@@ -318,5 +318,5 @@ Remote Convert Ollama/
 
 <p align="center">
   如果这个项目对你有帮助，欢迎 ⭐ Star 和 🍴 Fork！<br>
-  <sub>Made with ❤️ by 我</sub>
+  <sub>Made with ❤️ by https://github.com/haseeex </sub>
 </p>
