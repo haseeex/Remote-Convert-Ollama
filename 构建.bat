@@ -1,0 +1,1 @@
+garble build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
