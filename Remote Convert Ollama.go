@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -49,6 +50,28 @@ var clear map[string]func() //创建一个用于存储清除函数的映射
 
 var cfg Config
 
+// lastReasoningContent 存储上一个 assistant 响应的 reasoning_content，
+// 因为 DeepSeek 思考模式要求客户端下次请求时必须传回这个字段。
+// 如果 Cherry Studio 没有自动带上，我们就在转发时自动注入。
+var (
+	lastReasoningContent string
+	rcMutex              sync.RWMutex
+)
+
+// setLastReasoningContent 线程安全地设置 lastReasoningContent
+func setLastReasoningContent(rc string) {
+	rcMutex.Lock()
+	lastReasoningContent = rc
+	rcMutex.Unlock()
+}
+
+// getLastReasoningContent 线程安全地获取 lastReasoningContent
+func getLastReasoningContent() string {
+	rcMutex.RLock()
+	defer rcMutex.RUnlock()
+	return lastReasoningContent
+}
+
 const encryptedKeyPrefix = "已加密|"
 
 const (
@@ -61,18 +84,39 @@ const (
 // 推荐生成网站 https://www.uuidgenerator.net/ 生成一个随机的 UUID 来替换这个值。
 const secretUUID = "vancat-10a8bca6-fe6f-4bcd-8c9a-9a27d6ec1b16"
 
-type Choice struct {
-	Message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	} `json:"message"`
-	Text  string `json:"text"`
-	Delta struct {
-		Content string `json:"content"`
-	} `json:"delta"`
+// OllamaToolCall 是 Ollama 格式的工具调用
+type OllamaToolCall struct {
+	Function struct {
+		Name      string      `json:"name"`
+		Arguments interface{} `json:"arguments"` // JSON 对象（非字符串）
+	} `json:"function"`
 }
 
+// OpenAIToolCall 是 OpenAI 格式的工具调用
+type OpenAIToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"` // JSON 字符串
+	} `json:"function"`
+}
+
+// Choice 用于非流式响应的 choice
+type Choice struct {
+	Index        int                    `json:"index"`
+	Message      map[string]interface{} `json:"message"`
+	Text         string                 `json:"text"`
+	Delta        map[string]interface{} `json:"delta,omitempty"`
+	FinishReason *string                `json:"finish_reason"`
+}
+
+// OpenAIResp 用于非流式响应
 type OpenAIResp struct {
+	ID      string   `json:"id"`
+	Object  string   `json:"object"`
+	Created int64    `json:"created"`
+	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
 }
 
@@ -88,6 +132,8 @@ type AnthropicReq struct {
 	TopP          *float64               `json:"top_p,omitempty"`
 	StopSequences []string               `json:"stop_sequences,omitempty"`
 	Metadata      map[string]interface{} `json:"metadata,omitempty"`
+	Tools         []interface{}          `json:"tools,omitempty"`
+	ToolChoice    interface{}            `json:"tool_choice,omitempty"`
 }
 
 type AnthropicMessage struct {
@@ -170,22 +216,233 @@ type OpenAIChunk struct {
 	} `json:"usage,omitempty"`
 }
 
+// OpenAIDeltaToolCall 是流式 delta 中的 tool_call 片段
+type OpenAIDeltaToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function"`
+}
+
 func extractContent(resp *OpenAIResp) string {
 	if len(resp.Choices) == 0 {
 		return ""
 	}
 	ch := resp.Choices[0]
 
-	if ch.Message.Content != "" {
-		return ch.Message.Content
+	if msg, ok := ch.Message["content"].(string); ok && msg != "" {
+		return msg
 	}
 	if ch.Text != "" {
 		return ch.Text
 	}
-	if ch.Delta.Content != "" {
-		return ch.Delta.Content
+	if delta, ok := ch.Delta["content"].(string); ok && delta != "" {
+		return delta
 	}
 	return ""
+}
+
+// extractToolCalls 从 OpenAI 响应中提取 tool_calls 并转为 Ollama 格式
+func extractToolCalls(msg map[string]interface{}) []OllamaToolCall {
+	tcRaw, ok := msg["tool_calls"]
+	if !ok {
+		return nil
+	}
+
+	tcList, ok := tcRaw.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var result []OllamaToolCall
+	for _, tc := range tcList {
+		tcMap, ok := tc.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		// 提取 function
+		funcRaw, ok := tcMap["function"]
+		if !ok {
+			continue
+		}
+		funcMap, ok := funcRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		var otc OllamaToolCall
+		name, _ := funcMap["name"].(string)
+		otc.Function.Name = name
+
+		// arguments 在 OpenAI 中是 JSON 字符串，需要反序列化为对象
+		if argsStr, ok := funcMap["arguments"].(string); ok {
+			var argsObj interface{}
+			if err := json.Unmarshal([]byte(argsStr), &argsObj); err == nil {
+				otc.Function.Arguments = argsObj
+			} else {
+				otc.Function.Arguments = argsStr
+			}
+		} else {
+			otc.Function.Arguments = funcMap["arguments"]
+		}
+		result = append(result, otc)
+	}
+	return result
+}
+
+// convertMessagesToOpenAI 将 Ollama 格式的消息列表转为 OpenAI 格式
+func convertMessagesToOpenAI(messages []interface{}) []interface{} {
+	var result []interface{}
+	for _, msg := range messages {
+		msgMap, ok := msg.(map[string]interface{})
+		if !ok {
+			result = append(result, msg)
+			continue
+		}
+
+		role, _ := msgMap["role"].(string)
+
+		// 处理 tool 角色消息：添加 tool_call_id 如果不存在
+		if role == "tool" {
+			newMsg := make(map[string]interface{})
+			for k, v := range msgMap {
+				newMsg[k] = v
+			}
+			if _, hasID := newMsg["tool_call_id"]; !hasID {
+				newMsg["tool_call_id"] = ""
+			}
+			result = append(result, newMsg)
+			continue
+		}
+
+		// 处理 assistant 消息中的 tool_calls（转换为 OpenAI 格式）
+		if role == "assistant" {
+			// DeepSeek 思考模式：如果客户端没带 reasoning_content，但我们有存储，就自动注入
+			if _, hasRC := msgMap["reasoning_content"]; !hasRC && getLastReasoningContent() != "" {
+				// 创建一个新 map 避免修改原始 msg 的 map
+				newMsg := make(map[string]interface{})
+				for k, v := range msgMap {
+					newMsg[k] = v
+				}
+				newMsg["reasoning_content"] = getLastReasoningContent()
+				msgMap = newMsg
+			}
+
+			tcRaw, hasTC := msgMap["tool_calls"]
+			if !hasTC {
+				result = append(result, msgMap) // ← 修复：用 msgMap（可能含注入的 reasoning_content）
+				continue
+			}
+
+			newMsg := make(map[string]interface{})
+			for k, v := range msgMap {
+				if k != "tool_calls" {
+					newMsg[k] = v
+				}
+			}
+
+			tcList, ok := tcRaw.([]interface{})
+			if !ok {
+				result = append(result, msgMap) // ← 修复：用 msgMap
+				continue
+			}
+
+			var openaiTCs []map[string]interface{}
+			for _, tc := range tcList {
+				tcMap, ok := tc.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				// 检查是否已经有 id 字段 → 已经是 OpenAI 格式（仅需转换 arguments）
+				if existingID, hasID := tcMap["id"].(string); hasID && existingID != "" {
+					openaiTC := map[string]interface{}{
+						"id":   existingID,
+						"type": "function",
+					}
+					if funcRaw, ok := tcMap["function"]; ok {
+						if funcMap, ok := funcRaw.(map[string]interface{}); ok {
+							fn := map[string]interface{}{}
+							if n, ok := funcMap["name"]; ok {
+								fn["name"] = n
+							}
+							// arguments 是对象就序列化为字符串
+							if args, ok := funcMap["arguments"]; ok {
+								switch a := args.(type) {
+								case string:
+									fn["arguments"] = a
+								default:
+									argsBytes, _ := json.Marshal(a)
+									fn["arguments"] = string(argsBytes)
+								}
+							}
+							openaiTC["function"] = fn
+						}
+					}
+					openaiTCs = append(openaiTCs, openaiTC)
+				} else {
+					// Ollama 格式（无 id）：从 function 字段构建
+					funcRaw, ok := tcMap["function"]
+					if !ok {
+						continue
+					}
+					funcMap, ok := funcRaw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					openaiTC := map[string]interface{}{
+						"id":   "", // 将由上游 API 分配，但留空
+						"type": "function",
+						"function": map[string]interface{}{
+							"name": funcMap["name"],
+						},
+					}
+
+					if args, ok := funcMap["arguments"]; ok {
+						switch a := args.(type) {
+						case string:
+							openaiTC["function"].(map[string]interface{})["arguments"] = a
+						default:
+							argsBytes, _ := json.Marshal(a)
+							openaiTC["function"].(map[string]interface{})["arguments"] = string(argsBytes)
+						}
+					}
+					openaiTCs = append(openaiTCs, openaiTC)
+				}
+			}
+			newMsg["tool_calls"] = openaiTCs
+			result = append(result, newMsg)
+			continue
+		}
+
+		result = append(result, msg)
+	}
+	return result
+}
+
+// hasToolCalls 判断响应中是否包含 tool_calls
+func hasToolCalls(msg map[string]interface{}) bool {
+	tc, ok := msg["tool_calls"]
+	return ok && tc != nil
+}
+
+// makeOllamaMessage 构建 Ollama 格式的消息响应
+func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, reasoningContent string) map[string]interface{} {
+	msg := map[string]interface{}{
+		"role":    role,
+		"content": content,
+	}
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+	}
+	if reasoningContent != "" {
+		msg["reasoning_content"] = reasoningContent
+	}
+	return msg
 }
 
 func getDefaultConfig() Config {
@@ -588,16 +845,28 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		model = m
 	}
 
-	messages := req["messages"]
-	if messages == nil {
-		messages = []map[string]string{
-			{"role": "user", "content": req["prompt"].(string)},
+	var messages []interface{}
+	if rawMessages, ok := req["messages"].([]interface{}); ok {
+		// 将 Ollama 格式的消息转为 OpenAI 格式
+		messages = convertMessagesToOpenAI(rawMessages)
+	} else if prompt, ok := req["prompt"].(string); ok {
+		messages = []interface{}{
+			map[string]interface{}{"role": "user", "content": prompt},
 		}
+	} else {
+		messages = []interface{}{}
 	}
 
 	payload := map[string]interface{}{
 		"model":    model,
 		"messages": messages,
+	}
+
+	// 透传 Ollama 请求中的参数到 OpenAI 格式
+	for _, key := range []string{"tools", "tool_choice", "temperature", "top_p", "max_tokens", "stop", "frequency_penalty", "presence_penalty", "seed"} {
+		if val, ok := req[key]; ok {
+			payload[key] = val
+		}
 	}
 
 	requestedStream, _ := req["stream"].(bool)
@@ -631,15 +900,45 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Println("UPSTREAM:", string(raw))
 
-	var oai OpenAIResp
-	json.Unmarshal(raw, &oai)
+	// 解析上游响应
+	var upstreamResp map[string]interface{}
+	if err := json.Unmarshal(raw, &upstreamResp); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(raw)
+		return
+	}
 
-	content := extractContent(&oai)
+	// 提取 choices[0].message
+	choices, _ := upstreamResp["choices"].([]interface{})
+	content := ""
+	var toolCalls []OllamaToolCall
+	reasoningContent := ""
+
+	if len(choices) > 0 {
+		choice, _ := choices[0].(map[string]interface{})
+		if msg, ok := choice["message"].(map[string]interface{}); ok {
+			// 提取 content
+			if c, ok := msg["content"].(string); ok {
+				content = c
+			}
+			// 提取 tool_calls
+			toolCalls = extractToolCalls(msg)
+			// 提取 reasoning_content（DeepSeek 思考模式）
+			if rc, ok := msg["reasoning_content"].(string); ok {
+				reasoningContent = rc
+			}
+		}
+	}
+
+	// 保存 reasoning_content，供后续请求自动注入
+	if reasoningContent != "" {
+		setLastReasoningContent(reasoningContent)
+	}
 
 	out := map[string]interface{}{
 		"model":             model,
 		"created_at":        time.Now().Format("2006-01-02T15:04:05"),
-		"message":           map[string]string{"role": "assistant", "content": content},
+		"message":           makeOllamaMessage("assistant", content, toolCalls, reasoningContent),
 		"done":              true,
 		"total_duration":    1,
 		"load_duration":     1,
@@ -667,6 +966,23 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	}
 	defer resp.Body.Close()
 
+	// 检查上游是否返回了错误
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		errMsg := fmt.Sprintf("UPSTREAM ERROR (HTTP %d): %s", resp.StatusCode, string(raw))
+		fmt.Println(errMsg)
+		// 向客户端返回 Ollama 格式错误
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"model":      payload["model"],
+			"created_at": time.Now().Format(time.RFC3339),
+			"message":    map[string]string{"role": "assistant", "content": fmt.Sprintf("上游API返回错误: HTTP %d - %s", resp.StatusCode, string(raw))},
+			"done":       true,
+		})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -682,7 +998,43 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	inputTokens := 0
 	outputTokens := 0
 	var fullContent strings.Builder
+	var reasoningContent strings.Builder // 累积 reasoning_content（思考模式）
 	reader := bufio.NewReader(resp.Body)
+
+	// 流式 tool_calls 累积器
+	type accToolCall struct {
+		id      string
+		typ     string
+		name    string
+		argsBld strings.Builder
+	}
+	var accToolCalls []*accToolCall
+	hasToolCalls := false
+	isToolCallFinish := false
+
+	// 发送 Ollama 流式消息块
+	sendOllamaChunk := func(content string, done bool, tokens int, toolCalls []OllamaToolCall, rc string) {
+		msg := makeOllamaMessage("assistant", content, toolCalls, rc)
+		out := map[string]interface{}{
+			"model":      model,
+			"created_at": time.Now().Format(time.RFC3339),
+			"message":    msg,
+			"done":       done,
+		}
+		if done {
+			out["total_duration"] = 1
+			out["load_duration"] = 1
+			out["prompt_eval_count"] = inputTokens
+			if outputTokens > 0 {
+				out["eval_count"] = outputTokens
+			} else {
+				out["eval_count"] = tokens
+			}
+		}
+		if err := json.NewEncoder(w).Encode(out); err == nil {
+			flusher.Flush()
+		}
+	}
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -706,6 +1058,25 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 		}
 
 		dataStr := strings.TrimPrefix(line, "data: ")
+
+		// 先用完整 DeltaRaw 解析，保留 tool_calls 等字段
+		var rawDelta struct {
+			Choices []struct {
+				Index        int             `json:"index"`
+				Delta        json.RawMessage `json:"delta"`
+				FinishReason *string         `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(dataStr), &rawDelta); err != nil {
+			continue
+		}
+
+		// 使用标准结构解析
 		var chunk OpenAIChunk
 		if err := json.Unmarshal([]byte(dataStr), &chunk); err != nil {
 			continue
@@ -720,48 +1091,118 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 			}
 		}
 
-		content := ""
-		if len(chunk.Choices) > 0 {
-			content = chunk.Choices[0].Delta.Content
+		if len(chunk.Choices) == 0 {
+			continue
 		}
 
+		choice := chunk.Choices[0]
+		finishReason := choice.FinishReason
+
+		// 检查 delta 中是否包含 tool_calls
+		if len(rawDelta.Choices) > 0 && len(rawDelta.Choices[0].Delta) > 0 {
+			var deltaMap map[string]interface{}
+			if err := json.Unmarshal(rawDelta.Choices[0].Delta, &deltaMap); err == nil {
+				// 提取 reasoning_content（DeepSeek 思考模式）
+				if rc, ok := deltaMap["reasoning_content"].(string); ok && rc != "" {
+					reasoningContent.WriteString(rc)
+					if cfg.Log_Responses {
+						fmt.Print("[思考:" + rc + "]")
+					}
+				}
+				if tcRaw, ok := deltaMap["tool_calls"]; ok {
+					hasToolCalls = true
+					if tcList, ok := tcRaw.([]interface{}); ok {
+						for _, tc := range tcList {
+							if tcMap, ok := tc.(map[string]interface{}); ok {
+								idx := 0
+								if idxF, ok := tcMap["index"].(float64); ok {
+									idx = int(idxF)
+								}
+								// 扩展累积器数组
+								for len(accToolCalls) <= idx {
+									accToolCalls = append(accToolCalls, &accToolCall{})
+								}
+								if accToolCalls[idx] == nil {
+									accToolCalls[idx] = &accToolCall{}
+								}
+								if id, ok := tcMap["id"].(string); ok && id != "" {
+									accToolCalls[idx].id = id
+								}
+								if typ, ok := tcMap["type"].(string); ok && typ != "" {
+									accToolCalls[idx].typ = typ
+								}
+								if funcRaw, ok := tcMap["function"].(map[string]interface{}); ok {
+									if name, ok := funcRaw["name"].(string); ok && name != "" {
+										accToolCalls[idx].name = name
+									}
+									if args, ok := funcRaw["arguments"].(string); ok && args != "" {
+										accToolCalls[idx].argsBld.WriteString(args)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// 提取普通文本内容
+		content := choice.Delta.Content
 		if content != "" {
 			fullContent.WriteString(content)
 			if cfg.Log_Responses {
 				fmt.Print(content)
 			}
-			out := map[string]interface{}{
-				"model":      model,
-				"created_at": time.Now().Format(time.RFC3339),
-				"message": map[string]string{
-					"role":    "assistant",
-					"content": content,
-				},
-				"done": false,
-			}
-			if err := json.NewEncoder(w).Encode(out); err == nil {
-				flusher.Flush()
-			}
+			sendOllamaChunk(content, false, 0, nil, reasoningContent.String())
+		}
+
+		// 检查是否 tool_calls 结束
+		if finishReason != nil && *finishReason == "tool_calls" {
+			isToolCallFinish = true
 		}
 	}
 
 	if cfg.Log_Responses {
-		fmt.Println("")
+		if hasToolCalls {
+			fmt.Println("\n[Tool Calls Detected]")
+		} else {
+			fmt.Println("")
+		}
 		fmt.Println("UPSTREAM STREAM:", fullContent.String())
 	}
 
-	final := map[string]interface{}{
-		"model":             model,
-		"created_at":        time.Now().Format(time.RFC3339),
-		"message":           map[string]string{"role": "assistant", "content": ""},
-		"done":              true,
-		"total_duration":    1,
-		"load_duration":     1,
-		"prompt_eval_count": inputTokens,
-		"eval_count":        outputTokens,
+	// 构建最终消息
+	if hasToolCalls && isToolCallFinish {
+		// 将累积的 tool_calls 转为 Ollama 格式
+		var ollamaTCs []OllamaToolCall
+		for _, atc := range accToolCalls {
+			if atc == nil {
+				continue
+			}
+			var otc OllamaToolCall
+			otc.Function.Name = atc.name
+			// arguments 是 JSON 字符串，转为对象
+			argsStr := atc.argsBld.String()
+			if argsStr != "" {
+				var argsObj interface{}
+				if err := json.Unmarshal([]byte(argsStr), &argsObj); err == nil {
+					otc.Function.Arguments = argsObj
+				} else {
+					otc.Function.Arguments = argsStr
+				}
+			}
+			ollamaTCs = append(ollamaTCs, otc)
+		}
+		// 发送最后一个空内容块标记完成，附带 tool_calls
+		sendOllamaChunk("", true, 0, ollamaTCs, reasoningContent.String())
+	} else {
+		// 普通文本完成
+		sendOllamaChunk("", true, outputTokens, nil, reasoningContent.String())
 	}
-	if err := json.NewEncoder(w).Encode(final); err == nil {
-		flusher.Flush()
+
+	// 保存 reasoning_content，供后续请求自动注入
+	if rc := reasoningContent.String(); rc != "" {
+		setLastReasoningContent(rc)
 	}
 }
 
@@ -812,6 +1253,20 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Println("UPSTREAM:", string(raw))
+
+	// 保存 reasoning_content（DeepSeek 思考模式）
+	var upstreamResp map[string]interface{}
+	if err := json.Unmarshal(raw, &upstreamResp); err == nil {
+		if choices, ok := upstreamResp["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if msg, ok := choice["message"].(map[string]interface{}); ok {
+					if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+						setLastReasoningContent(rc)
+					}
+				}
+			}
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
@@ -899,49 +1354,67 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 			fmt.Println("UPSTREAM SSE:", line)
 		}
 
-		var chunk OpenAIChunk
-		if err := json.Unmarshal([]byte(dataStr), &chunk); err != nil {
+		// 用 RawMessage 解析完整 chunk，保留所有字段（包括 tool_calls）
+		var rawChunk struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			Model   string `json:"model"`
+			Choices []struct {
+				Index        int             `json:"index"`
+				Delta        json.RawMessage `json:"delta"`
+				FinishReason *string         `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *json.RawMessage `json:"usage,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(dataStr), &rawChunk); err != nil {
 			continue
 		}
 
-		if len(chunk.Choices) == 0 && chunk.Usage != nil {
+		// usage-only chunk 跳过
+		if len(rawChunk.Choices) == 0 && rawChunk.Usage != nil {
 			if cfg.Log_Responses {
 				fmt.Println("UPSTREAM SSE: usage-only chunk skipped")
 			}
 			continue
 		}
 
-		if len(chunk.Choices) > 0 {
-			choice := chunk.Choices[0]
+		if len(rawChunk.Choices) > 0 {
+			choice := rawChunk.Choices[0]
+			delta := map[string]interface{}{}
+
+			// 解析 delta 为通用 map，保留全部字段（content, reasoning_content, tool_calls 等）
+			if len(choice.Delta) > 0 {
+				var deltaMap map[string]interface{}
+				if err := json.Unmarshal(choice.Delta, &deltaMap); err == nil {
+					delta = deltaMap
+					// 日志中记录 content
+					if c, ok := deltaMap["content"].(string); ok && c != "" {
+						loggedContent.WriteString(c)
+						if cfg.Log_Responses {
+							fmt.Print(c)
+						}
+					}
+				}
+			}
+
 			choicePayload := map[string]interface{}{
 				"index":         choice.Index,
-				"delta":         map[string]interface{}{},
+				"delta":         delta,
 				"finish_reason": nil,
-			}
-			if choice.Delta.Role != "" {
-				choicePayload["delta"].(map[string]interface{})["role"] = choice.Delta.Role
-			}
-			if choice.Delta.Content != "" {
-				choicePayload["delta"].(map[string]interface{})["content"] = choice.Delta.Content
-				loggedContent.WriteString(choice.Delta.Content)
-				if cfg.Log_Responses {
-					fmt.Print(choice.Delta.Content)
-				}
 			}
 			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				choicePayload["finish_reason"] = *choice.FinishReason
 			}
 			payload := map[string]interface{}{
-				"id":      chunk.ID,
-				"object":  chunk.Object,
-				"created": chunk.Created,
-				"model":   chunk.Model,
+				"id":      rawChunk.ID,
+				"object":  rawChunk.Object,
+				"created": rawChunk.Created,
+				"model":   rawChunk.Model,
 				"choices": []map[string]interface{}{choicePayload},
 			}
 			out(payload)
 		}
-
-		// usage 仅用于日志或后续统计，不再下发给客户端，避免部分 OpenAI 客户端解析失败。
 	}
 
 	if cfg.Log_Responses && loggedContent.Len() > 0 {
@@ -1037,6 +1510,17 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	}
 	defer resp.Body.Close()
 
+	// 检查上游 HTTP 状态码
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		errMsg := fmt.Sprintf("UPSTREAM ERROR (HTTP %d): %s", resp.StatusCode, string(raw))
+		fmt.Println(errMsg)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(raw)
+		return
+	}
+
 	// 设置 SSE 响应头
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1054,8 +1538,25 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	inputTokens := 0
 	outputTokens := 0
 	msgStarted := false
-	blockStarted := false
-	allContent := ""
+
+	// 内容块跟踪：0=text, 1=tool_use...
+	type anthropicBlock struct {
+		index       int
+		blockType   string // "text" or "tool_use"
+		started     bool
+		toolUseID   string
+		toolUseName string
+	}
+	var blocks []*anthropicBlock
+	currentBlockIndex := 0
+
+	// 流式 tool_calls 累积器（用于 tool_use 块）
+	type accToolCall struct {
+		id      string
+		name    string
+		argsBld strings.Builder
+	}
+	var accToolCalls []*accToolCall
 
 	reader := bufio.NewReader(resp.Body)
 	for {
@@ -1078,30 +1579,58 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 
 		dataStr := strings.TrimPrefix(line, "data: ")
 
-		var chunk OpenAIChunk
-		if err := json.Unmarshal([]byte(dataStr), &chunk); err != nil {
+		// 用 rawDelta 解析保留所有字段
+		var rawDelta struct {
+			Choices []struct {
+				Index        int             `json:"index"`
+				Delta        json.RawMessage `json:"delta"`
+				FinishReason *string         `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			} `json:"usage,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(dataStr), &rawDelta); err != nil {
 			continue
 		}
 
-		// 获取 usage（如果有）
-		if chunk.Usage != nil {
-			if chunk.Usage.PromptTokens > 0 {
-				inputTokens = chunk.Usage.PromptTokens
+		// 提取 usage
+		if rawDelta.Usage != nil {
+			if rawDelta.Usage.PromptTokens > 0 {
+				inputTokens = rawDelta.Usage.PromptTokens
 			}
-			if chunk.Usage.CompletionTokens > 0 {
-				outputTokens = chunk.Usage.CompletionTokens
+			if rawDelta.Usage.CompletionTokens > 0 {
+				outputTokens = rawDelta.Usage.CompletionTokens
 			}
 		}
 
-		// 提取 content
-		content := ""
-		var finishReason *string
-		if len(chunk.Choices) > 0 {
-			content = chunk.Choices[0].Delta.Content
-			finishReason = chunk.Choices[0].FinishReason
+		if len(rawDelta.Choices) == 0 {
+			continue
 		}
 
-		// 第一次有内容 → message_start
+		choice := rawDelta.Choices[0]
+		finishReason := choice.FinishReason
+
+		// 解析 delta 为通用 map
+		deltaContent := ""
+		var deltaToolCalls []interface{}
+		if len(choice.Delta) > 0 {
+			var deltaMap map[string]interface{}
+			if err := json.Unmarshal(choice.Delta, &deltaMap); err == nil {
+				if c, ok := deltaMap["content"].(string); ok {
+					deltaContent = c
+				}
+				if tcRaw, ok := deltaMap["tool_calls"]; ok {
+					if tcList, ok := tcRaw.([]interface{}); ok {
+						deltaToolCalls = tcList
+					}
+				}
+			}
+		}
+
+		// --- 发送 message_start（首次） ---
 		if !msgStarted {
 			msgStarted = true
 			sendSSEEvent(w, flusher, "message_start", map[string]interface{}{
@@ -1114,44 +1643,172 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 					"model":         areq.Model,
 					"stop_reason":   nil,
 					"stop_sequence": nil,
-					"usage":         AnthropicUsage{InputTokens: inputTokens, OutputTokens: 0},
+					"usage": map[string]interface{}{
+						"input_tokens":  inputTokens,
+						"output_tokens": 0,
+					},
 				},
 			})
 		}
 
-		// 第一次有实际内容 → content_block_start
-		if content != "" && !blockStarted {
-			blockStarted = true
-			sendSSEEvent(w, flusher, "content_block_start", map[string]interface{}{
-				"type":  "content_block_start",
-				"index": 0,
-				"content_block": map[string]interface{}{
-					"type": "text",
-					"text": "",
-				},
-			})
+		// --- 处理 tool_calls delta ---
+		for _, tc := range deltaToolCalls {
+			tcMap, ok := tc.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			idx := 0
+			if idxF, ok := tcMap["index"].(float64); ok {
+				idx = int(idxF)
+			}
+			// 扩展累积器
+			for len(accToolCalls) <= idx {
+				accToolCalls = append(accToolCalls, &accToolCall{})
+			}
+			if accToolCalls[idx] == nil {
+				accToolCalls[idx] = &accToolCall{}
+			}
+			if id, ok := tcMap["id"].(string); ok && id != "" {
+				accToolCalls[idx].id = id
+			}
+			if funcRaw, ok := tcMap["function"].(map[string]interface{}); ok {
+				if name, ok := funcRaw["name"].(string); ok && name != "" {
+					accToolCalls[idx].name = name
+				}
+				if args, ok := funcRaw["arguments"].(string); ok && args != "" {
+					accToolCalls[idx].argsBld.WriteString(args)
+				}
+			}
 		}
 
-		// 发送内容增量
-		if content != "" {
-			allContent += content
+		// --- 发送适当的 content_block 事件 ---
+
+		// 文本内容 delta
+		if deltaContent != "" {
+			// 检查当前是否需要新开一个 text block
+			if len(blocks) == 0 || blocks[len(blocks)-1].blockType != "text" {
+				blocks = append(blocks, &anthropicBlock{
+					index:     currentBlockIndex,
+					blockType: "text",
+				})
+				currentBlockIndex++
+			}
+			textBlock := blocks[len(blocks)-1]
+
+			if !textBlock.started {
+				textBlock.started = true
+				sendSSEEvent(w, flusher, "content_block_start", map[string]interface{}{
+					"type":  "content_block_start",
+					"index": textBlock.index,
+					"content_block": map[string]interface{}{
+						"type": "text",
+						"text": "",
+					},
+				})
+			}
+
 			sendSSEEvent(w, flusher, "content_block_delta", map[string]interface{}{
 				"type":  "content_block_delta",
-				"index": 0,
+				"index": textBlock.index,
 				"delta": map[string]string{
 					"type": "text_delta",
-					"text": content,
+					"text": deltaContent,
 				},
 			})
 		}
 
-		// 结束标记
+		// 检查是否有 tool_calls 累积器更新需要发送 tool_use 块开始
+		for i, atc := range accToolCalls {
+			if atc == nil || (atc.id == "" && atc.name == "") {
+				continue
+			}
+			// 检查是否已经为此 tool_call 创建了块
+			existingBlock := false
+			for _, b := range blocks {
+				if b.blockType == "tool_use" && b.toolUseID == atc.id && b.toolUseName == atc.name && atc.id != "" {
+					existingBlock = true
+					break
+				}
+			}
+			if existingBlock {
+				continue
+			}
+
+			// 检查之前是否已经为这个索引创建了块（通过 id 空匹配）
+			if atc.id == "" && atc.name != "" {
+				// 如果有任何 tool_use 块已存在，跳过
+				for _, b := range blocks {
+					if b.blockType == "tool_use" && b.index == i+100 {
+						existingBlock = true
+						break
+					}
+				}
+				if existingBlock {
+					continue
+				}
+			}
+
+			// 新开 tool_use 块
+			useID := atc.id
+			useName := atc.name
+			if useID == "" {
+				useID = fmt.Sprintf("toolu_%d", i)
+			}
+			blocks = append(blocks, &anthropicBlock{
+				index:       currentBlockIndex,
+				blockType:   "tool_use",
+				toolUseID:   useID,
+				toolUseName: useName,
+				started:     true,
+			})
+			currentBlockIndex++
+
+			sendSSEEvent(w, flusher, "content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": blocks[len(blocks)-1].index,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    useID,
+					"name":  useName,
+					"input": map[string]interface{}{},
+				},
+			})
+		}
+
+		// 发送 tool_use 的 input_json_delta
+		for _, atc := range accToolCalls {
+			if atc == nil || atc.argsBld.Len() == 0 {
+				continue
+			}
+			// 找到对应的 block
+			for _, b := range blocks {
+				if b.blockType == "tool_use" && b.toolUseID == atc.id && atc.id != "" {
+					sendSSEEvent(w, flusher, "content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": b.index,
+						"delta": map[string]interface{}{
+							"type":         "input_json_delta",
+							"partial_json": atc.argsBld.String(),
+						},
+					})
+					// 清空已发送的部分
+					atc.argsBld.Reset()
+					break
+				}
+			}
+		}
+
+		// --- 结束标记 ---
 		if finishReason != nil {
-			if blockStarted {
-				sendSSEEvent(w, flusher, "content_block_stop", map[string]interface{}{
-					"type":  "content_block_stop",
-					"index": 0,
-				})
+			// 发送所有已开始块的 content_block_stop
+			for _, b := range blocks {
+				if b.started {
+					sendSSEEvent(w, flusher, "content_block_stop", map[string]interface{}{
+						"type":  "content_block_stop",
+						"index": b.index,
+					})
+					b.started = false
+				}
 			}
 			sendSSEEvent(w, flusher, "message_delta", map[string]interface{}{
 				"type": "message_delta",
@@ -1159,7 +1816,9 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 					"stop_reason":   toAnthropicStopReason(*finishReason),
 					"stop_sequence": nil,
 				},
-				"usage": AnthropicUsage{OutputTokens: outputTokens},
+				"usage": map[string]interface{}{
+					"output_tokens": outputTokens,
+				},
 			})
 			sendSSEEvent(w, flusher, "message_stop", map[string]interface{}{
 				"type": "message_stop",
@@ -1252,49 +1911,116 @@ func convertAnthropicToOpenAI(areq *AnthropicReq) ([]byte, error) {
 	if len(areq.StopSequences) > 0 {
 		payload["stop"] = areq.StopSequences
 	}
+	if len(areq.Tools) > 0 {
+		payload["tools"] = areq.Tools
+	}
+	if areq.ToolChoice != nil {
+		payload["tool_choice"] = areq.ToolChoice
+	}
 
 	return json.Marshal(payload)
 }
 
 // 转换 OpenAI 响应 → Anthropic 响应
 func convertOpenAIToAnthropic(raw []byte, model string) ([]byte, error) {
-	var oai OpenAIUsageResp
-	if err := json.Unmarshal(raw, &oai); err != nil {
+	var upstreamResp map[string]interface{}
+	if err := json.Unmarshal(raw, &upstreamResp); err != nil {
 		return nil, err
 	}
 
-	content := ""
+	// 提取 choices[0]
+	choices, _ := upstreamResp["choices"].([]interface{})
 	finishReason := "end_turn"
-	if len(oai.Choices) > 0 {
-		content = oai.Choices[0].Message.Content
-		fr := oai.Choices[0].FinishReason
-		if fr != "" {
+	textContent := ""
+	var toolUseBlocks []map[string]interface{}
+	inputTokens := 0
+	outputTokens := 0
+
+	if len(choices) > 0 {
+		choice, _ := choices[0].(map[string]interface{})
+		if msg, ok := choice["message"].(map[string]interface{}); ok {
+			// 提取文本内容
+			if c, ok := msg["content"].(string); ok {
+				textContent = c
+			}
+
+			// 提取 tool_calls → 转为 Anthropic tool_use 内容块
+			if tcRaw, ok := msg["tool_calls"]; ok {
+				if tcList, ok := tcRaw.([]interface{}); ok {
+					for _, tc := range tcList {
+						if tcMap, ok := tc.(map[string]interface{}); ok {
+							toolUseID, _ := tcMap["id"].(string)
+							if funcRaw, ok := tcMap["function"].(map[string]interface{}); ok {
+								name, _ := funcRaw["name"].(string)
+								var input interface{} = funcRaw["arguments"]
+								// arguments 可能是 JSON 字符串，要反序列化为对象
+								if argsStr, ok := funcRaw["arguments"].(string); ok {
+									var argsObj interface{}
+									if err := json.Unmarshal([]byte(argsStr), &argsObj); err == nil {
+										input = argsObj
+									}
+								}
+								toolUseBlocks = append(toolUseBlocks, map[string]interface{}{
+									"type":  "tool_use",
+									"id":    toolUseID,
+									"name":  name,
+									"input": input,
+								})
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// 提取 finish_reason
+		if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
 			finishReason = toAnthropicStopReason(fr)
 		}
 	}
 
+	// 提取 usage
+	if usage, ok := upstreamResp["usage"].(map[string]interface{}); ok {
+		if pt, ok := usage["prompt_tokens"].(float64); ok {
+			inputTokens = int(pt)
+		}
+		if ct, ok := usage["completion_tokens"].(float64); ok {
+			outputTokens = int(ct)
+		}
+	}
+
 	id := "msg_" + generateMsgID()
-	if oai.ID != "" {
-		id = oai.ID
+	if idStr, ok := upstreamResp["id"].(string); ok && idStr != "" {
+		id = idStr
 	}
 
-	ar := AnthropicResp{
-		ID:           id,
-		Type:         "message",
-		Role:         "assistant",
-		Model:        model,
-		StopReason:   finishReason,
-		StopSequence: nil,
-		Usage: AnthropicUsage{
-			InputTokens:  oai.Usage.PromptTokens,
-			OutputTokens: oai.Usage.CompletionTokens,
+	// 构建 content 数组：文本块 + tool_use 块
+	var contentBlocks []interface{}
+	if textContent != "" {
+		contentBlocks = append(contentBlocks, map[string]interface{}{
+			"type": "text",
+			"text": textContent,
+		})
+	}
+	for _, tb := range toolUseBlocks {
+		contentBlocks = append(contentBlocks, tb)
+	}
+	if len(contentBlocks) == 0 {
+		contentBlocks = []interface{}{}
+	}
+
+	ar := map[string]interface{}{
+		"id":            id,
+		"type":          "message",
+		"role":          "assistant",
+		"content":       contentBlocks,
+		"model":         model,
+		"stop_reason":   finishReason,
+		"stop_sequence": nil,
+		"usage": map[string]interface{}{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
 		},
-	}
-
-	if content != "" {
-		ar.Content = []AnthropicRespBlock{{Type: "text", Text: content}}
-	} else {
-		ar.Content = []AnthropicRespBlock{}
 	}
 
 	return json.Marshal(ar)
