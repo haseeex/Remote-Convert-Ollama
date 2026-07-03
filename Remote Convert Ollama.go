@@ -29,16 +29,19 @@ import (
 )
 
 type Config struct {
-	IP           string            `json:"IP"`
-	PORT         string            `json:"PORT"`
-	Log_Limit    int64             `json:"Log_Limit"`
-	OpenAIPrefix string            `json:"OpenAI_Prefix"`
-	OpenAISuffix string            `json:"OpenAI_Suffix"`
-	EnableStream bool              `json:"EnableStream"`
-	Capabilities []string          `json:"Capabilities"`
-	OpenAIBase   string            `json:"OPENAI_BASE"`
-	OpenAIKey    string            `json:"OPENAI_KEY"`
-	ModelAlias   map[string]string `json:"ModelAlias"`
+	IP            string            `json:"IP"`
+	PORT          string            `json:"PORT"`
+	Log_Limit     int64             `json:"Log_Limit"`
+	Log_Responses bool              `json:"Log_Responses"`
+	Log_Headers   bool              `json:"Log_Headers"`
+	Log_Body      bool              `json:"Log_Body"`
+	OpenAIPrefix  string            `json:"OpenAI_Prefix"`
+	OpenAISuffix  string            `json:"OpenAI_Suffix"`
+	EnableStream  bool              `json:"EnableStream"`
+	Capabilities  []string          `json:"Capabilities"`
+	OpenAIBase    string            `json:"OPENAI_BASE"`
+	OpenAIKey     string            `json:"OPENAI_KEY"`
+	ModelAlias    map[string]string `json:"ModelAlias"`
 }
 
 var requestCount int64
@@ -181,16 +184,19 @@ func extractContent(resp *OpenAIResp) string {
 
 func getDefaultConfig() Config {
 	return Config{
-		IP:           "0.0.0.0",
-		PORT:         "11434",
-		Log_Limit:    100,
-		OpenAIPrefix: "[VC反代] ",
-		OpenAISuffix: "",
-		EnableStream: true,
-		Capabilities: []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
-		OpenAIBase:   "https://api.openai.com/v1",
-		OpenAIKey:    "",
-		ModelAlias:   map[string]string{}, // 模型别名：key=上游模型ID, value=显示名称
+		IP:            "0.0.0.0",
+		PORT:          "11434",
+		Log_Limit:     100,
+		Log_Responses: true,
+		Log_Headers:   true,
+		Log_Body:      true,
+		OpenAIPrefix:  "[VC反代] ",
+		OpenAISuffix:  "",
+		EnableStream:  true,
+		Capabilities:  []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
+		OpenAIBase:    "https://api.openai.com/v1",
+		OpenAIKey:     "",
+		ModelAlias:    map[string]string{}, // 模型别名：key=上游模型ID, value=显示名称
 	}
 }
 
@@ -200,6 +206,9 @@ func printConfigHelp() {
 	fmt.Println(" ▼ IP              : 监听地址 (默认 0.0.0.0，本机测试用 127.0.0.1)")
 	fmt.Println(" ▼ PORT            : 监听端口 (默认 11434，即 Ollama 默认端口)")
 	fmt.Println(" ▼ Log_Limit       : 终端自动清理的日志行数阈值")
+	fmt.Println(" ▼ Log_Responses   : 是否打印响应内容 (true/false)")
+	fmt.Println(" ▼ Log_Headers     : 是否打印请求头 (true/false)")
+	fmt.Println(" ▼ Log_Body        : 是否打印请求体 (true/false)")
 	fmt.Println(" ▼ OpenAI_Prefix   : 返回给客户端的模型名称前缀,仅影响模型名字显示")
 	fmt.Println(" ▼ OpenAI_Suffix   : 返回给客户端的模型名称后缀,仅影响模型名字显示")
 	fmt.Println(" ▼ EnableStream    : 是否启用流式传输 (true/false)")
@@ -291,6 +300,18 @@ func loadConfig() {
 	}
 	if _, ok := rawMap["Log_Limit"]; !ok {
 		stored.Log_Limit = defaultCfg.Log_Limit
+		needSave = true
+	}
+	if _, ok := rawMap["Log_Responses"]; !ok {
+		stored.Log_Responses = defaultCfg.Log_Responses
+		needSave = true
+	}
+	if _, ok := rawMap["Log_Headers"]; !ok {
+		stored.Log_Headers = defaultCfg.Log_Headers
+		needSave = true
+	}
+	if _, ok := rawMap["Log_Body"]; !ok {
+		stored.Log_Body = defaultCfg.Log_Body
 		needSave = true
 	}
 	if _, ok := rawMap["OpenAI_Prefix"]; !ok {
@@ -542,6 +563,11 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		"messages": messages,
 	}
 
+	if stream, ok := req["stream"].(bool); ok && stream && cfg.EnableStream {
+		ollamaChatStream(w, payload)
+		return
+	}
+
 	b, _ := json.Marshal(payload)
 
 	httpReq, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
@@ -577,6 +603,120 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
+	payload["stream"] = true
+	b, _ := json.Marshal(payload)
+
+	httpReq, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
+	httpReq.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		http.Error(w, "upstream error", 500)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", 500)
+		return
+	}
+
+	model, _ := payload["model"].(string)
+	inputTokens := 0
+	outputTokens := 0
+	var fullContent strings.Builder
+	reader := bufio.NewReader(resp.Body)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			http.Error(w, "stream read error", 500)
+			return
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" || line == "data: [DONE]" {
+			if line == "data: [DONE]" {
+				break
+			}
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		dataStr := strings.TrimPrefix(line, "data: ")
+		var chunk OpenAIChunk
+		if err := json.Unmarshal([]byte(dataStr), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Usage != nil {
+			if chunk.Usage.PromptTokens > 0 {
+				inputTokens = chunk.Usage.PromptTokens
+			}
+			if chunk.Usage.CompletionTokens > 0 {
+				outputTokens = chunk.Usage.CompletionTokens
+			}
+		}
+
+		content := ""
+		if len(chunk.Choices) > 0 {
+			content = chunk.Choices[0].Delta.Content
+		}
+
+		if content != "" {
+			fullContent.WriteString(content)
+			if cfg.Log_Responses {
+				fmt.Print(content)
+			}
+			out := map[string]interface{}{
+				"model":      model,
+				"created_at": time.Now().Format(time.RFC3339),
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": content,
+				},
+				"done": false,
+			}
+			if err := json.NewEncoder(w).Encode(out); err == nil {
+				flusher.Flush()
+			}
+		}
+	}
+
+	if cfg.Log_Responses {
+		fmt.Println("")
+		fmt.Println("UPSTREAM STREAM:", fullContent.String())
+	}
+
+	final := map[string]interface{}{
+		"model":             model,
+		"created_at":        time.Now().Format(time.RFC3339),
+		"message":           map[string]string{"role": "assistant", "content": ""},
+		"done":              true,
+		"total_duration":    1,
+		"load_duration":     1,
+		"prompt_eval_count": inputTokens,
+		"eval_count":        outputTokens,
+	}
+	if err := json.NewEncoder(w).Encode(final); err == nil {
+		flusher.Flush()
+	}
 }
 
 // -------------------- OpenAI API: /v1/chat/completions --------------------
@@ -636,6 +776,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(body))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -645,11 +786,17 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 	defer resp.Body.Close()
 
-	// 设置流式响应头
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		contentType := resp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.WriteHeader(resp.StatusCode)
+		w.Write(raw)
+		return
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -657,20 +804,102 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	out := func(payload map[string]interface{}) {
+		jsonData, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+		flusher.Flush()
+	}
+
 	reader := bufio.NewReader(resp.Body)
+	loggedContent := strings.Builder{}
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
-				// 发送结束标记
 				fmt.Fprintf(w, "data: [DONE]\n\n")
 				flusher.Flush()
 			}
 			break
 		}
 
-		fmt.Fprint(w, line)
-		flusher.Flush()
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			if cfg.Log_Responses {
+				fmt.Println("UPSTREAM SSE:", line)
+			}
+			continue
+		}
+
+		dataStr := strings.TrimPrefix(line, "data: ")
+		if dataStr == "[DONE]" {
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			break
+		}
+
+		if cfg.Log_Responses {
+			fmt.Println("UPSTREAM SSE:", line)
+		}
+
+		var chunk OpenAIChunk
+		if err := json.Unmarshal([]byte(dataStr), &chunk); err != nil {
+			continue
+		}
+
+		if len(chunk.Choices) == 0 && chunk.Usage != nil {
+			if cfg.Log_Responses {
+				fmt.Println("UPSTREAM SSE: usage-only chunk skipped")
+			}
+			continue
+		}
+
+		if len(chunk.Choices) > 0 {
+			choice := chunk.Choices[0]
+			choicePayload := map[string]interface{}{
+				"index":         choice.Index,
+				"delta":         map[string]interface{}{},
+				"finish_reason": nil,
+			}
+			if choice.Delta.Role != "" {
+				choicePayload["delta"].(map[string]interface{})["role"] = choice.Delta.Role
+			}
+			if choice.Delta.Content != "" {
+				choicePayload["delta"].(map[string]interface{})["content"] = choice.Delta.Content
+				loggedContent.WriteString(choice.Delta.Content)
+				if cfg.Log_Responses {
+					fmt.Print(choice.Delta.Content)
+				}
+			}
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				choicePayload["finish_reason"] = *choice.FinishReason
+			}
+			payload := map[string]interface{}{
+				"id":      chunk.ID,
+				"object":  chunk.Object,
+				"created": chunk.Created,
+				"model":   chunk.Model,
+				"choices": []map[string]interface{}{choicePayload},
+			}
+			out(payload)
+		}
+
+		// usage 仅用于日志或后续统计，不再下发给客户端，避免部分 OpenAI 客户端解析失败。
+	}
+
+	if cfg.Log_Responses && loggedContent.Len() > 0 {
+		fmt.Println("UPSTREAM STREAM:", loggedContent.String())
 	}
 }
 
@@ -1067,7 +1296,9 @@ func ollamaVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
-	fmt.Println("响应内容:", out)
+	if cfg.Log_Responses {
+		fmt.Println("响应内容:", out)
+	}
 }
 
 func openaiModelsLegacy(w http.ResponseWriter, r *http.Request) {
@@ -1169,7 +1400,9 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
 
-	fmt.Println("响应内容:", out)
+	if cfg.Log_Responses {
+		fmt.Println("响应内容:", out)
+	}
 }
 
 func ollamaShow(w http.ResponseWriter, r *http.Request) {
@@ -1247,7 +1480,9 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
 
-	fmt.Println("响应内容:", out)
+	if cfg.Log_Responses {
+		fmt.Println("响应内容:", out)
+	}
 }
 
 func logAllRequests(w http.ResponseWriter, r *http.Request) {
@@ -1264,8 +1499,12 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("方法:", r.Method)
 	fmt.Println("路径:", r.URL.Path)
 	fmt.Println("查询:", r.URL.RawQuery)
-	fmt.Println("Body:", string(body))
-	fmt.Println("Headers:", r.Header)
+	if cfg.Log_Headers {
+		fmt.Println("Headers:", r.Header)
+	}
+	if cfg.Log_Body {
+		fmt.Println("Body:", string(body))
+	}
 	fmt.Println("================================")
 
 	// 把 body 放回去，否则后面 handler 读不到
