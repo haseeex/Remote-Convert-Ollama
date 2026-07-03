@@ -116,7 +116,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
     "Log_Limit": 100,
     "OpenAI_Prefix": "[VC反代] ",
     "OpenAI_Suffix": "by vancat",
-    "EnableStream": true,
+  "StreamMode": "preserve",
     "Capabilities": [
         "tools",
         "vision"
@@ -138,11 +138,15 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `Log_Limit` | 终端日志自动清理阈值(条) | `100` |
 | `OpenAI_Prefix` | 模型显示名前缀 | `[VC反代] ` |
 | `OpenAI_Suffix` | 模型显示名后缀 | `(by vancat)` |
-| `EnableStream` | 启用流式传输 | `true` |
+| `StreamMode` | 流式策略，可选 `preserve` / `force_stream` / `force_close` | `preserve` |
 | `Capabilities` | 能力声明列表 | `["tools", "vision"]` |
 | `OPENAI_BASE` | 上游 OpenAI 兼容 API 地址 | **必填** |
 | `OPENAI_KEY` | 上游 API 密钥 | **必填**，首次输入明文后自动加密 |
 | `ModelAlias` | 模型别名映射 | `{}` |
+
+`StreamMode` 的含义如下：`preserve` 表示按客户端请求决定是否流式，`force_stream` 表示无论客户端是否请求都强制流式，`force_close` 表示无论客户端是否请求都强制非流式。
+
+> 兼容说明：旧版 `EnableStream=true/false` 会在首次启动时自动迁移为 `StreamMode=preserve/force_close`。
 
 > ⚠️ **注意**：`OPENAI_KEY` 在第一次启动后会自动加密并回写到配置文件中。后续启动将使用加密后的密钥，换机器会提示"机器码不匹配"。
 
@@ -318,5 +322,5 @@ Remote Convert Ollama/
 
 <p align="center">
   如果这个项目对你有帮助，欢迎 ⭐ Star 和 🍴 Fork！<br>
-  <sub>Made with ❤️ by https://github.com/haseeex </sub>
+  <sub>Made with ❤️ by 我</sub>
 </p>
