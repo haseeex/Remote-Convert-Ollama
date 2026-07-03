@@ -37,7 +37,7 @@ type Config struct {
 	Log_Body      bool              `json:"Log_Body"`
 	OpenAIPrefix  string            `json:"OpenAI_Prefix"`
 	OpenAISuffix  string            `json:"OpenAI_Suffix"`
-	EnableStream  bool              `json:"EnableStream"`
+	StreamMode    string            `json:"StreamMode"`
 	Capabilities  []string          `json:"Capabilities"`
 	OpenAIBase    string            `json:"OPENAI_BASE"`
 	OpenAIKey     string            `json:"OPENAI_KEY"`
@@ -50,6 +50,12 @@ var clear map[string]func() //创建一个用于存储清除函数的映射
 var cfg Config
 
 const encryptedKeyPrefix = "已加密|"
+
+const (
+	streamModePreserve    = "preserve"
+	streamModeForceStream = "force_stream"
+	streamModeForceClose  = "force_close"
+)
 
 // 这个 UUID 是用来增强加密安全性的，确保同一台机器上的加密结果不同于其他机器。它不会泄露任何敏感信息。
 // 推荐生成网站 https://www.uuidgenerator.net/ 生成一个随机的 UUID 来替换这个值。
@@ -192,7 +198,7 @@ func getDefaultConfig() Config {
 		Log_Body:      true,
 		OpenAIPrefix:  "[VC反代] ",
 		OpenAISuffix:  "",
-		EnableStream:  true,
+		StreamMode:    streamModePreserve,
 		Capabilities:  []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
 		OpenAIBase:    "https://api.openai.com/v1",
 		OpenAIKey:     "",
@@ -211,7 +217,7 @@ func printConfigHelp() {
 	fmt.Println(" ▼ Log_Body        : 是否打印请求体 (true/false)")
 	fmt.Println(" ▼ OpenAI_Prefix   : 返回给客户端的模型名称前缀,仅影响模型名字显示")
 	fmt.Println(" ▼ OpenAI_Suffix   : 返回给客户端的模型名称后缀,仅影响模型名字显示")
-	fmt.Println(" ▼ EnableStream    : 是否启用流式传输 (true/false)")
+	fmt.Println(" ▼ StreamMode      : 流式策略 = 不覆写/强制流式/强制关闭 (preserve/force_stream/force_close)")
 	fmt.Println(" ▼ Capabilities    : 向客户端声明支持的能力列表 (tools, vision 等)")
 	fmt.Println(" ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)")
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
@@ -322,8 +328,17 @@ func loadConfig() {
 		stored.OpenAISuffix = defaultCfg.OpenAISuffix
 		needSave = true
 	}
-	if _, ok := rawMap["EnableStream"]; !ok {
-		stored.EnableStream = defaultCfg.EnableStream
+	if _, ok := rawMap["StreamMode"]; ok {
+		stored.StreamMode = normalizeStreamMode(stored.StreamMode)
+		if stored.StreamMode == "" {
+			stored.StreamMode = defaultCfg.StreamMode
+			needSave = true
+		}
+	} else if legacyEnabled, ok := rawMap["EnableStream"].(bool); ok {
+		stored.StreamMode = streamModeFromLegacy(legacyEnabled)
+		needSave = true
+	} else {
+		stored.StreamMode = defaultCfg.StreamMode
 		needSave = true
 	}
 	if _, ok := rawMap["Capabilities"]; !ok {
@@ -355,6 +370,8 @@ func loadConfig() {
 		fmt.Println("config.json 缺少 OPENAI_BASE 或 OPENAI_KEY")
 		pauseAndExit()
 	}
+
+	stored.StreamMode = normalizeStreamMode(stored.StreamMode)
 
 	plainKey, persistedKey, err := normalizeOpenAIKey(stored.OpenAIKey)
 	if err != nil {
@@ -393,6 +410,26 @@ func normalizeOpenAIKey(value string) (string, string, error) {
 	}
 
 	return value, encryptedKey, nil
+}
+
+func normalizeStreamMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case streamModeForceStream:
+		return streamModeForceStream
+	case streamModeForceClose:
+		return streamModeForceClose
+	case streamModePreserve:
+		return streamModePreserve
+	default:
+		return streamModePreserve
+	}
+}
+
+func streamModeFromLegacy(enabled bool) string {
+	if enabled {
+		return streamModePreserve
+	}
+	return streamModeForceClose
 }
 
 func encryptOpenAIKey(plainKey string) (string, error) {
@@ -563,9 +600,18 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		"messages": messages,
 	}
 
-	if stream, ok := req["stream"].(bool); ok && stream && cfg.EnableStream {
+	requestedStream, _ := req["stream"].(bool)
+	switch normalizeStreamMode(cfg.StreamMode) {
+	case streamModeForceStream:
 		ollamaChatStream(w, payload)
 		return
+	case streamModeForceClose:
+		// 强制关闭流式，直接走非流式分支
+	default:
+		if requestedStream {
+			ollamaChatStream(w, payload)
+			return
+		}
 	}
 
 	b, _ := json.Marshal(payload)
