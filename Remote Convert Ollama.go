@@ -1,6 +1,8 @@
 /*
 接口提供的字段兼容性优先适配 Visual Studio Code Copilot Chat
 https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/byok/vscode-node/ollamaProvider.ts#L137C2-L137C124
+Ollama 官方文档关于思考模式的说明
+https://docs.ollama.com/capabilities/thinking
 */
 package main
 
@@ -1143,6 +1145,8 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 					if cfg.Log_Responses {
 						fmt.Print("[思考:" + rc + "]")
 					}
+					// 实时推送 thinking 增量（sendOllamaChunk 内部自动计算增量）
+					sendOllamaChunk("", false, 0, nil, reasoningContent.String())
 				}
 				if tcRaw, ok := deltaMap["tool_calls"]; ok {
 					hasToolCalls = true
