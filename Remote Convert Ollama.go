@@ -431,14 +431,16 @@ func hasToolCalls(msg map[string]interface{}) bool {
 }
 
 // makeOllamaMessage 构建 Ollama 格式的消息响应
-// reasoning_content 应放在响应顶层而非 message 内部，由调用者负责添加
-func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall) map[string]interface{} {
+func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, thinkingContent string) map[string]interface{} {
 	msg := map[string]interface{}{
 		"role":    role,
 		"content": content,
 	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
+	}
+	if thinkingContent != "" {
+		msg["thinking"] = thinkingContent
 	}
 	return msg
 }
@@ -956,16 +958,13 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	out := map[string]interface{}{
 		"model":             model,
 		"created_at":        time.Now().Format("2006-01-02T15:04:05"),
-		"message":           makeOllamaMessage("assistant", content, toolCalls),
+		"message":           makeOllamaMessage("assistant", content, toolCalls, reasoningContent),
 		"done":              true,
 		"done_reason":       mapFinishReason(finishReason),
 		"total_duration":    1,
 		"load_duration":     1,
 		"prompt_eval_count": 1,
 		"eval_count":        1,
-	}
-	if reasoningContent != "" {
-		out["reasoning_content"] = reasoningContent
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1021,6 +1020,7 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	outputTokens := 0
 	var fullContent strings.Builder
 	var reasoningContent strings.Builder // 累积 reasoning_content（思考模式）
+	lastThinkingLen := 0                 // 已发送的 thinking 长度（用于增量发送）
 	reader := bufio.NewReader(resp.Body)
 
 	// 流式 tool_calls 累积器
@@ -1036,16 +1036,19 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	upstreamFinishReason := "" // 记录上游返回的 finish_reason
 
 	// 发送 Ollama 流式消息块
-	sendOllamaChunk := func(content string, done bool, tokens int, toolCalls []OllamaToolCall, rc string) {
-		msg := makeOllamaMessage("assistant", content, toolCalls)
+	sendOllamaChunk := func(content string, done bool, tokens int, toolCalls []OllamaToolCall, rcFull string) {
+		// 只发送 thinking 增量（新追加的部分），避免 Cherry Studio reasoning part 追踪混乱
+		rcDelta := ""
+		if len(rcFull) > lastThinkingLen {
+			rcDelta = rcFull[lastThinkingLen:]
+			lastThinkingLen = len(rcFull)
+		}
+		msg := makeOllamaMessage("assistant", content, toolCalls, rcDelta)
 		out := map[string]interface{}{
 			"model":      model,
 			"created_at": time.Now().Format(time.RFC3339),
 			"message":    msg,
 			"done":       done,
-		}
-		if rc != "" {
-			out["reasoning_content"] = rc
 		}
 		if done {
 			out["done_reason"] = mapFinishReason(upstreamFinishReason)
@@ -1140,8 +1143,6 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 					if cfg.Log_Responses {
 						fmt.Print("[思考:" + rc + "]")
 					}
-					// 立即发送 reasoning_content 更新块（即使没有文本内容）
-					sendOllamaChunk("", false, 0, nil, reasoningContent.String())
 				}
 				if tcRaw, ok := deltaMap["tool_calls"]; ok {
 					hasToolCalls = true
@@ -1346,6 +1347,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 
 	reader := bufio.NewReader(resp.Body)
 	loggedContent := strings.Builder{}
+	thinkingDone := false // 标记 thinking 是否已结束（收到 content 后关闭 reasoning_text 注入）
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -1412,18 +1414,25 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 				var deltaMap map[string]interface{}
 				if err := json.Unmarshal(choice.Delta, &deltaMap); err == nil {
 					delta = deltaMap
-					// VS Code 兼容：将 reasoning_content 映射为 reasoning_text
-					if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
-						if _, exists := delta["reasoning_text"]; !exists {
-							delta["reasoning_text"] = rc
-						}
-					}
-					// 日志中记录 content
+					// 检查是否已有 content → 标记 thinking 结束
 					if c, ok := deltaMap["content"].(string); ok && c != "" {
 						loggedContent.WriteString(c)
 						if cfg.Log_Responses {
 							fmt.Print(c)
 						}
+						thinkingDone = true
+					}
+					// VS Code 兼容：将 reasoning_content 映射为 reasoning_text
+					// 只在 thinking 阶段注入，content 开始后停止（避免 VS Code 内部追踪断链）
+					if !thinkingDone {
+						if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+							if _, exists := delta["reasoning_text"]; !exists {
+								delta["reasoning_text"] = rc
+							}
+						}
+					} else {
+						// thinking 结束后，从 delta 中移除 reasoning_text（如果有）
+						delete(delta, "reasoning_text")
 					}
 				}
 			}
