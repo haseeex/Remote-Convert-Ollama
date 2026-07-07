@@ -125,7 +125,7 @@ type OpenAIResp struct {
 type AnthropicReq struct {
 	Model         string                 `json:"model"`
 	Messages      []AnthropicMessage     `json:"messages"`
-	System        string                 `json:"system,omitempty"`
+	System        interface{}            `json:"system,omitempty"` // string 或 []{type, text}
 	MaxTokens     int                    `json:"max_tokens"`
 	Stream        bool                   `json:"stream,omitempty"`
 	Temperature   *float64               `json:"temperature,omitempty"`
@@ -431,16 +431,14 @@ func hasToolCalls(msg map[string]interface{}) bool {
 }
 
 // makeOllamaMessage 构建 Ollama 格式的消息响应
-func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, reasoningContent string) map[string]interface{} {
+// reasoning_content 应放在响应顶层而非 message 内部，由调用者负责添加
+func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall) map[string]interface{} {
 	msg := map[string]interface{}{
 		"role":    role,
 		"content": content,
 	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
-	}
-	if reasoningContent != "" {
-		msg["reasoning_content"] = reasoningContent
 	}
 	return msg
 }
@@ -851,7 +849,6 @@ func mapFinishReason(reason string) string {
 // -------------------- Ollama API: /api/chat --------------------
 func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
-	fmt.Println("OLLAMA /api/chat REQ:", string(body))
 
 	var req map[string]interface{}
 	json.Unmarshal(body, &req)
@@ -959,13 +956,16 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	out := map[string]interface{}{
 		"model":             model,
 		"created_at":        time.Now().Format("2006-01-02T15:04:05"),
-		"message":           makeOllamaMessage("assistant", content, toolCalls, reasoningContent),
+		"message":           makeOllamaMessage("assistant", content, toolCalls),
 		"done":              true,
 		"done_reason":       mapFinishReason(finishReason),
 		"total_duration":    1,
 		"load_duration":     1,
 		"prompt_eval_count": 1,
 		"eval_count":        1,
+	}
+	if reasoningContent != "" {
+		out["reasoning_content"] = reasoningContent
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1037,12 +1037,15 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 
 	// 发送 Ollama 流式消息块
 	sendOllamaChunk := func(content string, done bool, tokens int, toolCalls []OllamaToolCall, rc string) {
-		msg := makeOllamaMessage("assistant", content, toolCalls, rc)
+		msg := makeOllamaMessage("assistant", content, toolCalls)
 		out := map[string]interface{}{
 			"model":      model,
 			"created_at": time.Now().Format(time.RFC3339),
 			"message":    msg,
 			"done":       done,
+		}
+		if rc != "" {
+			out["reasoning_content"] = rc
 		}
 		if done {
 			out["done_reason"] = mapFinishReason(upstreamFinishReason)
@@ -1137,6 +1140,8 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 					if cfg.Log_Responses {
 						fmt.Print("[思考:" + rc + "]")
 					}
+					// 立即发送 reasoning_content 更新块（即使没有文本内容）
+					sendOllamaChunk("", false, 0, nil, reasoningContent.String())
 				}
 				if tcRaw, ok := deltaMap["tool_calls"]; ok {
 					hasToolCalls = true
@@ -1250,24 +1255,6 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 非流式请求 - 只打印元数据
-	var meta struct {
-		Model    string `json:"model"`
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal(body, &meta); err == nil {
-		msgCount := len(meta.Messages)
-		totalLen := 0
-		for _, m := range meta.Messages {
-			totalLen += len(m.Content)
-		}
-		fmt.Printf("VS /v1/chat/completions REQ: model=%s, messages=%d, total_chars=%d, stream=false\n",
-			meta.Model, msgCount, totalLen)
-	}
-
 	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(body))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -1283,7 +1270,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Println("UPSTREAM:", string(raw))
 
-	// 保存 reasoning_content（DeepSeek 思考模式）
+	// 保存 reasoning_content（DeepSeek 思考模式）并注入 reasoning_text（VS Code 兼容）
 	var upstreamResp map[string]interface{}
 	if err := json.Unmarshal(raw, &upstreamResp); err == nil {
 		if choices, ok := upstreamResp["choices"].([]interface{}); ok && len(choices) > 0 {
@@ -1291,9 +1278,17 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 				if msg, ok := choice["message"].(map[string]interface{}); ok {
 					if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
 						setLastReasoningContent(rc)
+						// VS Code 兼容：将 reasoning_content 映射为 reasoning_text
+						if _, exists := msg["reasoning_text"]; !exists {
+							msg["reasoning_text"] = rc
+						}
 					}
 				}
 			}
+		}
+		// 重新序列化（因为可能修改了 message）
+		if modified, _ := json.Marshal(upstreamResp); modified != nil {
+			raw = modified
 		}
 	}
 
@@ -1417,6 +1412,12 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 				var deltaMap map[string]interface{}
 				if err := json.Unmarshal(choice.Delta, &deltaMap); err == nil {
 					delta = deltaMap
+					// VS Code 兼容：将 reasoning_content 映射为 reasoning_text
+					if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+						if _, exists := delta["reasoning_text"]; !exists {
+							delta["reasoning_text"] = rc
+						}
+					}
 					// 日志中记录 content
 					if c, ok := deltaMap["content"].(string); ok && c != "" {
 						loggedContent.WriteString(c)
@@ -1457,6 +1458,8 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	var areq AnthropicReq
 	if err := json.Unmarshal(body, &areq); err != nil {
+		fmt.Println("ANTHROPIC PARSE ERROR:", err)
+		fmt.Println("ANTHROPIC RAW BODY:", string(body))
 		http.Error(w, `{"error":{"type":"invalid_request_error","message":"Invalid JSON"}}`, 400)
 		return
 	}
@@ -1467,8 +1470,6 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// --- 非流式请求 ---
-	fmt.Printf("VS /v1/messages REQ: model=%s, messages=%d, max_tokens=%d, stream=false\n",
-		areq.Model, len(areq.Messages), areq.MaxTokens)
 
 	// 1. 转换请求体 Anthropic → OpenAI
 	openaiBody, err := convertAnthropicToOpenAI(&areq)
@@ -1516,10 +1517,71 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	w.Write(anthropicBody)
 }
 
+// -------------------- /v1/messages/count_tokens --------------------
+func anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+
+	var areq AnthropicReq
+	if err := json.Unmarshal(body, &areq); err != nil {
+		// 如果解析失败，尝试提取 system 字段后用 interface{} 重试
+		fmt.Println("ANTHROPIC COUNT_TOKENS PARSE ERROR:", err)
+		http.Error(w, `{"error":{"type":"invalid_request_error","message":"Invalid JSON"}}`, 400)
+		return
+	}
+
+	// 转换为 OpenAI 格式来估算 token 数
+	openaiBody, err := convertAnthropicToOpenAI(&areq)
+	if err != nil {
+		http.Error(w, `{"error":{"type":"api_error","message":"conversion error"}}`, 500)
+		return
+	}
+
+	// 发送到上游估算 token 数（max_tokens=1 快速返回）
+	var upstreamPayload map[string]interface{}
+	json.Unmarshal(openaiBody, &upstreamPayload)
+	upstreamPayload["max_tokens"] = 1
+	upstreamPayload["stream"] = false
+	upstreamBody, _ := json.Marshal(upstreamPayload)
+
+	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(upstreamBody))
+	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var upstreamResp map[string]interface{}
+		if json.Unmarshal(raw, &upstreamResp) == nil {
+			if usage, ok := upstreamResp["usage"].(map[string]interface{}); ok {
+				var inputTokens int = 0
+				if pt, ok := usage["prompt_tokens"].(float64); ok {
+					inputTokens = int(pt)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"input_tokens": inputTokens,
+				})
+				return
+			}
+		}
+	}
+
+	// 降级：基于字符数估算
+	textLen := len(string(openaiBody))
+	estimatedTokens := textLen / 4
+	if estimatedTokens < 1 {
+		estimatedTokens = 1
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"input_tokens": estimatedTokens,
+	})
+}
+
 // --- 流式处理 ---
 func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *AnthropicReq) {
-	fmt.Printf("VS /v1/messages REQ: model=%s, messages=%d, max_tokens=%d, stream=true\n",
-		areq.Model, len(areq.Messages), areq.MaxTokens)
 
 	openaiBody, err := convertAnthropicToOpenAI(areq)
 	if err != nil {
@@ -1902,14 +1964,39 @@ func extractAnthropicContent(content interface{}) string {
 }
 
 // 转换 Anthropic 请求 → OpenAI 请求
+// extractSystemText 从 Anthropic system 字段提取文本（支持 string 和 []{type, text} 两种格式）
+func extractSystemText(system interface{}) string {
+	if system == nil {
+		return ""
+	}
+	switch v := system.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var parts []string
+		for _, block := range v {
+			if blockMap, ok := block.(map[string]interface{}); ok {
+				if t, _ := blockMap["type"].(string); t == "text" {
+					if text, ok := blockMap["text"].(string); ok {
+						parts = append(parts, text)
+					}
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
 func convertAnthropicToOpenAI(areq *AnthropicReq) ([]byte, error) {
 	var messages []map[string]interface{}
 
-	// system 消息放最前面
-	if areq.System != "" {
+	// system 消息放最前面（支持 string 或数组格式）
+	systemText := extractSystemText(areq.System)
+	if systemText != "" {
 		messages = append(messages, map[string]interface{}{
 			"role":    "system",
-			"content": areq.System,
+			"content": systemText,
 		})
 	}
 
@@ -2327,6 +2414,8 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		ollamaShow(w, r)
 	case r.URL.Path == "/v1/chat/completions":
 		openaiChat(w, r)
+	case r.URL.Path == "/v1/messages/count_tokens":
+		anthropicCountTokens(w, r)
 	case r.URL.Path == "/v1/messages":
 		anthropicMessages(w, r)
 	case r.URL.Path == "/v1/models":
