@@ -832,6 +832,22 @@ func saveConfig(stored Config) error {
 	return os.WriteFile("config.json", data, 0644)
 }
 
+// mapFinishReason 将 OpenAI 的 finish_reason 映射为 Ollama 的 done_reason
+func mapFinishReason(reason string) string {
+	switch reason {
+	case "stop":
+		return "stop"
+	case "length":
+		return "length"
+	case "tool_calls":
+		return "stop" // Ollama 无独立 tool_calls 类型，归为 stop
+	case "content_filter":
+		return "stop"
+	default:
+		return "stop" // 未知原因默认 stop
+	}
+}
+
 // -------------------- Ollama API: /api/chat --------------------
 func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
@@ -913,9 +929,14 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	content := ""
 	var toolCalls []OllamaToolCall
 	reasoningContent := ""
+	finishReason := ""
 
 	if len(choices) > 0 {
 		choice, _ := choices[0].(map[string]interface{})
+		// 提取 finish_reason
+		if fr, ok := choice["finish_reason"].(string); ok {
+			finishReason = fr
+		}
 		if msg, ok := choice["message"].(map[string]interface{}); ok {
 			// 提取 content
 			if c, ok := msg["content"].(string); ok {
@@ -940,6 +961,7 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		"created_at":        time.Now().Format("2006-01-02T15:04:05"),
 		"message":           makeOllamaMessage("assistant", content, toolCalls, reasoningContent),
 		"done":              true,
+		"done_reason":       mapFinishReason(finishReason),
 		"total_duration":    1,
 		"load_duration":     1,
 		"prompt_eval_count": 1,
@@ -1011,6 +1033,7 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	var accToolCalls []*accToolCall
 	hasToolCalls := false
 	isToolCallFinish := false
+	upstreamFinishReason := "" // 记录上游返回的 finish_reason
 
 	// 发送 Ollama 流式消息块
 	sendOllamaChunk := func(content string, done bool, tokens int, toolCalls []OllamaToolCall, rc string) {
@@ -1022,6 +1045,7 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 			"done":       done,
 		}
 		if done {
+			out["done_reason"] = mapFinishReason(upstreamFinishReason)
 			out["total_duration"] = 1
 			out["load_duration"] = 1
 			out["prompt_eval_count"] = inputTokens
@@ -1097,6 +1121,11 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 
 		choice := chunk.Choices[0]
 		finishReason := choice.FinishReason
+
+		// 保存上游返回的 finish_reason（用于最终 done_reason）
+		if finishReason != nil && *finishReason != "" {
+			upstreamFinishReason = *finishReason
+		}
 
 		// 检查 delta 中是否包含 tool_calls
 		if len(rawDelta.Choices) > 0 && len(rawDelta.Choices[0].Delta) > 0 {
