@@ -758,13 +758,18 @@ func encryptOpenAIKey(plainKey string) (string, error) {
 	cipherText := gcm.Seal(nil, nonce, []byte(plainKey), []byte(fingerprint))
 	payload := append(nonce, cipherText...)
 
-	return encryptedKeyPrefix + fingerprint + "|" + base64.StdEncoding.EncodeToString(payload) + "|" + secretUUID, nil
+	return encryptedKeyPrefix + fingerprint + "|" + base64.StdEncoding.EncodeToString(payload), nil
 }
 
 func decryptOpenAIKey(value string) (string, error) {
-	parts := strings.SplitN(value, "|", 4)
-	if len(parts) != 4 {
-		return "", errors.New("🔒 已加密格式不正确")
+	parts := strings.SplitN(value, "|", 3)
+	if len(parts) != 3 {
+		// 检测是否为旧格式（4段，含 UUID 尾巴）
+		oldParts := strings.SplitN(value, "|", 4)
+		if len(oldParts) == 4 {
+			return "", errors.New("🔒 检测到旧版加密格式已不再支持。请在 config.json 中将 OPENAI_KEY 改为明文密钥后重新启动（程序会自动以新格式加密保存）")
+		}
+		return "", errors.New("🔒 已加密格式不正确，请在 config.json 中填写明文 OPENAI_KEY 后重新启动（程序会自动加密保存）")
 	}
 
 	fingerprint, err := getMachineFingerprint()
@@ -774,11 +779,14 @@ func decryptOpenAIKey(value string) (string, error) {
 	if parts[1] != fingerprint {
 		return "", errors.New("🔒 机器码不匹配，需要重新输入 OPENAI_KEY")
 	}
-	if parts[3] != secretUUID {
-		return "", errors.New("🔒 双重因素UUID 不匹配，需要重新输入 OPENAI_KEY")
+
+	// parts[2] 如果含有 |，说明是旧格式（Base64数据|UUID），截断取前半部分
+	dataPart := parts[2]
+	if idx := strings.Index(dataPart, "|"); idx >= 0 {
+		return "", errors.New("🔒 检测到旧版加密格式，已不再支持。请在 config.json 中将 OPENAI_KEY 改为明文密钥后重新启动（程序会自动以新格式加密保存）")
 	}
 
-	payload, err := base64.StdEncoding.DecodeString(parts[2])
+	payload, err := base64.StdEncoding.DecodeString(dataPart)
 	if err != nil {
 		return "", err
 	}
