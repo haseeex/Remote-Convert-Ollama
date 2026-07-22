@@ -23,7 +23,7 @@
 
 **Remote API Convert Ollama** 是一个用 Go 编写的轻量级本地反向代理服务器。它监听在本地（或局域网）的 Ollama 兼容端口上，将 **Ollama API** 和 **Anthropic Messages API** 的请求实时转换为 **OpenAI 兼容 API** 请求，并转发到上游服务。
 
-> 💡 **简单来说**：你只需在 VS Code / VS2026 中配置 Ollama 作为 API 提供商，然后指向本程序，就能使用任何 **OpenAI 兼容的 API 服务**（如 DeepSeek、Claude 等）。
+> 💡 **简单来说**：你只需在 VS Code / VS2026 中配置 Ollama 作为 API 提供商，然后指向本程序，就能使用任何 **OpenAI 兼容的 API 服务**（如 DeepSeek、GPT、Claude 等）。
 
 ---
 
@@ -45,21 +45,32 @@
 | 客户端请求 | 转换目标 | 说明 |
 |-----------|---------|------|
 | `GET /api/version` | → 返回版本信息 | VS Code 探测 Ollama 服务 |
-| `GET /api/tags` | → `GET /v1/models` (上游) | 获取模型列表，支持别名与前后缀 |
-| `POST /api/show` | → 返回增强模型信息 | 包含上下文窗口、能力声明等 |
+| `GET /api/tags` | → `GET /v1/models` (上游) | 获取模型列表，支持别名、前后缀、上下文信息 |
+| `POST /api/show` | → 返回增强模型信息 | 包含上下文窗口、能力声明、Token 限制等 |
 | `POST /api/chat` | → `POST /v1/chat/completions` (上游) | Ollama 聊天补全 → OpenAI 格式 |
 | `POST /v1/chat/completions` | → `POST /v1/chat/completions` (上游) | 标准 OpenAI 流式/非流式透传 |
 | `POST /v1/messages` | → `POST /v1/chat/completions` (上游) | **Anthropic 格式 → OpenAI 格式转换** |
+| `POST /v1/messages/count_tokens` | → Token 估算 | Anthropic token 计数接口 |
 | `GET /v1/models` | → `GET /v1/models` (上游) | 获取上游模型列表 |
+| `GET /models` | → `GET /v1/models` (上游) | VS Code 旧版 API 兼容 |
 
 ### 🖥️ VS Code & VS2026 完美兼容
 
 - ✅ **Capabilities 声明** — 向客户端声明支持 `tools`、`vision` 等能力
 - ✅ **模型别名系统** — 通过 `ModelAlias` 配置将上游模型 ID 映射为友好名称
 - ✅ **显示名前缀/后缀** — 在客户端看到类似 `[VC反代] 高级智商` 的模型名称
-- ✅ **VS2026 思考功能** — 返回 `think: true` 启用推理能力
-- ✅ **超大上下文** — 声明 1M tokens 上下文窗口
+- ✅ **思考功能** — 返回 `think: true` 启用推理能力
+- ✅ **Reasoning 内容追踪** — 自动追踪 DeepSeek 思考模式，后续请求自动注入 `reasoning_content`
+- ✅ **VS Code 兼容映射** — `reasoning_content` → `reasoning_text` 自动映射
+- ✅ **超大上下文** — 声明 1M tokens 上下文窗口，支持每模型独立设置
 - ✅ **流式传输 (SSE)** — 支持 `stream: true`，实时输出
+
+### 🛠️ 工具调用支持
+
+- **Ollama 格式** → 自动转换为 OpenAI tool_calls 格式转发
+- **OpenAI 流式 tool_calls** → 累积合并后输出完整 tool_calls
+- **Anthropic tool_use** → 流式 `input_json_delta` 事件支持
+- **Anthropic 非流式** → tool_use content block 转换
 
 ### 🔒 安全保障
 
@@ -74,7 +85,10 @@
 - **自动创建**：首次运行自动生成 `config.json`
 - **自动补全**：版本更新后自动补充新增配置项
 - **自动加密**：首次输入明文 Key 自动加密回写
-- **自动获取模型列表**：启动时显示上游所有可用模型及其别名映射
+- **自动获取模型列表**：启动时显示上游所有可用模型及其别名映射、上下文长度、最大输出
+- **流式策略**：支持 `preserve` / `force_stream` / `force_close` 三种模式灵活切换
+- **日志分级**：可分别控制请求头(`Log_Headers`)、请求体(`Log_Body`)、响应内容(`Log_Responses`)的日志打印
+- **模型 Token 设置**：`ModelTokenSettings` 支持为每个模型单独指定上下文长度和最大输出 Token
 
 ---
 
@@ -94,7 +108,7 @@ cd Remote-Convert-Ollama
 # 安装 garble（用于混淆编译，可选）
 go install mvdan.cc/garble@latest
 
-# 编译
+# 混淆编译（推荐）
 garble build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 
 # 或者直接编译
@@ -114,9 +128,12 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
     "IP": "127.0.0.1",
     "PORT": "11434",
     "Log_Limit": 100,
+    "Log_Responses": true,
+    "Log_Headers": true,
+    "Log_Body": true,
     "OpenAI_Prefix": "[VC反代] ",
-    "OpenAI_Suffix": "by vancat",
-  "StreamMode": "preserve",
+    "OpenAI_Suffix": "",
+    "StreamMode": "preserve",
     "Capabilities": [
         "tools",
         "vision"
@@ -127,6 +144,12 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
         "deepseek-chat": "DeepSeek 通用",
         "deepseek-reasoner": "DeepSeek 推理",
         "gpt-4o": "GPT-4o 旗舰"
+    },
+    "ModelTokenSettings": {
+        "deepseek-chat": {
+            "ContextLength": 1000000,
+            "MaxOutputTokens": 64000
+        }
     }
 }
 ```
@@ -136,17 +159,31 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `IP` | 监听地址 | `0.0.0.0` |
 | `PORT` | 监听端口 | `11434` |
 | `Log_Limit` | 终端日志自动清理阈值(条) | `100` |
+| `Log_Responses` | 是否打印响应内容 | `true` |
+| `Log_Headers` | 是否打印请求头 | `true` |
+| `Log_Body` | 是否打印请求体 | `true` |
 | `OpenAI_Prefix` | 模型显示名前缀 | `[VC反代] ` |
-| `OpenAI_Suffix` | 模型显示名后缀 | `(by vancat)` |
-| `StreamMode` | 流式策略，可选 `preserve` / `force_stream` / `force_close` | `preserve` |
+| `OpenAI_Suffix` | 模型显示名后缀 | `""` (空) |
+| `StreamMode` | 流式策略 | `preserve` |
 | `Capabilities` | 能力声明列表 | `["tools", "vision"]` |
 | `OPENAI_BASE` | 上游 OpenAI 兼容 API 地址 | **必填** |
 | `OPENAI_KEY` | 上游 API 密钥 | **必填**，首次输入明文后自动加密 |
-| `ModelAlias` | 模型别名映射 | `{}` |
+| `ModelAlias` | 模型别名映射 `{上游ID: 显示名称}` | `{}` |
+| `ModelTokenSettings` | 模型 Token 手动设置 `{上游ID: {ContextLength, MaxOutputTokens}}` | `{}` |
 
-`StreamMode` 的含义如下：`preserve` 表示按客户端请求决定是否流式，`force_stream` 表示无论客户端是否请求都强制流式，`force_close` 表示无论客户端是否请求都强制非流式。
+**`StreamMode` 说明**：
+| 值 | 行为 |
+|-------|------|
+| `preserve` | 按客户端请求决定是否流式（默认） |
+| `force_stream` | 无论客户端是否请求，都强制使用流式 |
+| `force_close` | 无论客户端是否请求，都强制使用非流式 |
 
-> 兼容说明：旧版 `EnableStream=true/false` 会在首次启动时自动迁移为 `StreamMode=preserve/force_close`。
+**`ModelTokenSettings` 说明**：
+- 手动覆盖上游 API 返回的模型上下文长度和最大输出 Token 数
+- 当上游 API 不返回元数据或返回的值不准确时非常有用
+- 示例：`{"gpt-4o": {"ContextLength": 128000, "MaxOutputTokens": 16384}}`
+
+> **兼容说明**：旧版 `EnableStream=true/false` 会在首次启动时自动迁移为 `StreamMode=preserve/force_close`。
 
 > ⚠️ **注意**：`OPENAI_KEY` 在第一次启动后会自动加密并回写到配置文件中。后续启动将使用加密后的密钥，换机器会提示"机器码不匹配"。
 
@@ -189,16 +226,35 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 🛡️ 本程序不会保留任何调用记录到本地
 
 ══════════════════════ 🪄 配置项说明 ══════════════════════
- ▼ IP      : ...
- ...
+ ▼ IP              : 监听地址 (默认 0.0.0.0，本机测试用 127.0.0.1)
+ ▼ PORT            : 监听端口 (默认 11434，即 Ollama 默认端口)
+ ▼ Log_Limit       : 终端自动清理的日志行数阈值
+ ▼ Log_Responses   : 是否打印响应内容 (true/false)
+ ▼ Log_Headers     : 是否打印请求头 (true/false)
+ ▼ Log_Body        : 是否打印请求体 (true/false)
+ ▼ OpenAI_Prefix   : 返回给客户端的模型名称前缀
+ ▼ OpenAI_Suffix   : 返回给客户端的模型名称后缀
+ ▼ StreamMode      : 流式策略 = 不覆写/强制流式/强制关闭
+ ▼ Capabilities    : 向客户端声明支持的能力列表
+ ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)
+ ▼ OPENAI_KEY      : 上游 API 密钥 (必填，自动加密存储)
+ ▼ ModelAlias      : 模型别名映射 {上游模型ID: 显示名称}
+ ▼ ModelTokenSettings : 模型 Token 手动设置
+                      {上游模型ID: {ContextLength, MaxOutputTokens}}
+════════════════════════════════════════════════════════════
 
 📋 上游拥有的模型:
-   🧩 deepseek-chat → [VC反代] DeepSeek 通用
+   🧩 [VC反代] DeepSeek 通用
+       📎 上游模型ID: deepseek-chat
+       🔖 别名映射:   deepseek-chat → DeepSeek 通用
+       📐 上下文长度: 1000000
+       📤 最大输出:   64000
+       🛠️  能力集合:   [tools vision]
 
 🚀 转换器服务已启动 ~
 ```
 
-所有请求的元数据（模型、消息数量、字符数等）会实时显示在终端中，但**请求内容不会持久化到磁盘**。
+每条请求的详细信息（方法、路径、请求头、请求体等）会实时打印在终端中，但**请求内容不会持久化到磁盘**。
 
 ---
 
@@ -215,19 +271,30 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 - 多个模型共用一个别名
 - 搭配前后缀实现分类显示
 
+### 🧠 模型 Token 手动调优
+
+通过 `ModelTokenSettings` 你可以为每个模型单独设置：
+- **上下文长度** (ContextLength) — 覆盖上游返回的值
+- **最大输出 Token** (MaxOutputTokens) — 控制单次最大生成量
+- 适用于上游 API 不返回元数据或返回不准确的场景
+
 ### 🛡️ 自定义加密 UUID
 
 修改源码中的 `secretUUID` 常量，使用 [UUID Generator](https://www.uuidgenerator.net/) 生成自己的 UUID，增强加密安全性。
 
 ### 🔄 构建命令
 
-项目附带了 `构建.bat`，运行即可混淆编译：
+项目附带了两种构建脚本：
 
 ```batch
-garble build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
+:: 混淆编译（推荐，增加逆向难度）
+构建.bat
+
+:: 混淆编译 + 压缩 + UPX 加壳
+构建(加密和压缩).bat
 ```
 
-> 使用 `garble` 编译可以增加逆向难度，保护你的 API 配置信息。
+> 使用 `garble` 编译 + UPX 压缩可以有效保护你的 API 配置信息。
 
 ---
 
@@ -237,8 +304,11 @@ garble build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 Remote Convert Ollama/
 ├── Remote Convert Ollama.go   # 主程序源码
 ├── config.json                # 配置文件（首次运行自动生成）
-├── 构建.bat                   # Windows 构建脚本
-└── README.md                  # 本文件
+├── 构建.bat                   # Windows 混淆编译脚本
+├── 构建(加密和压缩).bat       # Windows 混淆编译+压缩脚本
+├── README.md                  # 本文件
+├── LICENSE                    # Apache 2.0 许可证
+└── 备份/                      # 配置文件备份目录
 ```
 
 ---
@@ -246,18 +316,20 @@ Remote Convert Ollama/
 ## 🧩 技术架构
 
 ```
-┌──────────────┐     Ollama / Anthropic API     ┌──────────────────────┐
-│  VS Code     │ ──────────────────────────────> │                      │
-│  VS2026      │     http://127.0.0.1:11434      │   Remote API Convert │
-│  其他客户端   │                                  │        Ollama        │
-└──────────────┘                                  │                      │
-                                                  │  ╭──────────────╮   │
-┌──────────────┐     OpenAI 兼容 API              │  │ 协议转换引擎  │   │
-│  DeepSeek    │ <────────────────────────────── │  │              │   │
-│  GPT-4o      │     https://upstream/v1/...      │  │ Ollama→OpenAI │   │
-│  Claude      │                                  │  │ Anthropic→OAI │   │
-│  其他服务商   │                                  │  ╰──────────────╯   │
-└──────────────┘                                  └──────────────────────┘
+┌──────────────┐     Ollama / Anthropic API     ┌──────────────────────────┐
+│  VS Code     │ ──────────────────────────────> │                          │
+│  VS2026      │     http://127.0.0.1:11434      │   Remote API Convert     │
+│  CherryStudio│                                  │        Ollama            │
+│  其他客户端   │                                  │                          │
+└──────────────┘                                  │  ╭──────────────────╮   │
+                                                  │  │  协议转换引擎     │   │
+┌──────────────┐     OpenAI 兼容 API              │  │                  │   │
+│  DeepSeek    │ <────────────────────────────── │  │ Ollama → OpenAI  │   │
+│  GPT-4o      │     https://upstream/v1/...      │  │ Anthropic → OAI  │   │
+│  Claude      │                                  │  │ 流式 tool_calls  │   │
+│  其他服务商   │                                  │  │ Reasoning 追踪   │   │
+└──────────────┘                                  │  ╰──────────────────╯   │
+                                                  └──────────────────────────┘
 ```
 
 ### 关键技术点
@@ -269,6 +341,8 @@ Remote Convert Ollama/
 | SHA-256 | 机器指纹 + UUID 密钥派生 |
 | Server-Sent Events (SSE) | 流式响应实时转发 |
 | 系统调用 (Windows) | 控制台标题设置、磁盘卷序列号获取 |
+| `bufio` 流式解析 | OpenAI / Anthropic 流式数据实时转发 |
+| `sync.RWMutex` | reasoning_content 线程安全读写 |
 
 ---
 
@@ -281,23 +355,25 @@ Remote Convert Ollama/
 2. 检查 VS Code 的 Ollama URL 设置是否为 `http://127.0.0.1:11434`
 3. 检查防火墙是否阻止了端口 `11434`
 4. 在浏览器中访问 `http://127.0.0.1:11434/api/version` 确认服务正常
+5. 检查终端日志是否有错误信息
 </details>
 
 <details>
 <summary><b>Q: 提示"机器码不匹配"？</b></summary>
 
 这是因为加密后的 API Key 绑定了当前机器的指纹。解决办法：
-1. 删掉 `config.json` 中的 `OPENAI_KEY` 字段（保留 `已加密|` 前缀之前的内容）
-2. 重新输入明文 API Key 启动程序
-3. 程序会自动重新加密
+1. 删掉 `config.json` 中的 `OPENAI_KEY` 字段（保留 `"OPENAI_KEY": ""` 留空）
+2. 在 `OPENAI_KEY` 中填入明文 API Key
+3. 重新启动程序，程序会自动重新加密并回写
 </details>
 
 <details>
 <summary><b>Q: 模型列表不显示？</b></summary>
 
 1. 检查 `OPENAI_BASE` 和 `OPENAI_KEY` 是否正确
-2. 关闭 VS Code，删除其模型缓存（VS Code 会缓存模型列表）
-3. 重新启动程序和 VS Code
+2. 启动时查看终端输出是否有"⚠️ 无法获取上游模型列表"的提示
+3. 关闭 VS Code，删除其模型缓存（VS Code 会缓存模型列表）
+4. 重新启动程序和 VS Code
 </details>
 
 <details>
@@ -309,7 +385,20 @@ Remote Convert Ollama/
 <details>
 <summary><b>Q: 日志太多怎么办？</b></summary>
 
-调整 `Log_Limit` 值，日志达到该阈值后终端会自动清屏。设置为 `0` 可禁用自动清理。
+可以通过以下方式控制日志输出量：
+- 调整 `Log_Limit` 值，日志达到该阈值后终端会自动清屏。设置为 `0` 可禁用自动清理
+- 将 `Log_Headers` 设为 `false` 关闭请求头打印
+- 将 `Log_Body` 设为 `false` 关闭请求体打印
+- 将 `Log_Responses` 设为 `false` 关闭响应内容打印
+</details>
+
+<details>
+<summary><b>Q: DeepSeek 思考模式下对话历史不连贯？</b></summary>
+
+本程序会自动追踪上游返回的 `reasoning_content`，并在客户端下次请求时自动注入。如果仍然有问题：
+1. 确保使用的是 `StreamMode: "preserve"`（默认值）
+2. 检查客户端是否发送了完整的消息历史
+3. 某些客户端可能需要手动清除对话后重新开始
 </details>
 
 ---
