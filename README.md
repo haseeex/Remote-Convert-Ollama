@@ -322,5 +322,10 @@ Remote Convert Ollama/
 
 <p align="center">
   如果这个项目对你有帮助，欢迎 ⭐ Star 和 🍴 Fork！<br>
-  <sub>Made with ❤️ by 我</sub>
+  Made with ❤️ by 
+  <a href="https://github.com/haseeex">
+    <img src="https://avatars.githubusercontent.com/u/62563787?v=4" width="32" style="border-radius:50%;" />
+  </a>
+</p>
+
 </p>
