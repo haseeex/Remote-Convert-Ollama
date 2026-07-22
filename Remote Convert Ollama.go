@@ -431,6 +431,98 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 			continue
 		}
 
+		// 处理 user/其他角色消息中的图片（Ollama 格式）
+		// Ollama 支持两种图片格式：
+		// 1. images 数组: {"role":"user","content":"文本","images":["base64..."]}
+		// 2. content 数组中的 image 块: {"role":"user","content":[{"type":"image","image_base64":"base64..."}]}
+		if role == "user" || role == "system" {
+			newMsg := make(map[string]interface{})
+			for k, v := range msgMap {
+				newMsg[k] = v
+			}
+
+			// 情况1: 检查 images 数组字段
+			hasImagesArray := false
+			if imagesRaw, hasImages := newMsg["images"]; hasImages {
+				if imagesList, ok := imagesRaw.([]interface{}); ok && len(imagesList) > 0 {
+					hasImagesArray = true
+					// 从 newMsg 移除 images 字段（OpenAI 不支持）
+					delete(newMsg, "images")
+
+					// 获取文本内容
+					textContent, _ := newMsg["content"].(string)
+
+					// 构建 content 数组
+					var contentArray []interface{}
+					if textContent != "" {
+						contentArray = append(contentArray, map[string]interface{}{
+							"type": "text",
+							"text": textContent,
+						})
+					}
+					for _, img := range imagesList {
+						if imgStr, ok := img.(string); ok && imgStr != "" {
+							mime := detectImageMIME(imgStr)
+							contentArray = append(contentArray, map[string]interface{}{
+								"type": "image_url",
+								"image_url": map[string]interface{}{
+									"url": "data:" + mime + ";base64," + imgStr,
+								},
+							})
+						}
+					}
+					if len(contentArray) > 0 {
+						newMsg["content"] = contentArray
+					}
+				}
+			}
+
+			// 情况2: 检查 content 是否为数组且包含 type:"image" 块
+			if !hasImagesArray {
+				if contentArray, ok := newMsg["content"].([]interface{}); ok {
+					hasImageBlock := false
+					for _, block := range contentArray {
+						if blockMap, ok := block.(map[string]interface{}); ok {
+							if t, _ := blockMap["type"].(string); t == "image" {
+								hasImageBlock = true
+								break
+							}
+						}
+					}
+					if hasImageBlock {
+						var newContent []interface{}
+						for _, block := range contentArray {
+							if blockMap, ok := block.(map[string]interface{}); ok {
+								if t, _ := blockMap["type"].(string); t == "image" {
+									// Ollama image 块 → OpenAI image_url 块
+									imgBase64, _ := blockMap["image_base64"].(string)
+									if imgBase64 != "" {
+										mime := detectImageMIME(imgBase64)
+										newContent = append(newContent, map[string]interface{}{
+											"type": "image_url",
+											"image_url": map[string]interface{}{
+												"url": "data:" + mime + ";base64," + imgBase64,
+											},
+										})
+									}
+								} else {
+									newContent = append(newContent, block)
+								}
+							} else {
+								newContent = append(newContent, block)
+							}
+						}
+						if len(newContent) > 0 {
+							newMsg["content"] = newContent
+						}
+					}
+				}
+			}
+
+			result = append(result, newMsg)
+			continue
+		}
+
 		result = append(result, msg)
 	}
 	return result
@@ -440,6 +532,32 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 func hasToolCalls(msg map[string]interface{}) bool {
 	tc, ok := msg["tool_calls"]
 	return ok && tc != nil
+}
+
+// detectImageMIME 根据 Base64 数据的前几个字符猜测图片 MIME 类型
+func detectImageMIME(b64 string) string {
+	if len(b64) < 4 {
+		return "image/png"
+	}
+	// 常见图片格式的 Base64 头部特征
+	switch {
+	case strings.HasPrefix(b64, "/9j/"):
+		return "image/jpeg"
+	case strings.HasPrefix(b64, "iVBOR"):
+		return "image/png"
+	case strings.HasPrefix(b64, "R0lG"):
+		return "image/gif"
+	case strings.HasPrefix(b64, "UklGR"):
+		return "image/webp"
+	case strings.HasPrefix(b64, "SUk"):
+		return "image/tiff"
+	case strings.HasPrefix(b64, "Qk"):
+		return "image/bmp"
+	case strings.HasPrefix(b64, "PHI"):
+		return "image/vnd.adobe.photoshop"
+	default:
+		return "image/png"
+	}
 }
 
 // makeOllamaMessage 构建 Ollama 格式的消息响应
@@ -2135,6 +2253,79 @@ func extractAnthropicContent(content interface{}) string {
 	}
 }
 
+// convertAnthropicContentToOpenAI 将 Anthropic 消息内容（含图片）转为 OpenAI 格式
+// Anthropic 图片格式: {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"base64..."}}
+// OpenAI 图片格式: {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}
+func convertAnthropicContentToOpenAI(content interface{}) interface{} {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []interface{}:
+		// 检查是否包含图片块
+		hasImage := false
+		for _, block := range v {
+			if blockMap, ok := block.(map[string]interface{}); ok {
+				if t, _ := blockMap["type"].(string); t == "image" {
+					hasImage = true
+					break
+				}
+			}
+		}
+		// 没有图片，直接提取文本
+		if !hasImage {
+			var parts []string
+			for _, block := range v {
+				if blockMap, ok := block.(map[string]interface{}); ok {
+					if t, _ := blockMap["type"].(string); t == "text" {
+						if text, ok := blockMap["text"].(string); ok {
+							parts = append(parts, text)
+						}
+					}
+				}
+			}
+			return strings.Join(parts, "\n")
+		}
+		// 有图片，构建 OpenAI content 数组
+		var contentArray []interface{}
+		for _, block := range v {
+			if blockMap, ok := block.(map[string]interface{}); ok {
+				switch blockMap["type"] {
+				case "text":
+					if text, ok := blockMap["text"].(string); ok && text != "" {
+						contentArray = append(contentArray, map[string]interface{}{
+							"type": "text",
+							"text": text,
+						})
+					}
+				case "image":
+					if source, ok := blockMap["source"].(map[string]interface{}); ok {
+						mediaType, _ := source["media_type"].(string)
+						if mediaType == "" {
+							data, _ := source["data"].(string)
+							mediaType = detectImageMIME(data)
+						}
+						data, _ := source["data"].(string)
+						if data != "" {
+							contentArray = append(contentArray, map[string]interface{}{
+								"type": "image_url",
+								"image_url": map[string]interface{}{
+									"url": "data:" + mediaType + ";base64," + data,
+								},
+							})
+						}
+					}
+				}
+			}
+		}
+		if len(contentArray) > 0 {
+			return contentArray
+		}
+		return ""
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 // 转换 Anthropic 请求 → OpenAI 请求
 // extractSystemText 从 Anthropic system 字段提取文本（支持 string 和 []{type, text} 两种格式）
 func extractSystemText(system interface{}) string {
@@ -2172,9 +2363,9 @@ func convertAnthropicToOpenAI(areq *AnthropicReq) ([]byte, error) {
 		})
 	}
 
-	// 转换每条消息
+	// 转换每条消息（含图片处理）
 	for _, msg := range areq.Messages {
-		content := extractAnthropicContent(msg.Content)
+		content := convertAnthropicContentToOpenAI(msg.Content)
 		messages = append(messages, map[string]interface{}{
 			"role":    msg.Role,
 			"content": content,
@@ -2589,6 +2780,46 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// hasImageInBody 检测请求体中是否包含图片
+// 支持 Ollama images 数组、Ollama content image 块、Anthropic image 块、OpenAI image_url 四种格式
+func hasImageInBody(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return false
+	}
+	// 检查 messages 数组
+	messages, _ := req["messages"].([]interface{})
+	for _, msg := range messages {
+		msgMap, _ := msg.(map[string]interface{})
+		if msgMap == nil {
+			continue
+		}
+		// Ollama images 数组
+		if images, _ := msgMap["images"].([]interface{}); len(images) > 0 {
+			return true
+		}
+		// content 数组中的图片块
+		if contentArr, _ := msgMap["content"].([]interface{}); len(contentArr) > 0 {
+			for _, block := range contentArr {
+				blockMap, _ := block.(map[string]interface{})
+				if blockMap == nil {
+					continue
+				}
+				switch blockMap["type"] {
+				case "image", "image_url":
+					return true
+				}
+			}
+		}
+	}
+	// Anthropic /v1/messages 格式（顶层 content 数组已在 messages 中处理）
+	// Anthropic system 字段也可能含图片（较少见，不做额外处理）
+	return false
+}
+
 func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	count := atomic.AddInt64(&requestCount, 1)
 	if count >= cfg.Log_Limit {
@@ -2599,7 +2830,12 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 
 	body, _ := io.ReadAll(r.Body)
 
-	fmt.Println("📤 ========= 客户端 请求 ==========")
+	hasImage := hasImageInBody(body)
+	if hasImage {
+		fmt.Println("🖼️ ===== 客户端 请求 (含图片) =====")
+	} else {
+		fmt.Println("📤 ========= 客户端 请求 ==========")
+	}
 	fmt.Println("方法:", r.Method)
 	fmt.Println("路径:", r.URL.Path)
 	fmt.Println("查询:", r.URL.RawQuery)
