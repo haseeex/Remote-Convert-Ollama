@@ -31,20 +31,26 @@ import (
 	"unsafe"
 )
 
+type ModelTokenSetting struct {
+	ContextLength   int64 `json:"ContextLength"`
+	MaxOutputTokens int64 `json:"MaxOutputTokens"`
+}
+
 type Config struct {
-	IP            string            `json:"IP"`
-	PORT          string            `json:"PORT"`
-	Log_Limit     int64             `json:"Log_Limit"`
-	Log_Responses bool              `json:"Log_Responses"`
-	Log_Headers   bool              `json:"Log_Headers"`
-	Log_Body      bool              `json:"Log_Body"`
-	OpenAIPrefix  string            `json:"OpenAI_Prefix"`
-	OpenAISuffix  string            `json:"OpenAI_Suffix"`
-	StreamMode    string            `json:"StreamMode"`
-	Capabilities  []string          `json:"Capabilities"`
-	OpenAIBase    string            `json:"OPENAI_BASE"`
-	OpenAIKey     string            `json:"OPENAI_KEY"`
-	ModelAlias    map[string]string `json:"ModelAlias"`
+	IP                 string                       `json:"IP"`
+	PORT               string                       `json:"PORT"`
+	Log_Limit          int64                        `json:"Log_Limit"`
+	Log_Responses      bool                         `json:"Log_Responses"`
+	Log_Headers        bool                         `json:"Log_Headers"`
+	Log_Body           bool                         `json:"Log_Body"`
+	OpenAIPrefix       string                       `json:"OpenAI_Prefix"`
+	OpenAISuffix       string                       `json:"OpenAI_Suffix"`
+	StreamMode         string                       `json:"StreamMode"`
+	Capabilities       []string                     `json:"Capabilities"`
+	OpenAIBase         string                       `json:"OPENAI_BASE"`
+	OpenAIKey          string                       `json:"OPENAI_KEY"`
+	ModelAlias         map[string]string            `json:"ModelAlias"`
+	ModelTokenSettings map[string]ModelTokenSetting `json:"ModelTokenSettings"`
 }
 
 var requestCount int64
@@ -85,6 +91,10 @@ const (
 // 这个 UUID 是用来增强加密安全性的，确保同一台机器上的加密结果不同于其他机器。它不会泄露任何敏感信息。
 // 推荐生成网站 https://www.uuidgenerator.net/ 生成一个随机的 UUID 来替换这个值。
 const secretUUID = "vancat-10a8bca6-fe6f-4bcd-8c9a-9a27d6ec1b16"
+
+// 上下文默认值，当上游 API 未返回模型元数据时使用
+const DefaultContextLength = 1000000
+const DefaultMaxOutputTokens = 384000
 
 // OllamaToolCall 是 Ollama 格式的工具调用
 type OllamaToolCall struct {
@@ -449,19 +459,20 @@ func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, 
 
 func getDefaultConfig() Config {
 	return Config{
-		IP:            "0.0.0.0",
-		PORT:          "11434",
-		Log_Limit:     100,
-		Log_Responses: true,
-		Log_Headers:   true,
-		Log_Body:      true,
-		OpenAIPrefix:  "[VC反代] ",
-		OpenAISuffix:  "",
-		StreamMode:    streamModePreserve,
-		Capabilities:  []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
-		OpenAIBase:    "https://api.openai.com/v1",
-		OpenAIKey:     "",
-		ModelAlias:    map[string]string{}, // 模型别名：key=上游模型ID, value=显示名称
+		IP:                 "0.0.0.0",
+		PORT:               "11434",
+		Log_Limit:          100,
+		Log_Responses:      true,
+		Log_Headers:        true,
+		Log_Body:           true,
+		OpenAIPrefix:       "[VC反代] ",
+		OpenAISuffix:       "",
+		StreamMode:         streamModePreserve,
+		Capabilities:       []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
+		OpenAIBase:         "https://api.openai.com/v1",
+		OpenAIKey:          "",
+		ModelAlias:         map[string]string{},            // 模型别名：key=上游模型ID, value=显示名称
+		ModelTokenSettings: map[string]ModelTokenSetting{}, // 模型 token 设置：key=上游模型ID, value={ContextLength, MaxOutputTokens}
 	}
 }
 
@@ -481,6 +492,9 @@ func printConfigHelp() {
 	fmt.Println(" ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)")
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
 	fmt.Println(" ▼ ModelAlias      : 模型别名映射,仅影响模型名字显示 {上游模型ID: 显示名称, 上游模型ID: 显示名称, ...}")
+	fmt.Println(" ▼ ModelTokenSettings : 模型 Token 手动设置,覆盖上游自动获取的值")
+	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出}, ...}")
+	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384}}")
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════════════════════════════════")
 	fmt.Println("")
 }
@@ -514,13 +528,38 @@ func printModelAliases() {
 		return
 	}
 
+	// 获取模型元数据（上下文长度、输出上限等）
+	modelMeta := fetchUpstreamModelMeta()
+
 	fmt.Println("📋 上游拥有的模型:")
 	for _, m := range upstream.Data {
+		displayName := m.ID
 		if alias, ok := cfg.ModelAlias[m.ID]; ok && alias != "" {
-			fmt.Printf("   🧩 %s → %s%s%s\n", m.ID, cfg.OpenAIPrefix, alias, cfg.OpenAISuffix)
-		} else {
-			fmt.Printf("   💠 %s → %s%s%s\n", m.ID, cfg.OpenAIPrefix, m.ID, cfg.OpenAISuffix)
+			displayName = alias
 		}
+		displayName = cfg.OpenAIPrefix + displayName + cfg.OpenAISuffix
+
+		// 获取该模型的上下文信息
+		meta := modelMeta[m.ID]
+		ctxLen := meta.ContextLength
+		maxOut := meta.MaxOutputTokens
+		if ctxLen <= 0 {
+			ctxLen = DefaultContextLength
+		}
+		if maxOut <= 0 {
+			maxOut = DefaultMaxOutputTokens
+		}
+
+		fmt.Printf("   🧩 %s\n", displayName)
+		fmt.Printf("       📎 上游模型ID: %s\n", m.ID)
+		if alias, ok := cfg.ModelAlias[m.ID]; ok && alias != "" {
+			fmt.Printf("       🔖 别名映射:   %s → %s\n", m.ID, alias)
+		} else {
+			fmt.Printf("       🔖 别名映射:   未设置，使用原始名称\n")
+		}
+		fmt.Printf("       📐 上下文长度: %d\n", ctxLen)
+		fmt.Printf("       📤 最大输出:   %d\n", maxOut)
+		fmt.Printf("       🛠️  能力集合:   %v\n", cfg.Capabilities)
 	}
 	fmt.Println("")
 }
@@ -614,6 +653,10 @@ func loadConfig() {
 	}
 	if _, ok := rawMap["ModelAlias"]; !ok {
 		stored.ModelAlias = defaultCfg.ModelAlias
+		needSave = true
+	}
+	if _, ok := rawMap["ModelTokenSettings"]; !ok {
+		stored.ModelTokenSettings = defaultCfg.ModelTokenSettings
 		needSave = true
 	}
 
@@ -832,6 +875,114 @@ func saveConfig(stored Config) error {
 
 	data = append(data, '\n')
 	return os.WriteFile("config.json", data, 0644)
+}
+
+// upstreamModelMeta 上游模型元数据
+type upstreamModelMeta struct {
+	ContextLength   int64
+	MaxOutputTokens int64
+}
+
+// fetchUpstreamModelMeta 调用上游 /v1/models 获取模型元数据并构建映射，
+// 然后合并 ModelTokenSettings 中手动指定的值（手动设置优先）
+func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
+	result := make(map[string]upstreamModelMeta)
+
+	req, err := http.NewRequest("GET", cfg.OpenAIBase+"/models", nil)
+	if err != nil {
+		return applyManualModelSettings(result)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return applyManualModelSettings(result)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	// 先用通用 map 解析，捕获所有可能字段
+	var upstreamResp struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &upstreamResp); err != nil {
+		return applyManualModelSettings(result)
+	}
+
+	for _, modelData := range upstreamResp.Data {
+		id, _ := modelData["id"].(string)
+		if id == "" {
+			continue
+		}
+
+		info := upstreamModelMeta{
+			ContextLength:   DefaultContextLength,
+			MaxOutputTokens: DefaultMaxOutputTokens,
+		}
+
+		// 尝试从多种可能的字段名中提取上下文长度
+		for _, field := range []string{"context_length", "max_input_tokens", "max_input_length", "context_window", "max_context"} {
+			if v := extractNumeric(modelData, field); v > 0 {
+				info.ContextLength = v
+				break
+			}
+		}
+
+		// 尝试提取最大输出 token 数
+		for _, field := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
+			if v := extractNumeric(modelData, field); v > 0 {
+				info.MaxOutputTokens = v
+				break
+			}
+		}
+
+		result[id] = info
+	}
+
+	// 合并 ModelTokenSettings 手动配置（手动设置优先）
+	return applyManualModelSettings(result)
+}
+
+// applyManualModelSettings 将 ModelTokenSettings 中的手动配置合并到 result 中
+func applyManualModelSettings(result map[string]upstreamModelMeta) map[string]upstreamModelMeta {
+	for modelID, setting := range cfg.ModelTokenSettings {
+		if setting.ContextLength <= 0 && setting.MaxOutputTokens <= 0 {
+			continue
+		}
+		info := result[modelID]
+		if setting.ContextLength > 0 {
+			info.ContextLength = setting.ContextLength
+		}
+		if setting.MaxOutputTokens > 0 {
+			info.MaxOutputTokens = setting.MaxOutputTokens
+		}
+		result[modelID] = info
+	}
+	return result
+}
+
+// extractNumeric 从 map 中提取 int64 数值字段（支持 float64 / int / int64 / json.Number）
+func extractNumeric(data map[string]interface{}, field string) int64 {
+	v, ok := data[field]
+	if !ok {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case json.Number:
+		val, err := n.Int64()
+		if err == nil {
+			return val
+		}
+	}
+	return 0
 }
 
 // mapFinishReason 将 OpenAI 的 finish_reason 映射为 Ollama 的 done_reason
@@ -2236,63 +2387,102 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 
 	raw, _ := io.ReadAll(resp.Body)
 
-	var oai struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+	// 先用通用 map 解析上游模型列表，捕获所有可能字段用于提取上下文
+	var upstreamModels struct {
+		Data []map[string]interface{} `json:"data"`
 	}
-	json.Unmarshal(raw, &oai)
+	json.Unmarshal(raw, &upstreamModels)
+
+	// 从上游获取模型元数据（上下文长度等）
+	modelMeta := fetchUpstreamModelMeta()
+
+	// 也尝试从上游模型列表的原始响应中提取字段（有些上游会在 data 数组里直接带元数据）
+	for _, modelData := range upstreamModels.Data {
+		id, _ := modelData["id"].(string)
+		if id == "" {
+			continue
+		}
+		if _, exists := modelMeta[id]; !exists {
+			info := upstreamModelMeta{
+				ContextLength:   DefaultContextLength,
+				MaxOutputTokens: DefaultMaxOutputTokens,
+			}
+			for _, field := range []string{"context_length", "max_input_tokens", "max_input_length", "context_window", "max_context"} {
+				if v := extractNumeric(modelData, field); v > 0 {
+					info.ContextLength = v
+					break
+				}
+			}
+			for _, field := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
+				if v := extractNumeric(modelData, field); v > 0 {
+					info.MaxOutputTokens = v
+					break
+				}
+			}
+			modelMeta[id] = info
+		}
+	}
 
 	const DefaultModelSize = 100 * 1024 * 1024
 
 	var models []map[string]interface{}
-	for _, m := range oai.Data {
+	for _, modelData := range upstreamModels.Data {
+		modelID, _ := modelData["id"].(string)
+		if modelID == "" {
+			continue
+		}
+
+		// 获取该模型的上文信息
+		meta := modelMeta[modelID]
+		ctxLen := meta.ContextLength
+		maxOut := meta.MaxOutputTokens
+
 		// 显示名称：优先使用 ModelAlias 中的别名，否则用上游 ID，再套上前后缀
-		displayName := m.ID
-		if alias, ok := cfg.ModelAlias[m.ID]; ok && alias != "" {
+		displayName := modelID
+		if alias, ok := cfg.ModelAlias[modelID]; ok && alias != "" {
 			displayName = alias
 		}
 		displayName = cfg.OpenAIPrefix + displayName + cfg.OpenAISuffix
 		models = append(models, map[string]interface{}{
 			"name":        displayName, // 显示名（可别名）
-			"model":       m.ID,        // 实际请求用的模型 ID
-			"modelId":     m.ID,        // 实际请求用的模型 ID
+			"model":       modelID,     // 实际请求用的模型 ID
+			"modelId":     modelID,     // 实际请求用的模型 ID
 			"modified_at": time.Now().Format(time.RFC3339),
 			"size":        DefaultModelSize,
 			"digest":      "sha256:fake",
 			"detail":      "Fast, general-purpose model",
-			"tooltip":     "This is a tooltip for " + m.ID,
+			"tooltip":     "This is a tooltip for " + modelID,
 			"details": map[string]interface{}{
 				"format":             "gguf",
-				"family":             m.ID,
+				"family":             modelID,
 				"quantization_level": "none",
-				"families":           []string{m.ID}, // ← 加这个
+				"families":           []string{modelID},
 			},
-			"model_info": map[string]interface{}{ // ← 加这个
-				"general.basename":       displayName, // ← VC Code 用这个字段显示别名
-				"general.architecture":   m.ID,
-				m.ID + ".context_length": 1000000, // ← 动态生成
-				"num_ctx":                1000000, // 1M 上下文
-				"max_output_tokens":      1000000,
-				"supports_vision":        true,
-				"supports_reasoning":     true, // ← 加这个
-				"supports_tools":         true, // ← 加这个
+			"model_info": map[string]interface{}{
+				"general.basename":          displayName,
+				"general.architecture":      modelID,
+				modelID + ".context_length": ctxLen,
+				"num_ctx":                   ctxLen,
+				"max_output_tokens":         maxOut,
+				"supports_vision":           true,
+				"supports_reasoning":        true,
+				"supports_tools":            true,
 			},
-			"capabilities":  cfg.Capabilities, // vs2026 需要这个字段才能启用工具功能
-			"contextWindow": 1000000,          // 65536 上下文
+			"capabilities":  cfg.Capabilities,
+			"contextWindow": ctxLen,
 			"options": map[string]interface{}{
-				"num_ctx": 1000000,
+				"num_ctx": ctxLen,
 			},
-			"context_length":                  1000000, // 1M 上下文
-			"prompt_tokens":                   1000000, // 1M 上下文
-			"completion_tokens":               1000000, // 1M 上下文
-			"total_tokens":                    1000000, // 1M 上下文
-			"maxInputTokens":                  1000000, // 1M 上下文
-			"maxOutputTokens":                 384000,  // 1M 上下文
+			"context_length":                  ctxLen,
+			"prompt_tokens":                   ctxLen,
+			"completion_tokens":               ctxLen,
+			"total_tokens":                    ctxLen,
+			"maxInputTokens":                  ctxLen,
+			"maxOutputTokens":                 maxOut,
 			"capabilities.supports.vision":    true,
-			"capabilities.supports.reasoning": true, // ← 加这个
-			"capabilities.supports.tools":     true, // ← 加这个
-			"think":                           true, // ← 加这个，启用 VS2026 的思考功能
+			"capabilities.supports.reasoning": true,
+			"capabilities.supports.tools":     true,
+			"think":                           true,
 		})
 	}
 
@@ -2319,6 +2509,12 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 		modelID = "deepseek-v4-pro"
 	}
 
+	// 从上游获取该模型的元数据
+	meta := fetchUpstreamModelMeta()
+	modelMeta := meta[modelID]
+	ctxLen := modelMeta.ContextLength
+	maxOut := modelMeta.MaxOutputTokens
+
 	// 显示名称：优先使用 ModelAlias 中的别名，否则用上游 ID，再套上前后缀
 	displayName := modelID
 	if alias, ok := cfg.ModelAlias[modelID]; ok && alias != "" {
@@ -2331,9 +2527,9 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 
 	out := map[string]interface{}{
 		"model": map[string]interface{}{
-			"name":        displayName, // 显示名（可别名）
-			"model":       modelID,     // 实际请求用的模型 ID
-			"modelId":     modelID,     // 实际请求用的模型 ID
+			"name":        displayName,
+			"model":       modelID,
+			"modelId":     modelID,
 			"modified_at": time.Now().Format(time.RFC3339),
 			"size":        DefaultModelSize,
 			"digest":      "sha256:fake",
@@ -2342,40 +2538,39 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 				"family":             modelID,
 				"parameter_size":     "1M",
 				"quantization_level": "none",
-				"families":           []string{modelID}, // ← 加这个
-				"context_length":     1000000,           // 1M 上下文
+				"families":           []string{modelID},
+				"context_length":     ctxLen,
 			},
 		},
 		"model_info": map[string]interface{}{
-			"general.basename":          displayName, // ← VC Code 用这个字段显示别名
-			"general.architecture":      modelID,     // ← 用 name
-			modelID + ".context_length": 1000000,     // ← 加这个动态字段！
-			"num_ctx":                   1000000,     // DeepSeek V4P 真实上下文：1M tokens
-			"max_output_tokens":         65535,       // DeepSeek V4P 最大输出：65535 tokens
+			"general.basename":          displayName,
+			"general.architecture":      modelID,
+			modelID + ".context_length": ctxLen,
+			"num_ctx":                   ctxLen,
+			"max_output_tokens":         maxOut,
 			"num_batch":                 512,
 			"num_gpu":                   1,
-			//"general.architecture":   "deepseek",
-			"general.file_type":      0,
-			"llama.context_length":   1000000, // 1M 上下文
-			"general.context_length": 1000000, // 1M 上下文
-			"n_ctx_train":            1000000, // 1M 上下文
-			"context_length":         1000000, // 1M 上下文
+			"general.file_type":         0,
+			"llama.context_length":      ctxLen,
+			"general.context_length":    ctxLen,
+			"n_ctx_train":               ctxLen,
+			"context_length":            ctxLen,
 		},
-		"capabilities":  cfg.Capabilities, // vs2026 需要这个字段才能启用工具功能
-		"contextWindow": 1000000,          // 65536 上下文
+		"capabilities":  cfg.Capabilities,
+		"contextWindow": ctxLen,
 		"options": map[string]interface{}{
-			"num_ctx": 1000000,
+			"num_ctx": ctxLen,
 		},
-		"context_length":                  1000000, // 1M 上下文
-		"prompt_tokens":                   1000000, // 1M 上下文
-		"completion_tokens":               1000000, // 1M 上下文
-		"total_tokens":                    1000000, // 1M 上下文
-		"maxInputTokens":                  1000000, // 1M 上下文
-		"maxOutputTokens":                 384000,  // 1M 上下文
+		"context_length":                  ctxLen,
+		"prompt_tokens":                   ctxLen,
+		"completion_tokens":               ctxLen,
+		"total_tokens":                    ctxLen,
+		"maxInputTokens":                  ctxLen,
+		"maxOutputTokens":                 maxOut,
 		"capabilities.supports.vision":    true,
-		"capabilities.supports.reasoning": true, // ← 加这个
-		"capabilities.supports.tools":     true, // ← 加这个
-		"think":                           true, // ← 加这个，启用 VS2026 的思考功能
+		"capabilities.supports.reasoning": true,
+		"capabilities.supports.tools":     true,
+		"think":                           true,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
