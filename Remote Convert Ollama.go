@@ -31,26 +31,33 @@ import (
 	"unsafe"
 )
 
-type ModelTokenSetting struct {
-	ContextLength   int64 `json:"ContextLength"`
-	MaxOutputTokens int64 `json:"MaxOutputTokens"`
+type VisionSubModelSetting struct {
+	Enable    bool   `json:"Enable"`
+	SubModels string `json:"SubModels"`
+}
+
+type ModelSettings struct {
+	ContextLength         int64                  `json:"ContextLength"`
+	MaxOutputTokens       int64                  `json:"MaxOutputTokens"`
+	Capabilities          []string               `json:"Capabilities,omitempty"`
+	VisionSubModelSetting *VisionSubModelSetting `json:"VisionSubModelSetting,omitempty"`
 }
 
 type Config struct {
-	IP                 string                       `json:"IP"`
-	PORT               string                       `json:"PORT"`
-	Log_Limit          int64                        `json:"Log_Limit"`
-	Log_Responses      bool                         `json:"Log_Responses"`
-	Log_Headers        bool                         `json:"Log_Headers"`
-	Log_Body           bool                         `json:"Log_Body"`
-	OpenAIPrefix       string                       `json:"OpenAI_Prefix"`
-	OpenAISuffix       string                       `json:"OpenAI_Suffix"`
-	StreamMode         string                       `json:"StreamMode"`
-	Capabilities       []string                     `json:"Capabilities"`
-	OpenAIBase         string                       `json:"OPENAI_BASE"`
-	OpenAIKey          string                       `json:"OPENAI_KEY"`
-	ModelAlias         map[string]string            `json:"ModelAlias"`
-	ModelTokenSettings map[string]ModelTokenSetting `json:"ModelTokenSettings"`
+	IP            string                    `json:"IP"`
+	PORT          string                    `json:"PORT"`
+	Log_Limit     int64                     `json:"Log_Limit"`
+	Log_Responses bool                      `json:"Log_Responses"`
+	Log_Headers   bool                      `json:"Log_Headers"`
+	Log_Body      bool                      `json:"Log_Body"`
+	OpenAIPrefix  string                    `json:"OpenAI_Prefix"`
+	OpenAISuffix  string                    `json:"OpenAI_Suffix"`
+	StreamMode    string                    `json:"StreamMode"`
+	Capabilities  []string                  `json:"Capabilities"`
+	OpenAIBase    string                    `json:"OPENAI_BASE"`
+	OpenAIKey     string                    `json:"OPENAI_KEY"`
+	ModelAlias    map[string]string         `json:"ModelAlias"`
+	ModelSettings map[string]*ModelSettings `json:"ModelSettings"`
 }
 
 var requestCount int64
@@ -577,20 +584,20 @@ func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, 
 
 func getDefaultConfig() Config {
 	return Config{
-		IP:                 "0.0.0.0",
-		PORT:               "11434",
-		Log_Limit:          100,
-		Log_Responses:      true,
-		Log_Headers:        true,
-		Log_Body:           true,
-		OpenAIPrefix:       "[VC反代] ",
-		OpenAISuffix:       "",
-		StreamMode:         streamModePreserve,
-		Capabilities:       []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
-		OpenAIBase:         "https://api.openai.com/v1",
-		OpenAIKey:          "",
-		ModelAlias:         map[string]string{},            // 模型别名：key=上游模型ID, value=显示名称
-		ModelTokenSettings: map[string]ModelTokenSetting{}, // 模型 token 设置：key=上游模型ID, value={ContextLength, MaxOutputTokens}
+		IP:            "0.0.0.0",
+		PORT:          "11434",
+		Log_Limit:     100,
+		Log_Responses: true,
+		Log_Headers:   true,
+		Log_Body:      true,
+		OpenAIPrefix:  "[VC反代] ",
+		OpenAISuffix:  "",
+		StreamMode:    streamModePreserve,
+		Capabilities:  []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
+		OpenAIBase:    "https://api.openai.com/v1",
+		OpenAIKey:     "",
+		ModelAlias:    map[string]string{},         // 模型别名：key=上游模型ID, value=显示名称
+		ModelSettings: map[string]*ModelSettings{}, // 模型设置：key=上游模型ID, value={ContextLength, MaxOutputTokens, Capabilities, VisionSubModelSetting}
 	}
 }
 
@@ -610,9 +617,9 @@ func printConfigHelp() {
 	fmt.Println(" ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)")
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
 	fmt.Println(" ▼ ModelAlias      : 模型别名映射,仅影响模型名字显示 {上游模型ID: 显示名称, 上游模型ID: 显示名称, ...}")
-	fmt.Println(" ▼ ModelTokenSettings : 模型 Token 手动设置,覆盖上游自动获取的值")
-	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出}, ...}")
-	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384}}")
+	fmt.Println(" ▼ ModelSettings : 模型手动设置,覆盖上游自动获取的值")
+	fmt.Println("                     格式: {上游模型ID: {ContextLength, MaxOutputTokens, Capabilities, VisionSubModelSetting}, ...}")
+	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384, \"Capabilities\": [\"tools\", \"vision\"]}}")
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════════════════════════════════")
 	fmt.Println("")
 }
@@ -773,8 +780,8 @@ func loadConfig() {
 		stored.ModelAlias = defaultCfg.ModelAlias
 		needSave = true
 	}
-	if _, ok := rawMap["ModelTokenSettings"]; !ok {
-		stored.ModelTokenSettings = defaultCfg.ModelTokenSettings
+	if _, ok := rawMap["ModelSettings"]; !ok {
+		stored.ModelSettings = defaultCfg.ModelSettings
 		needSave = true
 	}
 
@@ -1010,7 +1017,7 @@ type upstreamModelMeta struct {
 }
 
 // fetchUpstreamModelMeta 调用上游 /v1/models 获取模型元数据并构建映射，
-// 然后合并 ModelTokenSettings 中手动指定的值（手动设置优先）
+// 然后合并 ModelSettings 中手动指定的值（手动设置优先）
 func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 	result := make(map[string]upstreamModelMeta)
 
@@ -1067,14 +1074,14 @@ func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 		result[id] = info
 	}
 
-	// 合并 ModelTokenSettings 手动配置（手动设置优先）
+	// 合并 ModelSettings 手动配置（手动设置优先）
 	return applyManualModelSettings(result)
 }
 
-// applyManualModelSettings 将 ModelTokenSettings 中的手动配置合并到 result 中
+// applyManualModelSettings 将 ModelSettings 中的手动配置合并到 result 中
 func applyManualModelSettings(result map[string]upstreamModelMeta) map[string]upstreamModelMeta {
-	for modelID, setting := range cfg.ModelTokenSettings {
-		if setting.ContextLength <= 0 && setting.MaxOutputTokens <= 0 {
+	for modelID, setting := range cfg.ModelSettings {
+		if setting == nil || (setting.ContextLength <= 0 && setting.MaxOutputTokens <= 0) {
 			continue
 		}
 		info := result[modelID]
@@ -1087,6 +1094,49 @@ func applyManualModelSettings(result map[string]upstreamModelMeta) map[string]up
 		result[modelID] = info
 	}
 	return result
+}
+
+// resolveVisionModel 根据请求是否包含图片，决定是否切换到视觉子模型
+// 规则：如果请求包含图片，且主模型配置了 VisionSubModelSetting.Enable=true，
+// 则自动将图片请求交给子模型处理（子模型帮主模型"看"图片）
+func resolveVisionModel(modelName string, hasImage bool) string {
+	if !hasImage {
+		return modelName
+	}
+	settings, ok := cfg.ModelSettings[modelName]
+	if !ok || settings == nil || settings.VisionSubModelSetting == nil || !settings.VisionSubModelSetting.Enable {
+		return modelName
+	}
+	subModel := strings.TrimSpace(settings.VisionSubModelSetting.SubModels)
+	if subModel == "" {
+		return modelName
+	}
+	fmt.Printf("🖼️ 模型 [%s] 启用视觉子模型 [%s]，图片请求交由子模型处理\n", modelName, subModel)
+	return subModel
+}
+
+// resolveVisionModelInBody 检查请求体，如果包含图片且主模型不支持视觉，
+// 则自动将 body 中的 model 字段替换为视觉子模型
+func resolveVisionModelInBody(body []byte) []byte {
+	if !hasImageInBody(body) {
+		return body
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	modelName, _ := req["model"].(string)
+	if modelName == "" {
+		return body
+	}
+	resolved := resolveVisionModel(modelName, true)
+	if resolved == modelName {
+		return body
+	}
+	fmt.Printf("🖼️ resolveVisionModelInBody: 模型 [%s] → [%s]（视觉子模型切换）\n", modelName, resolved)
+	req["model"] = resolved
+	newBody, _ := json.Marshal(req)
+	return newBody
 }
 
 // extractNumeric 从 map 中提取 int64 数值字段（支持 float64 / int / int64 / json.Number）
@@ -1137,6 +1187,15 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	model := "deepseek-chat"
 	if m, ok := req["model"].(string); ok {
 		model = m
+	}
+
+	// 视觉子模型切换：如果请求包含图片且主模型不支持视觉，自动切换到子模型
+	hasImage := hasImageInBody(body)
+	resolvedModel := resolveVisionModel(model, hasImage)
+	if resolvedModel != model {
+		fmt.Printf("🖼️ ollamaChat: 模型 [%s] → [%s]（视觉子模型切换）\n", model, resolvedModel)
+		model = resolvedModel
+		req["model"] = model
 	}
 
 	var messages []interface{}
@@ -1526,6 +1585,9 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 func openaiChat(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 
+	// 视觉子模型切换：如果请求包含图片且主模型不支持视觉，自动切换到子模型
+	body = resolveVisionModelInBody(body)
+
 	// 判断是否为流式请求
 	var reqMeta struct {
 		Stream bool `json:"stream"`
@@ -1580,6 +1642,9 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 
 // 流式响应处理
 func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
+	// 视觉子模型切换：如果请求包含图片且主模型不支持视觉，自动切换到子模型
+	body = resolveVisionModelInBody(body)
+
 	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(body))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -1752,6 +1817,15 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("ANTHROPIC RAW BODY:", string(body))
 		http.Error(w, `{"error":{"type":"invalid_request_error","message":"Invalid JSON"}}`, 400)
 		return
+	}
+
+	// 视觉子模型切换：检查 Anthropic 请求中是否包含图片
+	if hasImageInBody(body) {
+		resolved := resolveVisionModel(areq.Model, true)
+		if resolved != areq.Model {
+			fmt.Printf("🖼️ anthropicMessages: 模型 [%s] → [%s]（视觉子模型切换）\n", areq.Model, resolved)
+			areq.Model = resolved
+		}
 	}
 
 	if areq.Stream {
