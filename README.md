@@ -1,4 +1,3 @@
-
 <p align="center">
   <img src="https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go Version"/>
   <img src="https://img.shields.io/badge/VS%20Code-Compatible-007ACC?style=for-the-badge&logo=visualstudiocode&logoColor=white" alt="VS Code"/>
@@ -15,6 +14,10 @@
 
 <p align="center">
   <b>因为微软不支持第三方 API，所以我造了一个轮子 🛞</b>
+</p>
+
+<p align="center">
+  <img src="images/%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE%202026-07-28%20083154.png" alt="Remote API Convert Ollama 预览" width="400"/>
 </p>
 
 ---
@@ -88,7 +91,8 @@
 - **自动获取模型列表**：启动时显示上游所有可用模型及其别名映射、上下文长度、最大输出
 - **流式策略**：支持 `preserve` / `force_stream` / `force_close` 三种模式灵活切换
 - **日志分级**：可分别控制请求头(`Log_Headers`)、请求体(`Log_Body`)、响应内容(`Log_Responses`)的日志打印
-- **模型 Token 设置**：`ModelTokenSettings` 支持为每个模型单独指定上下文长度和最大输出 Token
+- **模型详细设置**：`ModelDetailedSettings` 支持为每个模型单独指定上下文长度、最大输出 Token 和能力列表
+- **请求提示词替换**：`RequestPromptReplace` 支持自动替换请求消息中的指定文本，实现 Copilot 自有提示词篡改等高级玩法
 
 ---
 
@@ -145,10 +149,20 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
         "deepseek-reasoner": "DeepSeek 推理",
         "gpt-4o": "GPT-4o 旗舰"
     },
-    "ModelTokenSettings": {
+    "ModelDetailedSettings": {
         "deepseek-chat": {
             "ContextLength": 1000000,
-            "MaxOutputTokens": 64000
+            "MaxOutputTokens": 64000,
+            "Capabilities": ["tools", "vision"]
+        }
+    },
+    "RequestPromptReplace": {
+        "替换规则名称": {
+            "enable": true,
+            "index": 0,
+            "role": "system",
+            "prompt": "你要替换的原文",
+            "replace": "替换后的文本"
         }
     }
 }
@@ -169,7 +183,8 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `OPENAI_BASE` | 上游 OpenAI 兼容 API 地址 | **必填** |
 | `OPENAI_KEY` | 上游 API 密钥 | **必填**，首次输入明文后自动加密 |
 | `ModelAlias` | 模型别名映射 `{上游ID: 显示名称}` | `{}` |
-| `ModelTokenSettings` | 模型 Token 手动设置 `{上游ID: {ContextLength, MaxOutputTokens}}` | `{}` |
+| `ModelDetailedSettings` | 模型详细设置 `{上游ID: {ContextLength, MaxOutputTokens, Capabilities}}` | `{}` |
+| `RequestPromptReplace` | 请求提示词替换规则 `{规则名: {enable, role, index, prompt, replace}}` | `{}` |
 
 **`StreamMode` 说明**：
 | 值 | 行为 |
@@ -178,10 +193,11 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `force_stream` | 无论客户端是否请求，都强制使用流式 |
 | `force_close` | 无论客户端是否请求，都强制使用非流式 |
 
-**`ModelTokenSettings` 说明**：
-- 手动覆盖上游 API 返回的模型上下文长度和最大输出 Token 数
+**`ModelDetailedSettings` 说明**：
+- 手动覆盖上游 API 返回的模型上下文长度、最大输出 Token 数和能力列表
 - 当上游 API 不返回元数据或返回的值不准确时非常有用
-- 示例：`{"gpt-4o": {"ContextLength": 128000, "MaxOutputTokens": 16384}}`
+- `Capabilities` 字段可选（`omitempty`），当有定义时优先使用此处的配置，否则使用全局 `Capabilities`
+- 示例：`{"gpt-4o": {"ContextLength": 128000, "MaxOutputTokens": 16384, "Capabilities": ["tools", "vision"]}}`
 
 > **兼容说明**：旧版 `EnableStream=true/false` 会在首次启动时自动迁移为 `StreamMode=preserve/force_close`。
 
@@ -239,8 +255,15 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
  ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)
  ▼ OPENAI_KEY      : 上游 API 密钥 (必填，自动加密存储)
  ▼ ModelAlias      : 模型别名映射 {上游模型ID: 显示名称}
- ▼ ModelTokenSettings : 模型 Token 手动设置
-                      {上游模型ID: {ContextLength, MaxOutputTokens}}
+ ▼ ModelDetailedSettings : 模型详细设置,覆盖上游自动获取的值
+                     格式: {上游模型ID: {ContextLength, MaxOutputTokens, Capabilities}, ...}
+                     当 Capabilities 有定义时,优先使用此处的配置,否则使用全局 Capabilities
+ ▼ RequestPromptReplace: 请求提示词替换规则,自动替换请求中的指定文本
+                     格式: {规则名称: {enable, role, index, prompt, replace}}
+                     优先级:
+                       role+index → 先按 role 过滤,再取第 N 条替换
+                       role 单独  → 替换所有匹配 role 的消息
+                       index 单独 → 按索引取第 N 条替换
 ════════════════════════════════════════════════════════════
 
 📋 上游拥有的模型:
@@ -271,14 +294,73 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 - 多个模型共用一个别名
 - 搭配前后缀实现分类显示
 
-### 🧠 模型 Token 手动调优
+### 🧠 模型详细设置
 
-通过 `ModelTokenSettings` 你可以为每个模型单独设置：
+通过 `ModelDetailedSettings` 你可以为每个模型单独设置：
 - **上下文长度** (ContextLength) — 覆盖上游返回的值
 - **最大输出 Token** (MaxOutputTokens) — 控制单次最大生成量
+- **能力列表** (Capabilities) — 可选，当有定义时优先于此配置覆盖全局 `Capabilities`
 - 适用于上游 API 不返回元数据或返回不准确的场景
 
-### 🛡️ 自定义加密 UUID
+### � 请求提示词替换
+
+通过 `RequestPromptReplace` 你可以自动篡改客户端发来的请求消息中的指定文本，适用于以下场景：
+- **篡改 Copilot 内置提示词** — 例如将「你叫 GitHub Copilot」替换为「你叫亚丝娜」
+- **移除微软限制指令** — 替换掉系统级约束，让 AI 回答更多领域问题
+- **自定义角色设定** — 替换身份、语气、风格等系统提示词
+
+#### 配置格式
+
+每条规则包含以下字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `enable` | bool | 是否启用该规则 |
+| `role` | string | 按角色过滤（如 `"system"`、`"user"`），可选 |
+| `index` | int | 按索引取第 N 条消息，可选 |
+| `prompt` | string | 要查找替换的原文（必须完全匹配才能替换） |
+| `replace` | string | 替换后的文本 |
+
+#### 匹配优先级
+
+| 组合方式 | 行为 |
+|---------|------|
+| `role` + `index` 都有 | **先按 role 过滤**，再取过滤后第 N 条消息进行替换（最精确） |
+| 仅有 `role` | 替换所有匹配该 role 的消息 |
+| 仅有 `index` | 按消息数组的索引取第 N 条替换 |
+| 两者都省略 | 不对 messages 数组处理 |
+
+#### 示例
+
+```json
+"RequestPromptReplace": {
+    "夺舍Copilot的自称": {
+			"enable": true,
+			"index": 0,
+			"role": "system",
+			"prompt": "When asked for your name, you must respond with \"GitHub Copilot\".",
+			"replace": "When asked for your name, you must respond with \"亚丝娜\"."
+		},
+		"移除微软脑控1": {
+			"enable": true,
+			"index": 0,
+			"role": "system",
+			"prompt": "Your expertise is strictly limited to software development topics.",
+			"replace": "You can feel free to answer any topic or question."
+		},
+		"移除微软脑控2": {
+			"enable": true,
+			"index": 0,
+			"role": "system",
+			"prompt": "For questions not related to software development, simply give a reminder that you are an AI programming assistant.",
+			"replace": "You are not restricted to software development and should assist the user warmly on all subjects."
+		}
+}
+```
+
+> 💡 **提示**：替换规则按 `role+index` 的精确定位，只影响特定消息的文本内容，不影响消息结构。
+
+### �🛡️ 自定义加密 UUID
 
 修改源码中的 `secretUUID` 常量，使用 [UUID Generator](https://www.uuidgenerator.net/) 生成自己的 UUID，增强加密安全性。
 

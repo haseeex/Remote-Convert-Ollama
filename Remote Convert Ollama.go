@@ -31,9 +31,10 @@ import (
 	"unsafe"
 )
 
-type ModelTokenSetting struct {
-	ContextLength   int64 `json:"ContextLength"`
-	MaxOutputTokens int64 `json:"MaxOutputTokens"`
+type ModelDetailedSetting struct {
+	ContextLength   int64    `json:"ContextLength"`
+	MaxOutputTokens int64    `json:"MaxOutputTokens"`
+	Capabilities    []string `json:"Capabilities,omitempty"`
 }
 
 // PromptReplaceRule 定义请求提示词替换规则
@@ -46,21 +47,21 @@ type PromptReplaceRule struct {
 }
 
 type Config struct {
-	IP                   string                       `json:"IP"`
-	PORT                 string                       `json:"PORT"`
-	Log_Limit            int64                        `json:"Log_Limit"`
-	Log_Responses        bool                         `json:"Log_Responses"`
-	Log_Headers          bool                         `json:"Log_Headers"`
-	Log_Body             bool                         `json:"Log_Body"`
-	OpenAIPrefix         string                       `json:"OpenAI_Prefix"`
-	OpenAISuffix         string                       `json:"OpenAI_Suffix"`
-	StreamMode           string                       `json:"StreamMode"`
-	Capabilities         []string                     `json:"Capabilities"`
-	OpenAIBase           string                       `json:"OPENAI_BASE"`
-	OpenAIKey            string                       `json:"OPENAI_KEY"`
-	ModelAlias           map[string]string            `json:"ModelAlias"`
-	ModelTokenSettings   map[string]ModelTokenSetting `json:"ModelTokenSettings"`
-	RequestPromptReplace map[string]PromptReplaceRule `json:"RequestPromptReplace,omitempty"`
+	IP                    string                          `json:"IP"`
+	PORT                  string                          `json:"PORT"`
+	Log_Limit             int64                           `json:"Log_Limit"`
+	Log_Responses         bool                            `json:"Log_Responses"`
+	Log_Headers           bool                            `json:"Log_Headers"`
+	Log_Body              bool                            `json:"Log_Body"`
+	OpenAIPrefix          string                          `json:"OpenAI_Prefix"`
+	OpenAISuffix          string                          `json:"OpenAI_Suffix"`
+	StreamMode            string                          `json:"StreamMode"`
+	Capabilities          []string                        `json:"Capabilities"`
+	OpenAIBase            string                          `json:"OPENAI_BASE"`
+	OpenAIKey             string                          `json:"OPENAI_KEY"`
+	ModelAlias            map[string]string               `json:"ModelAlias"`
+	ModelDetailedSettings map[string]ModelDetailedSetting `json:"ModelDetailedSettings"`
+	RequestPromptReplace  map[string]PromptReplaceRule    `json:"RequestPromptReplace,omitempty"`
 }
 
 var requestCount int64
@@ -587,21 +588,21 @@ func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, 
 
 func getDefaultConfig() Config {
 	return Config{
-		IP:                   "0.0.0.0",
-		PORT:                 "11434",
-		Log_Limit:            100,
-		Log_Responses:        true,
-		Log_Headers:          true,
-		Log_Body:             true,
-		OpenAIPrefix:         "[VC反代] ",
-		OpenAISuffix:         "",
-		StreamMode:           streamModePreserve,
-		Capabilities:         []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
-		OpenAIBase:           "https://api.openai.com/v1",
-		OpenAIKey:            "",
-		ModelAlias:           map[string]string{},            // 模型别名：key=上游模型ID, value=显示名称
-		ModelTokenSettings:   map[string]ModelTokenSetting{}, // 模型 token 设置：key=上游模型ID, value={ContextLength, MaxOutputTokens}
-		RequestPromptReplace: map[string]PromptReplaceRule{}, // 请求提示词替换规则
+		IP:                    "0.0.0.0",
+		PORT:                  "11434",
+		Log_Limit:             100,
+		Log_Responses:         true,
+		Log_Headers:           true,
+		Log_Body:              true,
+		OpenAIPrefix:          "[VC反代] ",
+		OpenAISuffix:          "",
+		StreamMode:            streamModePreserve,
+		Capabilities:          []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
+		OpenAIBase:            "https://api.openai.com/v1",
+		OpenAIKey:             "",
+		ModelAlias:            map[string]string{},               // 模型别名：key=上游模型ID, value=显示名称
+		ModelDetailedSettings: map[string]ModelDetailedSetting{}, // 模型详细设置：key=上游模型ID, value={ContextLength, MaxOutputTokens, Capabilities}
+		RequestPromptReplace:  map[string]PromptReplaceRule{},    // 请求提示词替换规则
 	}
 }
 
@@ -621,8 +622,9 @@ func printConfigHelp() {
 	fmt.Println(" ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)")
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
 	fmt.Println(" ▼ ModelAlias      : 模型别名映射,仅影响模型名字显示 {上游模型ID: 显示名称, 上游模型ID: 显示名称, ...}")
-	fmt.Println(" ▼ ModelTokenSettings : 模型 Token 手动设置,覆盖上游自动获取的值")
-	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出}, ...}")
+	fmt.Println(" ▼ ModelDetailedSettings : 模型详细设置,覆盖上游自动获取的值")
+	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出, Capabilities: [能力列表]}, ...}")
+	fmt.Println("                     当 Capabilities 有定义时,优先使用此处的配置,否则使用全局 Capabilities")
 	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384}}")
 	fmt.Println(" ▼ RequestPromptReplace: 请求提示词替换规则,自动替换请求中的指定文本")
 	fmt.Println("                     格式: {规则名称: {enable, role, index, prompt, replace}}")
@@ -695,7 +697,12 @@ func printModelAliases() {
 		}
 		fmt.Printf("       📐 上下文长度: %d\n", ctxLen)
 		fmt.Printf("       📤 最大输出:   %d\n", maxOut)
-		fmt.Printf("       🛠️  能力集合:   %v\n", cfg.Capabilities)
+		// 优先使用 ModelDetailedSettings 中的 Capabilities
+		modelCaps := cfg.Capabilities
+		if setting, ok := cfg.ModelDetailedSettings[m.ID]; ok && len(setting.Capabilities) > 0 {
+			modelCaps = setting.Capabilities
+		}
+		fmt.Printf("       🛠️  能力集合:   %v\n", modelCaps)
 	}
 	fmt.Println("")
 }
@@ -795,8 +802,31 @@ func loadConfig() {
 		stored.RequestPromptReplace = defaultCfg.RequestPromptReplace
 		needSave = true
 	}
-	if _, ok := rawMap["ModelTokenSettings"]; !ok {
-		stored.ModelTokenSettings = defaultCfg.ModelTokenSettings
+	// 优先读取新字段 ModelDetailedSettings，兼容旧字段 ModelTokenSettings
+	if _, ok := rawMap["ModelDetailedSettings"]; ok {
+		// 新字段已存在，无需处理
+	} else if oldVal, ok := rawMap["ModelTokenSettings"]; ok {
+		// 旧字段存在 → 迁移到新字段
+		if oldMap, ok := oldVal.(map[string]interface{}); ok {
+			migrated := make(map[string]ModelDetailedSetting)
+			for k, v := range oldMap {
+				if oldSetting, ok := v.(map[string]interface{}); ok {
+					newSetting := ModelDetailedSetting{}
+					if cl, ok := oldSetting["ContextLength"].(float64); ok {
+						newSetting.ContextLength = int64(cl)
+					}
+					if mot, ok := oldSetting["MaxOutputTokens"].(float64); ok {
+						newSetting.MaxOutputTokens = int64(mot)
+					}
+					migrated[k] = newSetting
+				}
+			}
+			stored.ModelDetailedSettings = migrated
+		}
+		needSave = true
+		fmt.Println("🔄 检测到旧的 ModelTokenSettings，已自动迁移到 ModelDetailedSettings")
+	} else {
+		stored.ModelDetailedSettings = defaultCfg.ModelDetailedSettings
 		needSave = true
 	}
 
@@ -1032,7 +1062,7 @@ type upstreamModelMeta struct {
 }
 
 // fetchUpstreamModelMeta 调用上游 /v1/models 获取模型元数据并构建映射，
-// 然后合并 ModelTokenSettings 中手动指定的值（手动设置优先）
+// 然后合并 ModelDetailedSettings 中手动指定的值（手动设置优先）
 func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 	result := make(map[string]upstreamModelMeta)
 
@@ -1089,13 +1119,13 @@ func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 		result[id] = info
 	}
 
-	// 合并 ModelTokenSettings 手动配置（手动设置优先）
+	// 合并 ModelDetailedSettings 手动配置（手动设置优先）
 	return applyManualModelSettings(result)
 }
 
-// applyManualModelSettings 将 ModelTokenSettings 中的手动配置合并到 result 中
+// applyManualModelSettings 将 ModelDetailedSettings 中的手动配置合并到 result 中
 func applyManualModelSettings(result map[string]upstreamModelMeta) map[string]upstreamModelMeta {
-	for modelID, setting := range cfg.ModelTokenSettings {
+	for modelID, setting := range cfg.ModelDetailedSettings {
 		if setting.ContextLength <= 0 && setting.MaxOutputTokens <= 0 {
 			continue
 		}
@@ -1147,6 +1177,16 @@ func mapFinishReason(reason string) string {
 	default:
 		return "stop" // 未知原因默认 stop
 	}
+}
+
+// hasCapability 检查 capabilities 列表中是否包含指定的能力
+func hasCapability(caps []string, capability string) bool {
+	for _, c := range caps {
+		if c == capability {
+			return true
+		}
+	}
+	return false
 }
 
 // -------------------- Ollama API: /api/chat --------------------
@@ -2664,6 +2704,17 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 			displayName = alias
 		}
 		displayName = cfg.OpenAIPrefix + displayName + cfg.OpenAISuffix
+
+		// 获取该模型的能力列表：优先使用 ModelDetailedSettings 中的 Capabilities，否则使用全局 Capabilities
+		modelCaps := cfg.Capabilities
+		if setting, ok := cfg.ModelDetailedSettings[modelID]; ok && len(setting.Capabilities) > 0 {
+			modelCaps = setting.Capabilities
+		}
+
+		// 根据模型能力列表动态计算各能力标志
+		hasVision := hasCapability(modelCaps, "vision")
+		hasTools := hasCapability(modelCaps, "tools")
+
 		models = append(models, map[string]interface{}{
 			"name":        displayName, // 显示名（可别名）
 			"model":       modelID,     // 实际请求用的模型 ID
@@ -2685,11 +2736,11 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 				modelID + ".context_length": ctxLen,
 				"num_ctx":                   ctxLen,
 				"max_output_tokens":         maxOut,
-				"supports_vision":           true,
+				"supports_vision":           hasVision,
 				"supports_reasoning":        true,
-				"supports_tools":            true,
+				"supports_tools":            hasTools,
 			},
-			"capabilities":  cfg.Capabilities,
+			"capabilities":  modelCaps,
 			"contextWindow": ctxLen,
 			"options": map[string]interface{}{
 				"num_ctx": ctxLen,
@@ -2700,9 +2751,9 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 			"total_tokens":                    ctxLen,
 			"maxInputTokens":                  ctxLen,
 			"maxOutputTokens":                 maxOut,
-			"capabilities.supports.vision":    true,
+			"capabilities.supports.vision":    hasVision,
 			"capabilities.supports.reasoning": true,
-			"capabilities.supports.tools":     true,
+			"capabilities.supports.tools":     hasTools,
 			"think":                           true,
 		})
 	}
@@ -2735,6 +2786,14 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 	modelMeta := meta[modelID]
 	ctxLen := modelMeta.ContextLength
 	maxOut := modelMeta.MaxOutputTokens
+
+	// 获取该模型的能力列表：优先使用 ModelDetailedSettings 中的 Capabilities，否则使用全局 Capabilities
+	modelCaps := cfg.Capabilities
+	if setting, ok := cfg.ModelDetailedSettings[modelID]; ok && len(setting.Capabilities) > 0 {
+		modelCaps = setting.Capabilities
+	}
+	hasVision := hasCapability(modelCaps, "vision")
+	hasTools := hasCapability(modelCaps, "tools")
 
 	// 显示名称：优先使用 ModelAlias 中的别名，否则用上游 ID，再套上前后缀
 	displayName := modelID
@@ -2777,7 +2836,7 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 			"n_ctx_train":               ctxLen,
 			"context_length":            ctxLen,
 		},
-		"capabilities":  cfg.Capabilities,
+		"capabilities":  modelCaps,
 		"contextWindow": ctxLen,
 		"options": map[string]interface{}{
 			"num_ctx": ctxLen,
@@ -2788,9 +2847,9 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 		"total_tokens":                    ctxLen,
 		"maxInputTokens":                  ctxLen,
 		"maxOutputTokens":                 maxOut,
-		"capabilities.supports.vision":    true,
+		"capabilities.supports.vision":    hasVision,
 		"capabilities.supports.reasoning": true,
-		"capabilities.supports.tools":     true,
+		"capabilities.supports.tools":     hasTools,
 		"think":                           true,
 	}
 
