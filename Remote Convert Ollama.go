@@ -36,21 +36,31 @@ type ModelTokenSetting struct {
 	MaxOutputTokens int64 `json:"MaxOutputTokens"`
 }
 
+// PromptReplaceRule 定义请求提示词替换规则
+type PromptReplaceRule struct {
+	Enable  bool   `json:"enable"`
+	Index   *int   `json:"index,omitempty"` // 消息索引（nil=未指定, 0=第1条），与 role 配合使用
+	Role    string `json:"role,omitempty"`  // 按角色定位（如 "system"）
+	Prompt  string `json:"prompt"`
+	Replace string `json:"replace"`
+}
+
 type Config struct {
-	IP                 string                       `json:"IP"`
-	PORT               string                       `json:"PORT"`
-	Log_Limit          int64                        `json:"Log_Limit"`
-	Log_Responses      bool                         `json:"Log_Responses"`
-	Log_Headers        bool                         `json:"Log_Headers"`
-	Log_Body           bool                         `json:"Log_Body"`
-	OpenAIPrefix       string                       `json:"OpenAI_Prefix"`
-	OpenAISuffix       string                       `json:"OpenAI_Suffix"`
-	StreamMode         string                       `json:"StreamMode"`
-	Capabilities       []string                     `json:"Capabilities"`
-	OpenAIBase         string                       `json:"OPENAI_BASE"`
-	OpenAIKey          string                       `json:"OPENAI_KEY"`
-	ModelAlias         map[string]string            `json:"ModelAlias"`
-	ModelTokenSettings map[string]ModelTokenSetting `json:"ModelTokenSettings"`
+	IP                   string                       `json:"IP"`
+	PORT                 string                       `json:"PORT"`
+	Log_Limit            int64                        `json:"Log_Limit"`
+	Log_Responses        bool                         `json:"Log_Responses"`
+	Log_Headers          bool                         `json:"Log_Headers"`
+	Log_Body             bool                         `json:"Log_Body"`
+	OpenAIPrefix         string                       `json:"OpenAI_Prefix"`
+	OpenAISuffix         string                       `json:"OpenAI_Suffix"`
+	StreamMode           string                       `json:"StreamMode"`
+	Capabilities         []string                     `json:"Capabilities"`
+	OpenAIBase           string                       `json:"OPENAI_BASE"`
+	OpenAIKey            string                       `json:"OPENAI_KEY"`
+	ModelAlias           map[string]string            `json:"ModelAlias"`
+	ModelTokenSettings   map[string]ModelTokenSetting `json:"ModelTokenSettings"`
+	RequestPromptReplace map[string]PromptReplaceRule `json:"RequestPromptReplace,omitempty"`
 }
 
 var requestCount int64
@@ -577,20 +587,21 @@ func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, 
 
 func getDefaultConfig() Config {
 	return Config{
-		IP:                 "0.0.0.0",
-		PORT:               "11434",
-		Log_Limit:          100,
-		Log_Responses:      true,
-		Log_Headers:        true,
-		Log_Body:           true,
-		OpenAIPrefix:       "[VC反代] ",
-		OpenAISuffix:       "",
-		StreamMode:         streamModePreserve,
-		Capabilities:       []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
-		OpenAIBase:         "https://api.openai.com/v1",
-		OpenAIKey:          "",
-		ModelAlias:         map[string]string{},            // 模型别名：key=上游模型ID, value=显示名称
-		ModelTokenSettings: map[string]ModelTokenSetting{}, // 模型 token 设置：key=上游模型ID, value={ContextLength, MaxOutputTokens}
+		IP:                   "0.0.0.0",
+		PORT:                 "11434",
+		Log_Limit:            100,
+		Log_Responses:        true,
+		Log_Headers:          true,
+		Log_Body:             true,
+		OpenAIPrefix:         "[VC反代] ",
+		OpenAISuffix:         "",
+		StreamMode:           streamModePreserve,
+		Capabilities:         []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
+		OpenAIBase:           "https://api.openai.com/v1",
+		OpenAIKey:            "",
+		ModelAlias:           map[string]string{},            // 模型别名：key=上游模型ID, value=显示名称
+		ModelTokenSettings:   map[string]ModelTokenSetting{}, // 模型 token 设置：key=上游模型ID, value={ContextLength, MaxOutputTokens}
+		RequestPromptReplace: map[string]PromptReplaceRule{}, // 请求提示词替换规则
 	}
 }
 
@@ -613,6 +624,13 @@ func printConfigHelp() {
 	fmt.Println(" ▼ ModelTokenSettings : 模型 Token 手动设置,覆盖上游自动获取的值")
 	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出}, ...}")
 	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384}}")
+	fmt.Println(" ▼ RequestPromptReplace: 请求提示词替换规则,自动替换请求中的指定文本")
+	fmt.Println("                     格式: {规则名称: {enable, role, index, prompt, replace}}")
+	fmt.Println("                     优先级:")
+	fmt.Println("                       role+index → 先按 role 过滤,再取第 N 条替换")
+	fmt.Println("                       role 单独  → 替换所有匹配 role 的消息")
+	fmt.Println("                       index 单独 → 按索引取第 N 条替换")
+	fmt.Println("                     示例: {\"替换系统提示词\": {\"enable\": true, \"role\": \"system\", \"index\": 0, \"prompt\": \"你是一个AI\", \"replace\": \"你是助手\"}}")
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════════════════════════════════")
 	fmt.Println("")
 }
@@ -771,6 +789,10 @@ func loadConfig() {
 	}
 	if _, ok := rawMap["ModelAlias"]; !ok {
 		stored.ModelAlias = defaultCfg.ModelAlias
+		needSave = true
+	}
+	if _, ok := rawMap["RequestPromptReplace"]; !ok {
+		stored.RequestPromptReplace = defaultCfg.RequestPromptReplace
 		needSave = true
 	}
 	if _, ok := rawMap["ModelTokenSettings"]; !ok {
@@ -2820,6 +2842,116 @@ func hasImageInBody(body []byte) bool {
 	return false
 }
 
+// applyRequestPromptReplace 对请求体中的 messages 进行提示词替换
+// 根据配置的 RequestPromptReplace 规则，查找并替换指定位置消息中的文本
+func applyRequestPromptReplace(body []byte) []byte {
+	if len(body) == 0 || len(cfg.RequestPromptReplace) == 0 {
+		return body
+	}
+
+	// 检查是否有启用的规则
+	hasEnabled := false
+	for _, rule := range cfg.RequestPromptReplace {
+		if rule.Enable && rule.Prompt != "" {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
+		return body
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	modified := false
+
+	// 处理 messages 数组（OpenAI / Ollama chat 格式）
+	if rawMessages, ok := req["messages"].([]interface{}); ok {
+		for ruleName, rule := range cfg.RequestPromptReplace {
+			if !rule.Enable || rule.Prompt == "" {
+				continue
+			}
+
+			if rule.Role != "" && rule.Index != nil {
+				// ① role + index 都有值：先按 role 过滤，再用 index 取第 N 条
+				roleIdx := 0
+				for i, rawMsg := range rawMessages {
+					msg, ok := rawMsg.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					role, _ := msg["role"].(string)
+					if role != rule.Role {
+						continue
+					}
+					if roleIdx == *rule.Index {
+						// 找到了第 N 条匹配 role 的消息
+						if content, ok := msg["content"].(string); ok && strings.Contains(content, rule.Prompt) {
+							msg["content"] = strings.ReplaceAll(content, rule.Prompt, rule.Replace)
+							modified = true
+							fmt.Printf("🔧 提示词替换 [%s]: messages[%d] (role=%q, index=%d) 中 \"%s\" → \"%s\"\n", ruleName, i, rule.Role, *rule.Index, rule.Prompt, rule.Replace)
+						}
+						break
+					}
+					roleIdx++
+				}
+			} else if rule.Role != "" {
+				// ② 只有 role 有值：按 role 过滤所有消息，每条都替换
+				for i, rawMsg := range rawMessages {
+					if msg, ok := rawMsg.(map[string]interface{}); ok {
+						if role, _ := msg["role"].(string); role == rule.Role {
+							if content, ok := msg["content"].(string); ok && strings.Contains(content, rule.Prompt) {
+								msg["content"] = strings.ReplaceAll(content, rule.Prompt, rule.Replace)
+								modified = true
+								fmt.Printf("🔧 提示词替换 [%s]: messages[%d] role=%q 中 \"%s\" → \"%s\"\n", ruleName, i, rule.Role, rule.Prompt, rule.Replace)
+							}
+						}
+					}
+				}
+			} else if rule.Index != nil && *rule.Index >= 0 && *rule.Index < len(rawMessages) {
+				// ③ 只有 index 有值：按 index 取第 N 条消息替换
+				idx := *rule.Index
+				if msg, ok := rawMessages[idx].(map[string]interface{}); ok {
+					if content, ok := msg["content"].(string); ok {
+						if strings.Contains(content, rule.Prompt) {
+							msg["content"] = strings.ReplaceAll(content, rule.Prompt, rule.Replace)
+							modified = true
+							fmt.Printf("🔧 提示词替换 [%s]: messages[%d] 中 \"%s\" → \"%s\"\n", ruleName, idx, rule.Prompt, rule.Replace)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 处理 Ollama 单条 prompt 字段
+	if prompt, ok := req["prompt"].(string); ok {
+		for ruleName, rule := range cfg.RequestPromptReplace {
+			if !rule.Enable || rule.Prompt == "" {
+				continue
+			}
+			if rule.Role == "" && rule.Index != nil && *rule.Index == 0 && strings.Contains(prompt, rule.Prompt) {
+				req["prompt"] = strings.ReplaceAll(prompt, rule.Prompt, rule.Replace)
+				modified = true
+				fmt.Printf("🔧 提示词替换 [%s]: prompt 字段中 \"%s\" → \"%s\"\n", ruleName, rule.Prompt, rule.Replace)
+			}
+		}
+	}
+
+	if modified {
+		newBody, err := json.Marshal(req)
+		if err == nil {
+			fmt.Println("✅ 提示词替换完成，请求体已更新")
+			return newBody
+		}
+	}
+
+	return body
+}
+
 func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	count := atomic.AddInt64(&requestCount, 1)
 	if count >= cfg.Log_Limit {
@@ -2846,6 +2978,9 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("Body:", string(body))
 	}
 	fmt.Println("================================")
+
+	// 应用请求提示词替换
+	body = applyRequestPromptReplace(body)
 
 	// 把 body 放回去，否则后面 handler 读不到
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
