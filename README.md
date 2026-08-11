@@ -217,6 +217,14 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 
 程序启动后，会自动在本地提供一个**可视化配置管理页面**，无需手动编辑 `config.json`：
 
+<p align="center">
+  <img src="images/屏幕截图 2026-08-11 150350.png" alt="Remote API Convert Ollama 预览" width="400"/>
+</p>
+
+<p align="center">
+  <img src="images/屏幕截图 2026-08-11 150453.png" alt="Remote API Convert Ollama 预览" width="400"/>
+</p>
+
 ```
 ⚙️ 配置管理页面: http://127.0.0.1:11434/config
 ```
