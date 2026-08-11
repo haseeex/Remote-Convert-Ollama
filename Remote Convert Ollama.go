@@ -59,6 +59,7 @@ type Config struct {
 	Capabilities          []string                        `json:"Capabilities"`
 	OpenAIBase            string                          `json:"OPENAI_BASE"`
 	OpenAIKey             string                          `json:"OPENAI_KEY"`
+	WebConfigPassword     string                          `json:"WebConfigPassword,omitempty"` // 配置管理页面访问密码（空=不启用）
 	ModelAlias            map[string]string               `json:"ModelAlias"`
 	ModelDetailedSettings map[string]ModelDetailedSetting `json:"ModelDetailedSettings"`
 	RequestPromptReplace  map[string]PromptReplaceRule    `json:"RequestPromptReplace,omitempty"`
@@ -68,6 +69,14 @@ var requestCount int64
 var clear map[string]func() //创建一个用于存储清除函数的映射
 
 var cfg Config
+
+// storedOpenAIKey 保存 config.json 中持久化的 OPENAI_KEY（加密格式），
+// 供配置管理页面在用户未修改密钥时原样写回，避免密钥丢失
+var storedOpenAIKey string
+
+// storedWebConfigPassword 保存 config.json 中持久化的 WebConfigPassword（加密格式），
+// 供配置管理页面在用户未修改密码时原样写回，避免密码丢失
+var storedWebConfigPassword string
 
 // lastReasoningContent 存储上一个 assistant 响应的 reasoning_content，
 // 因为 DeepSeek 思考模式要求客户端下次请求时必须传回这个字段。
@@ -851,17 +860,42 @@ func loadConfig() {
 		pauseAndExit()
 	}
 
-	cfg = stored
-	cfg.OpenAIKey = plainKey
-
-	if persistedKey != "" {
-		stored.OpenAIKey = persistedKey
-		if err := saveConfig(stored); err != nil {
-			fmt.Println("🔒 OPENAI_KEY 自动回写失败:", err)
+	// 处理 WebConfigPassword：明文自动加密回写；已加密则解密供登录比对
+	var plainPw, persistedPw string
+	if stored.WebConfigPassword != "" {
+		plainPw, persistedPw, err = normalizeWebConfigPassword(stored.WebConfigPassword)
+		if err != nil {
+			fmt.Println("🔒 WebConfigPassword 校验失败:", err)
 			pauseAndExit()
 		}
-		fmt.Println("🔒 OPENAI_KEY 已按本机信息加密并回写到 config.json")
 	}
+
+	cfg = stored
+	cfg.OpenAIKey = plainKey
+	cfg.WebConfigPassword = plainPw
+
+	if persistedKey != "" || persistedPw != "" {
+		if persistedKey != "" {
+			stored.OpenAIKey = persistedKey
+		}
+		if persistedPw != "" {
+			stored.WebConfigPassword = persistedPw
+		}
+		if err := saveConfig(stored); err != nil {
+			fmt.Println("🔒 配置加密回写失败:", err)
+			pauseAndExit()
+		}
+		if persistedKey != "" {
+			fmt.Println("🔒 OPENAI_KEY 已按本机信息加密并回写到 config.json")
+		}
+		if persistedPw != "" {
+			fmt.Println("🔒 WebConfigPassword 已按本机信息加密并回写到 config.json")
+		}
+	}
+
+	// 记录文件中持久化的密钥/密码格式，供配置管理页面在未修改时原样写回
+	storedOpenAIKey = stored.OpenAIKey
+	storedWebConfigPassword = stored.WebConfigPassword
 }
 
 func pauseAndExit() {
@@ -882,6 +916,33 @@ func normalizeOpenAIKey(value string) (string, string, error) {
 	}
 
 	return value, encryptedKey, nil
+}
+
+// normalizeWebConfigPassword 处理网页访问密码：
+// 已加密 → 解密返回明文；明文 → 加密返回持久化值（兼容旧版明文配置）
+func normalizeWebConfigPassword(value string) (string, string, error) {
+	if value == "" {
+		return "", "", nil
+	}
+	if strings.HasPrefix(value, encryptedKeyPrefix) {
+		plain, err := decryptWebConfigPassword(value)
+		return plain, "", err
+	}
+	encrypted, err := encryptWebConfigPassword(value)
+	if err != nil {
+		return "", "", err
+	}
+	return value, encrypted, nil
+}
+
+// encryptWebConfigPassword 使用与 OPENAI_KEY 相同的 AES-GCM 加密方式（机器指纹+UUID 派生密钥）
+func encryptWebConfigPassword(plain string) (string, error) {
+	return encryptOpenAIKey(plain)
+}
+
+// decryptWebConfigPassword 解密网页访问密码（与 OPENAI_KEY 相同算法）
+func decryptWebConfigPassword(value string) (string, error) {
+	return decryptOpenAIKey(value)
 }
 
 func normalizeStreamMode(mode string) string {
@@ -1053,6 +1114,899 @@ func saveConfig(stored Config) error {
 
 	data = append(data, '\n')
 	return os.WriteFile("config.json", data, 0644)
+}
+
+// ==================== 本地配置管理网页 ====================
+
+// webConfigPageHTML 是可视化配置管理页面（嵌入程序，无需额外文件）
+const webConfigPageHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Remote Convert Ollama · 配置管理</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--accent2:#1f6feb;--green:#3fb950;--yellow:#d29922;--red:#f85149;--radius:12px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:linear-gradient(180deg,#0d1117 0%,#0a0e14 100%);color:var(--text);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;min-height:100vh;padding-bottom:120px}
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:12px;padding:14px 24px;background:rgba(13,17,23,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+header .logo{font-size:22px}
+header h1{font-size:17px;font-weight:600}
+header .sub{font-size:12px;color:var(--muted)}
+header .spacer{flex:1}
+.wrap{max-width:880px;margin:24px auto 0;padding:0 20px;display:flex;flex-direction:column;gap:18px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.card>.head{display:flex;align-items:center;gap:8px;padding:12px 18px;background:var(--panel2);border-bottom:1px solid var(--border);font-weight:600;font-size:14px}
+.card>.head .hint{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);text-align:right}
+.card>.body{padding:16px 18px;display:flex;flex-direction:column;gap:14px}
+.row{display:flex;flex-direction:column;gap:6px}
+.row label{font-size:12.5px;color:var(--muted);display:flex;align-items:center;gap:8px}
+.row label .req{color:var(--yellow)}
+input[type=text],input[type=number],input[type=password],select,textarea{width:100%;padding:9px 12px;background:#0d1117;color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:13.5px;font-family:inherit;outline:none;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+select{appearance:none;-webkit-appearance:none;background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"><path d="M0 0l5 6 5-6z" fill="%238b949e"/></svg>');background-repeat:no-repeat;background-position:right 10px center;background-size:10px 6px;padding-right:34px;cursor:pointer}
+textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-size:12.5px;line-height:1.5}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+@media(max-width:680px){.grid2,.grid3{grid-template-columns:1fr}}
+.switch{position:relative;display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.switch input{display:none}
+.switch .track{width:38px;height:21px;background:#30363d;border-radius:21px;position:relative;transition:.2s;flex-shrink:0}
+.switch .track::after{content:"";position:absolute;top:2.5px;left:3px;width:16px;height:16px;background:#8b949e;border-radius:50%;transition:.2s}
+.switch input:checked+.track{background:var(--accent2)}
+.switch input:checked+.track::after{left:19px;background:#fff}
+.switch .lbl{font-size:13px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font-size:13px;font-weight:500;cursor:pointer;transition:.15s;font-family:inherit}
+.btn:hover{border-color:var(--accent);color:#fff}
+.btn.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
+.btn.primary:hover{filter:brightness(1.15)}
+.btn.danger{background:transparent;border-color:transparent;color:var(--red);padding:6px 10px}
+.btn.danger:hover{background:rgba(248,81,73,.12)}
+.btn.small{padding:5px 12px;font-size:12px}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.dtable{display:flex;flex-direction:column;gap:8px}
+.drow{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:center}
+.card-item{border:1px solid var(--border);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:10px;background:var(--panel2)}
+.card-item .item-head{display:flex;align-items:center;gap:8px}
+.card-item .item-head .name{font-weight:600;font-size:13px;color:var(--accent);white-space:nowrap}
+#toast{position:fixed;top:72px;right:20px;transform:translateX(120%);background:#1c2128;border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;font-size:13.5px;opacity:0;transition:all .3s;z-index:99;max-width:min(440px,82vw);box-shadow:0 8px 24px rgba(0,0,0,.4);display:flex;align-items:center;gap:10px}
+#toast.show{opacity:1;transform:translateX(0)}
+#toast.ok{border-color:var(--green);box-shadow:0 8px 24px rgba(0,0,0,.4),0 0 0 1px rgba(63,185,80,.15)}
+#toast.err{border-color:var(--red);box-shadow:0 8px 24px rgba(0,0,0,.4),0 0 0 1px rgba(248,81,73,.15)}
+#toast .toast-msg{flex:1;word-break:break-all}
+#toast .toast-time{font-family:Consolas,"Courier New",monospace;font-size:11px;color:var(--muted);background:rgba(139,148,158,.12);border:1px solid var(--border);padding:2px 8px;border-radius:20px;white-space:nowrap;letter-spacing:.5px;flex-shrink:0}
+.footerbar{position:fixed;bottom:0;left:0;right:0;z-index:10;display:flex;align-items:center;justify-content:center;gap:14px;padding:16px;background:rgba(13,17,23,.92);backdrop-filter:blur(10px);border-top:1px solid var(--border)}
+.mono{font-family:Consolas,monospace}
+.hidden{display:none!important}
+.badge{font-size:11px;padding:2px 8px;border-radius:20px;background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}
+.empty{color:var(--muted);font-size:13px;text-align:center;padding:10px}
+#loginOverlay{position:fixed;inset:0;z-index:200;background:rgba(5,8,12,.88);backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center}
+#loginOverlay.hidden{display:none}
+.login-box{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:36px 40px;width:min(380px,90vw);display:flex;flex-direction:column;gap:14px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+.login-box .login-icon{font-size:46px;line-height:1}
+.login-box h2{margin:0;font-size:18px;font-weight:600}
+.login-box .login-sub{color:var(--muted);font-size:13px;margin:0}
+.login-box input{padding:11px 14px;font-size:14px;text-align:center}
+.login-box .btn{width:100%;justify-content:center;padding:11px}
+.login-err{color:var(--red);font-size:12.5px;min-height:16px;margin:0}
+.login-tip{color:var(--muted);font-size:11.5px;margin:0}
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">🐭</span>
+  <div>
+    <h1>Remote Convert Ollama · 配置管理</h1>
+    <div class="sub">监听 http://<span id="listenAddr">-</span> · 保存后立即写入 config.json</div>
+  </div>
+  <div class="spacer"></div>
+  <button class="btn" onclick="testConn()" id="btnTest">🔌 测试连接</button>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <div class="head">🖥️ 监听设置 <span class="hint">修改 IP / PORT 需重启程序生效</span></div>
+    <div class="body grid2">
+      <div class="row"><label>监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
+      <div class="row"><label>监听端口 PORT</label><input type="text" id="PORT" placeholder="11434"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="head">📡 上游 API <span class="hint">OPENAI_KEY 留空表示保持当前密钥</span></div>
+    <div class="body">
+      <div class="row"><label>OPENAI_BASE <span class="req">必填</span></label><input type="text" id="OPENAI_BASE" placeholder="https://api.example.com/v1"></div>
+      <div class="row">
+        <label>OPENAI_KEY <span id="keyStatus" class="badge hidden">已加密保存</span></label>
+        <input type="password" id="OPENAI_KEY" placeholder="留空保持不变；输入明文新密钥将自动加密保存" autocomplete="off">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="head">🔒 访问密码 <span class="hint">防止局域网内被他人乱改，留空保持不变</span></div>
+    <div class="body">
+      <div class="row">
+        <label>配置页面访问密码 WebConfigPassword <span id="pwStatus" class="badge hidden">已启用</span></label>
+        <input type="password" id="WebConfigPassword" placeholder="留空保持不变；设置新密码后需重新登录" autocomplete="new-password">
+      </div>
+      <div class="row"><label class="mono" style="color:var(--muted);font-size:12px">💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改</label></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="head">📜 日志设置</div>
+    <div class="body">
+      <div class="grid2">
+        <div class="row"><label>终端日志清理阈值 Log_Limit</label><input type="number" id="Log_Limit" min="1"></div>
+        <div class="row"></div>
+      </div>
+      <div class="grid3">
+        <label class="switch"><input type="checkbox" id="Log_Responses"><span class="track"></span><span class="lbl">打印响应内容</span></label>
+        <label class="switch"><input type="checkbox" id="Log_Headers"><span class="track"></span><span class="lbl">打印请求头</span></label>
+        <label class="switch"><input type="checkbox" id="Log_Body"><span class="track"></span><span class="lbl">打印请求体</span></label>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="head">🧩 模型显示 <span class="hint">仅影响客户端看到的模型名称</span></div>
+    <div class="body">
+      <div class="grid2">
+        <div class="row"><label>模型名前缀 OpenAI_Prefix</label><input type="text" id="OpenAI_Prefix" placeholder="[VC反代] "></div>
+        <div class="row"><label>模型名后缀 OpenAI_Suffix</label><input type="text" id="OpenAI_Suffix"></div>
+      </div>
+      <div class="grid2">
+        <div class="row">
+          <label>流式策略 StreamMode</label>
+          <select id="StreamMode">
+            <option value="preserve">preserve · 不覆写（默认）</option>
+            <option value="force_stream">force_stream · 强制流式</option>
+            <option value="force_close">force_close · 强制关闭</option>
+          </select>
+        </div>
+        <div class="row"><label>能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="head">🔖 模型别名 ModelAlias <span class="hint">将上游模型 ID 显示为友好名称</span></div>
+    <div class="body">
+      <div id="aliasList" class="dtable"></div>
+      <div><button class="btn small" onclick="addAlias()">＋ 添加别名</button></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="head">📐 模型详细设置 ModelDetailedSettings <span class="hint">覆盖上游自动获取的值</span></div>
+    <div class="body">
+      <div id="detailList" style="display:flex;flex-direction:column;gap:10px"></div>
+      <div><button class="btn small" onclick="addDetail()">＋ 添加模型设置</button></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="head">✂️ 请求提示词替换 RequestPromptReplace <span class="hint">自动替换请求中的指定文本</span></div>
+    <div class="body">
+      <div id="ruleList" style="display:flex;flex-direction:column;gap:10px"></div>
+      <div><button class="btn small" onclick="addRule()">＋ 添加替换规则</button></div>
+    </div>
+  </div>
+</div>
+
+<div class="footerbar">
+  <button class="btn" onclick="loadCfg(true)">🔄 重新加载</button>
+  <button class="btn primary" onclick="saveCfg()" id="btnSave">💾 保存配置</button>
+  <button class="btn" onclick="doLogout()" id="btnLogout" title="使当前登录令牌立即失效">🔒 退出登录</button>
+</div>
+
+<div id="toast"></div>
+
+<div id="loginOverlay" class="hidden">
+  <div class="login-box">
+    <div class="login-icon">🔒</div>
+    <h2>配置管理已加锁</h2>
+    <p class="login-sub">请输入访问密码以继续</p>
+    <input type="password" id="loginPw" placeholder="访问密码" autocomplete="current-password">
+    <button class="btn primary" onclick="doLogin()">🔓 解锁</button>
+    <p class="login-err" id="loginErr"></p>
+  </div>
+</div>
+
+<script>
+var state = { aliases: [], details: [], rules: [] };
+
+function $(id){ return document.getElementById(id); }
+
+function esc(s){
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function toast(msg, type){
+  var t = $('toast');
+  var now = new Date();
+  var hh = ('0' + now.getHours()).slice(-2);
+  var mm = ('0' + now.getMinutes()).slice(-2);
+  var ss = ('0' + now.getSeconds()).slice(-2);
+  var time = hh + ':' + mm + ':' + ss;
+  // 消息用 textContent 填充，避免注入；时间徽章单独渲染
+  t.innerHTML = '<span class="toast-msg"></span><span class="toast-time">🕐 ' + time + '</span>';
+  t.querySelector('.toast-msg').textContent = msg;
+  t.className = 'show ' + (type || 'ok');
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(function(){ t.className = ''; }, 3500);
+}
+
+// -------- 访问密码鉴权（服务端会话令牌）--------
+// 登录成功后服务端签发随机 token，前端只存 token（不存密码），
+// token 保存在服务端内存 —— 服务端重启后所有会话失效，必须重新登录
+function authHeader(){
+  var token = sessionStorage.getItem('cfg_token');
+  return token ? { 'X-Config-Token': token } : {};
+}
+
+function clearSession(){
+  sessionStorage.removeItem('cfg_token');
+  sessionStorage.removeItem('cfg_pw'); // 清理旧版遗留
+}
+
+function showLogin(){
+  $('loginOverlay').classList.remove('hidden');
+  setTimeout(function(){ $('loginPw').focus(); }, 60);
+}
+
+function hideLogin(){
+  $('loginOverlay').classList.add('hidden');
+}
+
+async function doLogin(){
+  var pw = $('loginPw').value;
+  if(!pw){ $('loginErr').textContent = '请输入密码'; return; }
+  try{
+    var res = await fetch('/api/config/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw })
+    });
+    var data = null;
+    try { data = await res.json(); } catch(e){}
+    if(!res.ok){
+      $('loginErr').textContent = (data && data.message) || '密码错误';
+      return;
+    }
+    // 存服务端签发的令牌，而不是密码本身
+    if(data.token){ sessionStorage.setItem('cfg_token', data.token); }
+    clearSession();
+    if(data.token){ sessionStorage.setItem('cfg_token', data.token); }
+    $('loginPw').value = '';
+    $('loginErr').textContent = '';
+    hideLogin();
+    toast('🔓 解锁成功');
+    loadCfg();
+  }catch(e){
+    $('loginErr').textContent = '登录失败: ' + e.message;
+  }
+}
+
+async function doLogout(){
+  try{
+    await fetch('/api/config/logout', { method: 'POST', headers: authHeader() });
+  }catch(e){}
+  clearSession();
+  showLogin();
+  toast('🔒 已退出登录');
+}
+
+async function initAuth(){
+  try{
+    var res = await fetch('/api/config/auth', { cache: 'no-store' });
+    var auth = await res.json();
+    if(auth.required && !sessionStorage.getItem('cfg_token')){
+      showLogin();
+    } else {
+      loadCfg();
+    }
+  }catch(e){
+    // 接口异常时直接尝试加载
+    loadCfg();
+  }
+}
+
+async function api(url, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers, authHeader());
+  var res = await fetch(url, opts);
+  if(res.status === 401){
+    clearSession();
+    showLogin();
+    throw new Error('未授权，会话已失效，请重新解锁');
+  }
+  var data = null;
+  try { data = await res.json(); } catch(e){}
+  if(!res.ok){ throw new Error(data && data.message ? data.message : ('HTTP ' + res.status)); }
+  return data;
+}
+
+function splitList(s){
+  return String(s || '').split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+}
+
+async function loadCfg(notify){
+  try{
+    var c = await api('/api/config');
+    $('IP').value = c.IP || '';
+    $('PORT').value = c.PORT || '';
+    $('listenAddr').textContent = (c.IP || '0.0.0.0') + ':' + (c.PORT || '11434');
+    $('OPENAI_BASE').value = c.OPENAI_BASE || '';
+    $('OPENAI_KEY').value = '';
+    if(c.OPENAI_KEY_SET){ $('keyStatus').classList.remove('hidden'); } else { $('keyStatus').classList.add('hidden'); }
+    $('WebConfigPassword').value = '';
+    if(c.WEB_CONFIG_PASSWORD_SET){ $('pwStatus').classList.remove('hidden'); } else { $('pwStatus').classList.add('hidden'); }
+    $('Log_Limit').value = c.Log_Limit != null ? c.Log_Limit : 100;
+    $('Log_Responses').checked = !!c.Log_Responses;
+    $('Log_Headers').checked = !!c.Log_Headers;
+    $('Log_Body').checked = !!c.Log_Body;
+    $('OpenAI_Prefix').value = c.OpenAI_Prefix || '';
+    $('OpenAI_Suffix').value = c.OpenAI_Suffix || '';
+    $('StreamMode').value = c.StreamMode || 'preserve';
+    $('Capabilities').value = (c.Capabilities || []).join(', ');
+
+    state.aliases = [];
+    if(c.ModelAlias){
+      Object.keys(c.ModelAlias).forEach(function(k){
+        state.aliases.push({ key: k, value: c.ModelAlias[k] || '' });
+      });
+    }
+    renderAliases();
+
+    state.details = [];
+    if(c.ModelDetailedSettings){
+      Object.keys(c.ModelDetailedSettings).forEach(function(k){
+        var s = c.ModelDetailedSettings[k] || {};
+        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', ') });
+      });
+    }
+    renderDetails();
+
+    state.rules = [];
+    if(c.RequestPromptReplace){
+      Object.keys(c.RequestPromptReplace).forEach(function(k){
+        var rr = c.RequestPromptReplace[k] || {};
+        state.rules.push({ name: k, enable: rr.enable !== false, role: rr.role || '', index: rr.index != null ? rr.index : '', prompt: rr.prompt || '', replace: rr.replace || '' });
+      });
+    }
+    renderRules();
+    if(notify){ toast('✅ 已重新加载配置'); }
+  }catch(e){
+    toast('加载配置失败: ' + e.message, 'err');
+  }
+}
+
+function renderAliases(){
+  var box = $('aliasList');
+  box.innerHTML = '';
+  if(!state.aliases.length){ box.innerHTML = '<div class="empty">暂无别名配置</div>'; return; }
+  state.aliases.forEach(function(a, i){
+    var row = document.createElement('div');
+    row.className = 'drow';
+    row.innerHTML =
+      '<input type="text" class="mono" value="' + esc(a.key) + '" placeholder="上游模型ID" oninput="state.aliases[' + i + '].key=this.value">' +
+      '<input type="text" value="' + esc(a.value) + '" placeholder="显示名称" oninput="state.aliases[' + i + '].value=this.value">' +
+      '<button class="btn danger" onclick="removeAt(state.aliases,' + i + ',renderAliases)" title="删除">✕</button>';
+    box.appendChild(row);
+  });
+}
+
+function renderDetails(){
+  var box = $('detailList');
+  box.innerHTML = '';
+  if(!state.details.length){ box.innerHTML = '<div class="empty">暂无模型详细设置</div>'; return; }
+  state.details.forEach(function(d, i){
+    var el = document.createElement('div');
+    el.className = 'card-item';
+    el.innerHTML =
+      '<div class="item-head"><span class="name">模型</span>' +
+      '<input type="text" class="mono" style="flex:1" value="' + esc(d.model) + '" placeholder="上游模型ID，如 deepseek-chat" oninput="state.details[' + i + '].model=this.value">' +
+      '<button class="btn danger" onclick="removeAt(state.details,' + i + ',renderDetails)" title="删除">✕</button></div>' +
+      '<div class="grid3">' +
+      '<div class="row"><label>上下文长度 ContextLength</label><input type="number" min="0" value="' + esc(d.cl) + '" placeholder="默认 1000000" oninput="state.details[' + i + '].cl=this.value"></div>' +
+      '<div class="row"><label>最大输出 MaxOutputTokens</label><input type="number" min="0" value="' + esc(d.mot) + '" placeholder="默认 384000" oninput="state.details[' + i + '].mot=this.value"></div>' +
+      '<div class="row"><label>能力 Capabilities（逗号分隔）</label><input type="text" value="' + esc(d.caps) + '" placeholder="tools, vision" oninput="state.details[' + i + '].caps=this.value"></div>' +
+      '</div>';
+    box.appendChild(el);
+  });
+}
+
+function renderRules(){
+  var box = $('ruleList');
+  box.innerHTML = '';
+  if(!state.rules.length){ box.innerHTML = '<div class="empty">暂无替换规则</div>'; return; }
+  state.rules.forEach(function(r, i){
+    var el = document.createElement('div');
+    el.className = 'card-item';
+    el.innerHTML =
+      '<div class="item-head">' +
+      '<label class="switch"><input type="checkbox" ' + (r.enable ? 'checked' : '') + ' onchange="state.rules[' + i + '].enable=this.checked"><span class="track"></span><span class="lbl">启用</span></label>' +
+      '<span class="name">规则名</span>' +
+      '<input type="text" style="flex:1" value="' + esc(r.name) + '" placeholder="规则名称（唯一）" oninput="state.rules[' + i + '].name=this.value">' +
+      '<button class="btn danger" onclick="removeAt(state.rules,' + i + ',renderRules)" title="删除">✕</button></div>' +
+      '<div class="grid3">' +
+      '<div class="row"><label>目标角色 role（留空=任意）</label><select onchange="state.rules[' + i + '].role=this.value">' +
+      '<option value="">任意</option>' +
+      '<option value="system"' + (r.role === 'system' ? ' selected' : '') + '>system</option>' +
+      '<option value="user"' + (r.role === 'user' ? ' selected' : '') + '>user</option>' +
+      '<option value="assistant"' + (r.role === 'assistant' ? ' selected' : '') + '>assistant</option>' +
+      '</select></div>' +
+      '<div class="row"><label>消息索引 index（0=第1条）</label><input type="number" min="0" value="' + esc(r.index) + '" placeholder="留空=按角色" oninput="state.rules[' + i + '].index=this.value"></div>' +
+      '<div class="row"><label>文本匹配 prompt 出现即替换</label><input type="text" value="' + esc(r.prompt) + '" placeholder="要查找的文本" oninput="state.rules[' + i + '].prompt=this.value"></div>' +
+      '</div>' +
+      '<div class="row"><label>替换为 replace</label><textarea oninput="state.rules[' + i + '].replace=this.value">' + esc(r.replace) + '</textarea></div>';
+    box.appendChild(el);
+  });
+}
+
+function addAlias(){ state.aliases.push({ key: '', value: '' }); renderAliases(); }
+function addDetail(){ state.details.push({ model: '', cl: '', mot: '', caps: '' }); renderDetails(); }
+function addRule(){ state.rules.push({ name: '', enable: true, role: '', index: '', prompt: '', replace: '' }); renderRules(); }
+function removeAt(arr, i, render){ arr.splice(i, 1); render(); }
+
+function collectCfg(){
+  var aliases = {};
+  state.aliases.forEach(function(a){ if(a.key){ aliases[a.key] = a.value; } });
+
+  var details = {};
+  state.details.forEach(function(d){
+    if(!d.model) return;
+    var o = {};
+    if(d.cl !== '' && d.cl != null){ o.ContextLength = parseInt(d.cl, 10); }
+    if(d.mot !== '' && d.mot != null){ o.MaxOutputTokens = parseInt(d.mot, 10); }
+    var dc = splitList(d.caps);
+    if(dc.length){ o.Capabilities = dc; }
+    details[d.model] = o;
+  });
+
+  var rules = {};
+  state.rules.forEach(function(r){
+    if(!r.name) return;
+    var o = { enable: r.enable };
+    if(r.role){ o.role = r.role; }
+    if(r.index !== '' && r.index != null){ o.index = parseInt(r.index, 10); }
+    o.prompt = r.prompt || '';
+    o.replace = r.replace || '';
+    rules[r.name] = o;
+  });
+
+  return {
+    IP: $('IP').value.trim(),
+    PORT: $('PORT').value.trim(),
+    Log_Limit: parseInt($('Log_Limit').value, 10) || 100,
+    Log_Responses: $('Log_Responses').checked,
+    Log_Headers: $('Log_Headers').checked,
+    Log_Body: $('Log_Body').checked,
+    OpenAI_Prefix: $('OpenAI_Prefix').value,
+    OpenAI_Suffix: $('OpenAI_Suffix').value,
+    StreamMode: $('StreamMode').value,
+    Capabilities: splitList($('Capabilities').value),
+    OPENAI_BASE: $('OPENAI_BASE').value.trim(),
+    OPENAI_KEY: $('OPENAI_KEY').value.trim(),
+    WebConfigPassword: $('WebConfigPassword').value.trim(),
+    ModelAlias: aliases,
+    ModelDetailedSettings: details,
+    RequestPromptReplace: rules
+  };
+}
+
+async function saveCfg(){
+  var btn = $('btnSave');
+  btn.disabled = true;
+  btn.innerHTML = '⏳ 保存中...';
+  try{
+    var c = collectCfg();
+    if(!c.OPENAI_BASE){ toast('请填写 OPENAI_BASE', 'err'); btn.disabled = false; btn.innerHTML = '💾 保存配置'; return; }
+    var res = await api('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) });
+    toast(res.message || '配置已保存 ✓');
+    await loadCfg();
+  }catch(e){
+    toast('保存失败: ' + e.message, 'err');
+  }finally{
+    btn.disabled = false;
+    btn.innerHTML = '💾 保存配置';
+  }
+}
+
+async function testConn(){
+  var btn = $('btnTest');
+  btn.disabled = true;
+  btn.innerHTML = '⏳ 测试中...';
+  try{
+    var res = await api('/api/config/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ OPENAI_BASE: $('OPENAI_BASE').value.trim(), OPENAI_KEY: $('OPENAI_KEY').value.trim() }) });
+    var models = res.models || [];
+    var msg = '✅ 连接成功！发现 ' + models.length + ' 个模型';
+    if(models.length){ msg += '：' + models.slice(0, 6).join(', ') + (models.length > 6 ? ' 等' : ''); }
+    toast(msg, 'ok');
+  }catch(e){
+    toast('❌ ' + e.message, 'err');
+  }finally{
+    btn.disabled = false;
+    btn.innerHTML = '🔌 测试连接';
+  }
+}
+
+document.addEventListener('keydown', function(e){
+  if((e.ctrlKey || e.metaKey) && e.key === 's'){ e.preventDefault(); saveCfg(); }
+});
+// 登录框回车提交
+$('loginPw').addEventListener('keydown', function(e){
+  if(e.key === 'Enter'){ e.preventDefault(); doLogin(); }
+});
+window.addEventListener('DOMContentLoaded', initAuth);
+</script>
+</body>
+</html>`
+
+// handleConfigPage 返回可视化配置管理页面
+func handleConfigPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write([]byte(webConfigPageHTML))
+}
+
+// handleConfigAPI 处理配置的获取与保存
+func handleConfigAPI(w http.ResponseWriter, r *http.Request) {
+	if !requireConfigAuth(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		apiGetConfig(w, r)
+	case http.MethodPost:
+		apiSaveConfig(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// requireConfigAuth 校验配置管理接口的访问权限。
+// 未启用密码（WebConfigPassword 为空）时直接放行；
+// 启用后要求请求头 X-Config-Token 携带有效的服务端会话令牌。
+// 令牌由登录接口签发、存于服务端内存 —— 服务端重启后全部会话失效，
+// 已登录用户必须重新登录，杜绝"重启后仍可免登录修改"的漏洞。
+func requireConfigAuth(w http.ResponseWriter, r *http.Request) bool {
+	if cfg.WebConfigPassword == "" {
+		return true
+	}
+	if validConfigSession(r.Header.Get("X-Config-Token")) {
+		return true
+	}
+	http.Error(w, "未授权：会话已失效，请重新解锁", http.StatusUnauthorized)
+	return false
+}
+
+// configSessions 存储已签发的配置管理会话令牌（token → 过期时间）。
+// 仅存内存：服务端重启即全部失效，已登录用户必须重新登录。
+var (
+	configSessions   = make(map[string]time.Time)
+	configSessionsMu sync.Mutex
+)
+
+// configSessionTTL 会话有效期（24 小时）
+const configSessionTTL = 24 * time.Hour
+
+// newConfigSession 生成并登记一个随机会话令牌
+func newConfigSession() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(buf)
+
+	configSessionsMu.Lock()
+	defer configSessionsMu.Unlock()
+	// 顺带清理过期令牌，防止 map 无限膨胀
+	now := time.Now()
+	for t, exp := range configSessions {
+		if now.After(exp) {
+			delete(configSessions, t)
+		}
+	}
+	configSessions[token] = now.Add(configSessionTTL)
+	return token, nil
+}
+
+// validConfigSession 校验令牌是否有效（存在且未过期）
+func validConfigSession(token string) bool {
+	if token == "" {
+		return false
+	}
+	configSessionsMu.Lock()
+	defer configSessionsMu.Unlock()
+	expire, ok := configSessions[token]
+	if !ok {
+		return false
+	}
+	if time.Now().After(expire) {
+		delete(configSessions, token)
+		return false
+	}
+	return true
+}
+
+// removeConfigSession 使指定令牌立即失效（退出登录 / 密码变更后）
+func removeConfigSession(token string) {
+	configSessionsMu.Lock()
+	delete(configSessions, token)
+	configSessionsMu.Unlock()
+}
+
+// clearAllConfigSessions 清除所有会话（修改访问密码后强制全部重新登录）
+func clearAllConfigSessions() {
+	configSessionsMu.Lock()
+	configSessions = make(map[string]time.Time)
+	configSessionsMu.Unlock()
+}
+
+// apiConfigAuthStatus 返回是否启用了访问密码（公开接口，供登录页判断）
+func apiConfigAuthStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"required": cfg.WebConfigPassword != "",
+	})
+}
+
+// apiConfigLogin 验证访问密码并签发会话令牌（公开接口）
+func apiConfigLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		Password string `json:"password"`
+	}
+	_ = json.Unmarshal(body, &req)
+
+	if cfg.WebConfigPassword == "" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "message": "未启用密码保护"})
+		return
+	}
+	if req.Password != cfg.WebConfigPassword {
+		http.Error(w, "访问密码错误", http.StatusUnauthorized)
+		return
+	}
+	token, err := newConfigSession()
+	if err != nil {
+		http.Error(w, "会话创建失败", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":    true,
+		"token": token,
+	})
+}
+
+// apiConfigLogout 使当前会话令牌立即失效（退出登录）
+func apiConfigLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	removeConfigSession(r.Header.Get("X-Config-Token"))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+}
+
+// apiGetConfig 返回当前配置（OPENAI_KEY / WebConfigPassword 脱敏，绝不返回明文）
+func apiGetConfig(w http.ResponseWriter, r *http.Request) {
+	cfgCopy := cfg
+	keySet := cfgCopy.OpenAIKey != ""
+	cfgCopy.OpenAIKey = ""
+	pwSet := cfgCopy.WebConfigPassword != ""
+	cfgCopy.WebConfigPassword = ""
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(struct {
+		Config
+		OpenAIKeySet         bool `json:"OPENAI_KEY_SET"`
+		WebConfigPasswordSet bool `json:"WEB_CONFIG_PASSWORD_SET"`
+	}{Config: cfgCopy, OpenAIKeySet: keySet, WebConfigPasswordSet: pwSet})
+}
+
+// apiSaveConfig 保存配置到 config.json 并同步更新运行内存
+func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "读取请求失败", http.StatusBadRequest)
+		return
+	}
+
+	var newCfg Config
+	if err := json.Unmarshal(body, &newCfg); err != nil {
+		http.Error(w, "配置格式解析失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// 处理 OPENAI_KEY：空=保持不变；已加密=验证后原样保存；明文=自动加密保存
+	plainKey := cfg.OpenAIKey // 默认沿用当前内存明文
+	switch {
+	case newCfg.OpenAIKey == "":
+		if storedOpenAIKey == "" {
+			http.Error(w, "OPENAI_KEY 不能为空，请填写密钥", http.StatusBadRequest)
+			return
+		}
+		newCfg.OpenAIKey = storedOpenAIKey
+	case strings.HasPrefix(newCfg.OpenAIKey, encryptedKeyPrefix):
+		pk, err := decryptOpenAIKey(newCfg.OpenAIKey)
+		if err != nil {
+			http.Error(w, "OPENAI_KEY 校验失败: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		plainKey = pk
+		// 保持用户提供的加密值原样保存
+	default:
+		pk, persisted, err := normalizeOpenAIKey(newCfg.OpenAIKey)
+		if err != nil {
+			http.Error(w, "OPENAI_KEY 校验失败: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		plainKey = pk
+		newCfg.OpenAIKey = persisted
+	}
+
+	// 校验与规范化
+	if strings.TrimSpace(newCfg.OpenAIBase) == "" {
+		http.Error(w, "OPENAI_BASE 不能为空", http.StatusBadRequest)
+		return
+	}
+	newCfg.OpenAIBase = strings.TrimSpace(newCfg.OpenAIBase)
+	newCfg.IP = strings.TrimSpace(newCfg.IP)
+	newCfg.PORT = strings.TrimSpace(newCfg.PORT)
+	newCfg.StreamMode = normalizeStreamMode(newCfg.StreamMode)
+
+	// 处理 WebConfigPassword：空=保持原加密值；明文=自动加密保存；已加密=校验后保存
+	pwChanged := false
+	if newCfg.WebConfigPassword != "" {
+		plainPw, persistedPw, err := normalizeWebConfigPassword(strings.TrimSpace(newCfg.WebConfigPassword))
+		if err != nil {
+			http.Error(w, "访问密码处理失败: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if plainPw != cfg.WebConfigPassword {
+			pwChanged = true // 密码确实变更
+		}
+		cfg.WebConfigPassword = plainPw // 内存明文，供登录比对
+		storedWebConfigPassword = persistedPw
+		newCfg.WebConfigPassword = persistedPw
+	} else {
+		newCfg.WebConfigPassword = storedWebConfigPassword
+	}
+
+	if err := saveConfig(newCfg); err != nil {
+		http.Error(w, "写入 config.json 失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// 更新运行内存（map 整体替换引用，避免并发读写同一 map）
+	storedOpenAIKey = newCfg.OpenAIKey
+	applyConfigToRuntime(newCfg)
+	cfg.OpenAIKey = plainKey
+
+	// 访问密码已变更 → 清除所有已签发会话，强制所有用户重新登录
+	if pwChanged {
+		clearAllConfigSessions()
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]string{
+		"ok":      "true",
+		"message": "✅ 配置已保存。IP/PORT 修改需重启程序生效，其余配置立即生效。",
+	})
+}
+
+// applyConfigToRuntime 将新配置应用到运行时的全局 cfg（不含 OpenAIKey / WebConfigPassword，
+// 两者由调用方单独处理为明文，避免加密值覆盖内存明文）
+func applyConfigToRuntime(newCfg Config) {
+	cfg.IP = newCfg.IP
+	cfg.PORT = newCfg.PORT
+	cfg.Log_Limit = newCfg.Log_Limit
+	cfg.Log_Responses = newCfg.Log_Responses
+	cfg.Log_Headers = newCfg.Log_Headers
+	cfg.Log_Body = newCfg.Log_Body
+	cfg.OpenAIPrefix = newCfg.OpenAIPrefix
+	cfg.OpenAISuffix = newCfg.OpenAISuffix
+	cfg.StreamMode = newCfg.StreamMode
+	cfg.Capabilities = newCfg.Capabilities
+	cfg.OpenAIBase = newCfg.OpenAIBase
+	cfg.ModelAlias = newCfg.ModelAlias
+	cfg.ModelDetailedSettings = newCfg.ModelDetailedSettings
+	cfg.RequestPromptReplace = newCfg.RequestPromptReplace
+}
+
+// apiTestConfig 测试上游 API 连通性并返回模型列表
+func apiTestConfig(w http.ResponseWriter, r *http.Request) {
+	if !requireConfigAuth(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		OpenAIBase string `json:"OPENAI_BASE"`
+		OpenAIKey  string `json:"OPENAI_KEY"`
+	}
+	_ = json.Unmarshal(body, &req)
+
+	base := strings.TrimSpace(req.OpenAIBase)
+	if base == "" {
+		base = cfg.OpenAIBase
+	}
+	key := req.OpenAIKey
+	if key == "" {
+		key = cfg.OpenAIKey // 内存中为明文
+	} else if strings.HasPrefix(key, encryptedKeyPrefix) {
+		pk, err := decryptOpenAIKey(key)
+		if err != nil {
+			http.Error(w, "密钥解密失败: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		key = pk
+	}
+
+	httpReq, err := http.NewRequest("GET", strings.TrimRight(base, "/")+"/models", nil)
+	if err != nil {
+		http.Error(w, "请求构造失败: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+key)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		http.Error(w, "连接失败: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		http.Error(w, fmt.Sprintf("上游返回错误 (%d): %s", resp.StatusCode, truncateStr(string(raw), 300)), http.StatusBadGateway)
+		return
+	}
+
+	var models struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(raw, &models)
+
+	ids := make([]string, 0, len(models.Data))
+	for _, m := range models.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":     true,
+		"models": ids,
+	})
+}
+
+// truncateStr 截断过长的错误信息
+func truncateStr(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "..."
 }
 
 // upstreamModelMeta 上游模型元数据
@@ -3154,6 +4108,24 @@ func main() {
 	printModelAliases()
 
 	fmt.Println("🚀 转换器服务已启动 ~")
+
+	// 注册本地配置管理页面
+	http.HandleFunc("/config", handleConfigPage)
+	http.HandleFunc("/api/config", handleConfigAPI)
+	http.HandleFunc("/api/config/auth", apiConfigAuthStatus)
+	http.HandleFunc("/api/config/login", apiConfigLogin)
+	http.HandleFunc("/api/config/logout", apiConfigLogout)
+	http.HandleFunc("/api/config/test", apiTestConfig)
+
+	webHost := cfg.IP
+	if webHost == "" || webHost == "0.0.0.0" {
+		webHost = "127.0.0.1"
+	}
+	pwHint := ""
+	if cfg.WebConfigPassword != "" {
+		pwHint = "（已启用访问密码 🔒）"
+	}
+	fmt.Println("⚙️ 配置管理页面: http://" + webHost + ":" + cfg.PORT + "/config " + pwHint)
 
 	http.HandleFunc("/", logAllRequests)
 	http.ListenAndServe(cfg.IP+":"+cfg.PORT, nil)
