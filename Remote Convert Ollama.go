@@ -40,10 +40,62 @@ type ModelDetailedSetting struct {
 // PromptReplaceRule 定义请求提示词替换规则
 type PromptReplaceRule struct {
 	Enable  bool   `json:"enable"`
+	Mode    string `json:"mode,omitempty"`  // 替换模式枚举：normal=普通替换（默认）/ whole=匹配整段替换 / force=强制替换
 	Index   *int   `json:"index,omitempty"` // 消息索引（nil=未指定, 0=第1条），与 role 配合使用
 	Role    string `json:"role,omitempty"`  // 按角色定位（如 "system"）
 	Prompt  string `json:"prompt"`
 	Replace string `json:"replace"`
+}
+
+// 替换模式枚举常量
+const (
+	replaceModeNormal = "normal" // 普通替换：仅替换 prompt 匹配片段
+	replaceModeWhole  = "whole"  // 匹配整段替换：匹配到 prompt 后将整条消息替换为 replace
+	replaceModeForce  = "force"  // 强制替换：不检查匹配，直接整条替换
+)
+
+// normalizeReplaceMode 规范化替换模式枚举，非法值回退为 normal
+func normalizeReplaceMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case replaceModeForce:
+		return replaceModeForce
+	case replaceModeWhole:
+		return replaceModeWhole
+	default:
+		return replaceModeNormal
+	}
+}
+
+// migrateRequestPromptReplace 将旧版替换规则的 force / replaceWhole 布尔字段迁移为 mode 枚举。
+// 返回是否发生了迁移（需要写回 config.json）。
+// 旧字段已被 json.Unmarshal 丢弃，因此从原始 rawMap 读取。
+// 兼容规则：force=true → mode=force；否则 replaceWhole=true → mode=whole；其余保持 normal。
+func migrateRequestPromptReplace(stored *Config, rawMap map[string]interface{}) bool {
+	rawRules, _ := rawMap["RequestPromptReplace"].(map[string]interface{})
+	migrated := false
+	for name, rule := range stored.RequestPromptReplace {
+		// 规则已显式指定 mode → 仅规范化
+		if strings.TrimSpace(rule.Mode) != "" {
+			rule.Mode = normalizeReplaceMode(rule.Mode)
+			stored.RequestPromptReplace[name] = rule
+			continue
+		}
+		// 从原始 JSON 读取旧布尔字段
+		mode := replaceModeNormal
+		if rawRule, ok := rawRules[name].(map[string]interface{}); ok {
+			if f, _ := rawRule["force"].(bool); f {
+				mode = replaceModeForce
+			} else if w, _ := rawRule["replaceWhole"].(bool); w {
+				mode = replaceModeWhole
+			}
+		}
+		if mode != replaceModeNormal {
+			rule.Mode = mode
+			stored.RequestPromptReplace[name] = rule
+			migrated = true
+		}
+	}
+	return migrated
 }
 
 type Config struct {
@@ -811,6 +863,12 @@ func loadConfig() {
 		stored.RequestPromptReplace = defaultCfg.RequestPromptReplace
 		needSave = true
 	}
+	// 迁移旧版替换规则：force / replaceWhole 布尔字段 → mode 枚举
+	if migrateRequestPromptReplace(&stored, rawMap) {
+		needSave = true
+		fmt.Println("🔄 检测到旧的替换规则字段（force/replaceWhole），已迁移为 mode 枚举")
+	}
+
 	// 优先读取新字段 ModelDetailedSettings，兼容旧字段 ModelTokenSettings
 	if _, ok := rawMap["ModelDetailedSettings"]; ok {
 		// 新字段已存在，无需处理
@@ -1156,6 +1214,11 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .switch input:checked+.track{background:var(--accent2)}
 .switch input:checked+.track::after{left:19px;background:#fff}
 .switch .lbl{font-size:13px}
+.mode-group{display:flex;gap:8px;flex-wrap:wrap}
+.mode-opt{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:12.5px;color:var(--muted);transition:.15s;background:transparent;user-select:none}
+.mode-opt:hover{border-color:var(--accent);color:var(--text)}
+.mode-opt input{accent-color:var(--accent2);cursor:pointer}
+.mode-opt:has(input:checked){border-color:var(--accent);background:rgba(88,166,255,.12);color:var(--accent);font-weight:500}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font-size:13px;font-weight:500;cursor:pointer;transition:.15s;font-family:inherit}
 .btn:hover{border-color:var(--accent);color:#fff}
 .btn.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
@@ -1473,7 +1536,13 @@ async function loadCfg(notify){
     if(c.RequestPromptReplace){
       Object.keys(c.RequestPromptReplace).forEach(function(k){
         var rr = c.RequestPromptReplace[k] || {};
-        state.rules.push({ name: k, enable: rr.enable !== false, role: rr.role || '', index: rr.index != null ? rr.index : '', prompt: rr.prompt || '', replace: rr.replace || '' });
+        // 读取 mode 枚举（兼容旧版 force / replaceWhole 布尔字段）
+        var mode = rr.mode || 'normal';
+        if(mode === 'normal'){
+          if(rr.force){ mode = 'force'; }
+          else if(rr.ReplaceWhole){ mode = 'whole'; }
+        }
+        state.rules.push({ name: k, enable: rr.enable !== false, mode: mode, role: rr.role || '', index: rr.index != null ? rr.index : '', prompt: rr.prompt || '', replace: rr.replace || '' });
       });
     }
     renderRules();
@@ -1531,6 +1600,12 @@ function renderRules(){
       '<span class="name">规则名</span>' +
       '<input type="text" style="flex:1" value="' + esc(r.name) + '" placeholder="规则名称（唯一）" oninput="state.rules[' + i + '].name=this.value">' +
       '<button class="btn danger" onclick="removeAt(state.rules,' + i + ',renderRules)" title="删除">✕</button></div>' +
+      '<div class="row"><label>替换模式（互斥，只能选一种）</label>' +
+      '<div class="mode-group">' +
+      '<label class="mode-opt" title="仅将 prompt 出现处替换为 replace，其余内容保留"><input type="radio" name="rmode_' + i + '" value="normal" ' + (r.mode === 'normal' ? 'checked' : '') + ' onchange="state.rules[' + i + '].mode=this.value"><span>📄 普通替换</span></label>' +
+      '<label class="mode-opt" title="文本匹配到 prompt 时，将整条消息内容替换为 replace"><input type="radio" name="rmode_' + i + '" value="whole" ' + (r.mode === 'whole' ? 'checked' : '') + ' onchange="state.rules[' + i + '].mode=this.value"><span>📝 匹配整段替换</span></label>' +
+      '<label class="mode-opt" title="不检查文本匹配，直接整条替换"><input type="radio" name="rmode_' + i + '" value="force" ' + (r.mode === 'force' ? 'checked' : '') + ' onchange="state.rules[' + i + '].mode=this.value"><span>⚡ 强制替换</span></label>' +
+      '</div></div>' +
       '<div class="grid3">' +
       '<div class="row"><label>目标角色 role（留空=任意）</label><select onchange="state.rules[' + i + '].role=this.value">' +
       '<option value="">任意</option>' +
@@ -1539,16 +1614,16 @@ function renderRules(){
       '<option value="assistant"' + (r.role === 'assistant' ? ' selected' : '') + '>assistant</option>' +
       '</select></div>' +
       '<div class="row"><label>消息索引 index（0=第1条）</label><input type="number" min="0" value="' + esc(r.index) + '" placeholder="留空=按角色" oninput="state.rules[' + i + '].index=this.value"></div>' +
-      '<div class="row"><label>文本匹配 prompt 出现即替换</label><input type="text" value="' + esc(r.prompt) + '" placeholder="要查找的文本" oninput="state.rules[' + i + '].prompt=this.value"></div>' +
+      '<div class="row"><label>文本匹配 prompt' + (r.mode === 'force' ? '（强制替换时忽略）' : '') + '</label><input type="text" value="' + esc(r.prompt) + '" placeholder="要查找的文本" oninput="state.rules[' + i + '].prompt=this.value"></div>' +
       '</div>' +
-      '<div class="row"><label>替换为 replace</label><textarea oninput="state.rules[' + i + '].replace=this.value">' + esc(r.replace) + '</textarea></div>';
+      '<div class="row"><label>替换为 replace' + (r.mode !== 'normal' ? '（此模式 = 消息的完整新内容）' : '') + '</label><textarea oninput="state.rules[' + i + '].replace=this.value">' + esc(r.replace) + '</textarea></div>';
     box.appendChild(el);
   });
 }
 
 function addAlias(){ state.aliases.push({ key: '', value: '' }); renderAliases(); }
 function addDetail(){ state.details.push({ model: '', cl: '', mot: '', caps: '' }); renderDetails(); }
-function addRule(){ state.rules.push({ name: '', enable: true, role: '', index: '', prompt: '', replace: '' }); renderRules(); }
+function addRule(){ state.rules.push({ name: '', enable: true, mode: 'normal', role: '', index: '', prompt: '', replace: '' }); renderRules(); }
 function removeAt(arr, i, render){ arr.splice(i, 1); render(); }
 
 function collectCfg(){
@@ -1570,6 +1645,7 @@ function collectCfg(){
   state.rules.forEach(function(r){
     if(!r.name) return;
     var o = { enable: r.enable };
+    if(r.mode && r.mode !== 'normal'){ o.mode = r.mode; }
     if(r.role){ o.role = r.role; }
     if(r.index !== '' && r.index != null){ o.index = parseInt(r.index, 10); }
     o.prompt = r.prompt || '';
@@ -1865,6 +1941,11 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.IP = strings.TrimSpace(newCfg.IP)
 	newCfg.PORT = strings.TrimSpace(newCfg.PORT)
 	newCfg.StreamMode = normalizeStreamMode(newCfg.StreamMode)
+
+	// 规范化替换规则模式：mode 枚举 + 兼容旧 force/replaceWhole 字段
+	var rawCfg map[string]interface{}
+	_ = json.Unmarshal(body, &rawCfg)
+	migrateRequestPromptReplace(&newCfg, rawCfg)
 
 	// 处理 WebConfigPassword：空=保持原加密值；明文=自动加密保存；已加密=校验后保存
 	pwChanged := false
@@ -3862,10 +3943,10 @@ func applyRequestPromptReplace(body []byte) []byte {
 		return body
 	}
 
-	// 检查是否有启用的规则
+	// 检查是否有启用的规则（强制替换模式不需要 prompt）
 	hasEnabled := false
 	for _, rule := range cfg.RequestPromptReplace {
-		if rule.Enable && rule.Prompt != "" {
+		if rule.Enable && (rule.Prompt != "" || rule.Mode == replaceModeForce) {
 			hasEnabled = true
 			break
 		}
@@ -3884,7 +3965,7 @@ func applyRequestPromptReplace(body []byte) []byte {
 	// 处理 messages 数组（OpenAI / Ollama chat 格式）
 	if rawMessages, ok := req["messages"].([]interface{}); ok {
 		for ruleName, rule := range cfg.RequestPromptReplace {
-			if !rule.Enable || rule.Prompt == "" {
+			if !rule.Enable || (rule.Mode != replaceModeForce && rule.Prompt == "") {
 				continue
 			}
 
@@ -3902,10 +3983,10 @@ func applyRequestPromptReplace(body []byte) []byte {
 					}
 					if roleIdx == *rule.Index {
 						// 找到了第 N 条匹配 role 的消息
-						if content, ok := msg["content"].(string); ok && strings.Contains(content, rule.Prompt) {
-							msg["content"] = strings.ReplaceAll(content, rule.Prompt, rule.Replace)
+						if content, ok := msg["content"].(string); ok && (rule.Mode == replaceModeForce || strings.Contains(content, rule.Prompt)) {
+							msg["content"] = replaceRuleContent(content, rule)
 							modified = true
-							fmt.Printf("🔧 提示词替换 [%s]: messages[%d] (role=%q, index=%d) 中 \"%s\" → \"%s\"\n", ruleName, i, rule.Role, *rule.Index, rule.Prompt, rule.Replace)
+							fmt.Printf("🔧 提示词替换 [%s]: messages[%d] (role=%q, index=%d)%s\n", ruleName, i, rule.Role, *rule.Index, ruleLogDesc(rule))
 						}
 						break
 					}
@@ -3916,10 +3997,10 @@ func applyRequestPromptReplace(body []byte) []byte {
 				for i, rawMsg := range rawMessages {
 					if msg, ok := rawMsg.(map[string]interface{}); ok {
 						if role, _ := msg["role"].(string); role == rule.Role {
-							if content, ok := msg["content"].(string); ok && strings.Contains(content, rule.Prompt) {
-								msg["content"] = strings.ReplaceAll(content, rule.Prompt, rule.Replace)
+							if content, ok := msg["content"].(string); ok && (rule.Mode == replaceModeForce || strings.Contains(content, rule.Prompt)) {
+								msg["content"] = replaceRuleContent(content, rule)
 								modified = true
-								fmt.Printf("🔧 提示词替换 [%s]: messages[%d] role=%q 中 \"%s\" → \"%s\"\n", ruleName, i, rule.Role, rule.Prompt, rule.Replace)
+								fmt.Printf("🔧 提示词替换 [%s]: messages[%d] role=%q%s\n", ruleName, i, rule.Role, ruleLogDesc(rule))
 							}
 						}
 					}
@@ -3928,12 +4009,10 @@ func applyRequestPromptReplace(body []byte) []byte {
 				// ③ 只有 index 有值：按 index 取第 N 条消息替换
 				idx := *rule.Index
 				if msg, ok := rawMessages[idx].(map[string]interface{}); ok {
-					if content, ok := msg["content"].(string); ok {
-						if strings.Contains(content, rule.Prompt) {
-							msg["content"] = strings.ReplaceAll(content, rule.Prompt, rule.Replace)
-							modified = true
-							fmt.Printf("🔧 提示词替换 [%s]: messages[%d] 中 \"%s\" → \"%s\"\n", ruleName, idx, rule.Prompt, rule.Replace)
-						}
+					if content, ok := msg["content"].(string); ok && (rule.Mode == replaceModeForce || strings.Contains(content, rule.Prompt)) {
+						msg["content"] = replaceRuleContent(content, rule)
+						modified = true
+						fmt.Printf("🔧 提示词替换 [%s]: messages[%d]%s\n", ruleName, idx, ruleLogDesc(rule))
 					}
 				}
 			}
@@ -3943,13 +4022,13 @@ func applyRequestPromptReplace(body []byte) []byte {
 	// 处理 Ollama 单条 prompt 字段
 	if prompt, ok := req["prompt"].(string); ok {
 		for ruleName, rule := range cfg.RequestPromptReplace {
-			if !rule.Enable || rule.Prompt == "" {
+			if !rule.Enable || (rule.Mode != replaceModeForce && rule.Prompt == "") {
 				continue
 			}
-			if rule.Role == "" && rule.Index != nil && *rule.Index == 0 && strings.Contains(prompt, rule.Prompt) {
-				req["prompt"] = strings.ReplaceAll(prompt, rule.Prompt, rule.Replace)
+			if rule.Role == "" && rule.Index != nil && *rule.Index == 0 && (rule.Mode == replaceModeForce || strings.Contains(prompt, rule.Prompt)) {
+				req["prompt"] = replaceRuleContent(prompt, rule)
 				modified = true
-				fmt.Printf("🔧 提示词替换 [%s]: prompt 字段中 \"%s\" → \"%s\"\n", ruleName, rule.Prompt, rule.Replace)
+				fmt.Printf("🔧 提示词替换 [%s]: prompt 字段%s\n", ruleName, ruleLogDesc(rule))
 			}
 		}
 	}
@@ -3963,6 +4042,28 @@ func applyRequestPromptReplace(body []byte) []byte {
 	}
 
 	return body
+}
+
+// replaceRuleContent 根据规则模式决定替换方式：
+// force（强制替换）→ 不检查匹配，直接整体覆盖为 Replace；
+// whole（匹配整段替换）→ 调用方已确认内容包含 Prompt，整体覆盖为 Replace；
+// normal（普通模式）→ 仅将 Prompt 出现处替换为 Replace
+func replaceRuleContent(content string, rule PromptReplaceRule) string {
+	if rule.Mode == replaceModeForce || rule.Mode == replaceModeWhole {
+		return rule.Replace
+	}
+	return strings.ReplaceAll(content, rule.Prompt, rule.Replace)
+}
+
+// ruleLogDesc 生成替换日志的描述片段
+func ruleLogDesc(rule PromptReplaceRule) string {
+	if rule.Mode == replaceModeForce {
+		return " 强制替换整条内容 → \"" + rule.Replace + "\""
+	}
+	if rule.Mode == replaceModeWhole {
+		return " 匹配到后整段替换 → \"" + rule.Replace + "\""
+	}
+	return " 中 \"" + rule.Prompt + "\" → \"" + rule.Replace + "\""
 }
 
 func logAllRequests(w http.ResponseWriter, r *http.Request) {

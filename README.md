@@ -32,12 +32,12 @@
 
 ## 🎯 为什么需要这个工具？
 
-| 问题 | 解决方案 |
-|------|---------|
-| ❌ VS Code Copilot Chat 只支持 Ollama API 调用本地模型 | ✅ 本程序模拟 Ollama API，实际调用远程 OpenAI 兼容 API |
-| ❌ VS2026 仅内置支持 OpenAI + Azure + Anthropic 官方 | ✅ 同时提供 Ollama API + Anthropic Messages API 两种接入方式 |
-| ❌ 官方限制多、地区不可用、价格高昂 | ✅ 自由选择任意第三方 OpenAI 兼容服务商 |
-| ❌ API Key 明文存储有泄露风险 | ✅ AES-GCM 加密存储，绑定机器指纹 + UUID 双重校验 |
+| 问题                                                   | 解决方案                                                     |
+| ------------------------------------------------------ | ------------------------------------------------------------ |
+| ❌ VS Code Copilot Chat 只支持 Ollama API 调用本地模型 | ✅ 本程序模拟 Ollama API，实际调用远程 OpenAI 兼容 API       |
+| ❌ VS2026 仅内置支持 OpenAI + Azure + Anthropic 官方   | ✅ 同时提供 Ollama API + Anthropic Messages API 两种接入方式 |
+| ❌ 官方限制多、地区不可用、价格高昂                    | ✅ 自由选择任意第三方 OpenAI 兼容服务商                      |
+| ❌ API Key 明文存储有泄露风险                          | ✅ AES-GCM 加密存储，绑定机器指纹 + UUID 双重校验            |
 
 ---
 
@@ -45,17 +45,17 @@
 
 ### 🔄 多协议转换
 
-| 客户端请求 | 转换目标 | 说明 |
-|-----------|---------|------|
-| `GET /api/version` | → 返回版本信息 | VS Code 探测 Ollama 服务 |
-| `GET /api/tags` | → `GET /v1/models` (上游) | 获取模型列表，支持别名、前后缀、上下文信息 |
-| `POST /api/show` | → 返回增强模型信息 | 包含上下文窗口、能力声明、Token 限制等 |
-| `POST /api/chat` | → `POST /v1/chat/completions` (上游) | Ollama 聊天补全 → OpenAI 格式 |
-| `POST /v1/chat/completions` | → `POST /v1/chat/completions` (上游) | 标准 OpenAI 流式/非流式透传 |
-| `POST /v1/messages` | → `POST /v1/chat/completions` (上游) | **Anthropic 格式 → OpenAI 格式转换** |
-| `POST /v1/messages/count_tokens` | → Token 估算 | Anthropic token 计数接口 |
-| `GET /v1/models` | → `GET /v1/models` (上游) | 获取上游模型列表 |
-| `GET /models` | → `GET /v1/models` (上游) | VS Code 旧版 API 兼容 |
+| 客户端请求                         | 转换目标                               | 说明                                        |
+| ---------------------------------- | -------------------------------------- | ------------------------------------------- |
+| `GET /api/version`               | → 返回版本信息                        | VS Code 探测 Ollama 服务                    |
+| `GET /api/tags`                  | →`GET /v1/models` (上游)            | 获取模型列表，支持别名、前后缀、上下文信息  |
+| `POST /api/show`                 | → 返回增强模型信息                    | 包含上下文窗口、能力声明、Token 限制等      |
+| `POST /api/chat`                 | →`POST /v1/chat/completions` (上游) | Ollama 聊天补全 → OpenAI 格式              |
+| `POST /v1/chat/completions`      | →`POST /v1/chat/completions` (上游) | 标准 OpenAI 流式/非流式透传                 |
+| `POST /v1/messages`              | →`POST /v1/chat/completions` (上游) | **Anthropic 格式 → OpenAI 格式转换** |
+| `POST /v1/messages/count_tokens` | → Token 估算                          | Anthropic token 计数接口                    |
+| `GET /v1/models`                 | →`GET /v1/models` (上游)            | 获取上游模型列表                            |
+| `GET /models`                    | →`GET /v1/models` (上游)            | VS Code 旧版 API 兼容                       |
 
 ### 🖥️ VS Code & VS2026 完美兼容
 
@@ -159,6 +159,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
     "RequestPromptReplace": {
         "替换规则名称": {
             "enable": true,
+            "mode": "whole",
             "index": 0,
             "role": "system",
             "prompt": "你要替换的原文",
@@ -168,32 +169,34 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 }
 ```
 
-| 配置项 | 说明 | 默认值 |
-|-------|------|--------|
-| `IP` | 监听地址 | `0.0.0.0` |
-| `PORT` | 监听端口 | `11434` |
-| `Log_Limit` | 终端日志自动清理阈值(条) | `100` |
-| `Log_Responses` | 是否打印响应内容 | `true` |
-| `Log_Headers` | 是否打印请求头 | `true` |
-| `Log_Body` | 是否打印请求体 | `true` |
-| `OpenAI_Prefix` | 模型显示名前缀 | `[VC反代] ` |
-| `OpenAI_Suffix` | 模型显示名后缀 | `""` (空) |
-| `StreamMode` | 流式策略 | `preserve` |
-| `Capabilities` | 能力声明列表 | `["tools", "vision"]` |
-| `OPENAI_BASE` | 上游 OpenAI 兼容 API 地址 | **必填** |
-| `OPENAI_KEY` | 上游 API 密钥 | **必填**，首次输入明文后自动加密 |
-| `ModelAlias` | 模型别名映射 `{上游ID: 显示名称}` | `{}` |
-| `ModelDetailedSettings` | 模型详细设置 `{上游ID: {ContextLength, MaxOutputTokens, Capabilities}}` | `{}` |
-| `RequestPromptReplace` | 请求提示词替换规则 `{规则名: {enable, role, index, prompt, replace}}` | `{}` |
+| 配置项                    | 说明                                                                     | 默认值                                 |
+| ------------------------- | ------------------------------------------------------------------------ | -------------------------------------- |
+| `IP`                    | 监听地址                                                                 | `0.0.0.0`                            |
+| `PORT`                  | 监听端口                                                                 | `11434`                              |
+| `Log_Limit`             | 终端日志自动清理阈值(条)                                                 | `100`                                |
+| `Log_Responses`         | 是否打印响应内容                                                         | `true`                               |
+| `Log_Headers`           | 是否打印请求头                                                           | `true`                               |
+| `Log_Body`              | 是否打印请求体                                                           | `true`                               |
+| `OpenAI_Prefix`         | 模型显示名前缀                                                           | `[VC反代] `                          |
+| `OpenAI_Suffix`         | 模型显示名后缀                                                           | `""` (空)                            |
+| `StreamMode`            | 流式策略                                                                 | `preserve`                           |
+| `Capabilities`          | 能力声明列表                                                             | `["tools", "vision"]`                |
+| `OPENAI_BASE`           | 上游 OpenAI 兼容 API 地址                                                | **必填**                         |
+| `OPENAI_KEY`            | 上游 API 密钥                                                            | **必填**，首次输入明文后自动加密 |
+| `ModelAlias`            | 模型别名映射`{上游ID: 显示名称}`                                       | `{}`                                 |
+| `ModelDetailedSettings` | 模型详细设置`{上游ID: {ContextLength, MaxOutputTokens, Capabilities}}` | `{}`                                 |
+| `RequestPromptReplace`  | 请求提示词替换规则`{规则名: {enable, mode, role, index, prompt, replace}}`   | `{}`                                 |
 
 **`StreamMode` 说明**：
-| 值 | 行为 |
-|-------|------|
-| `preserve` | 按客户端请求决定是否流式（默认） |
-| `force_stream` | 无论客户端是否请求，都强制使用流式 |
-| `force_close` | 无论客户端是否请求，都强制使用非流式 |
+
+| 值               | 行为                                 |
+| ---------------- | ------------------------------------ |
+| `preserve`     | 按客户端请求决定是否流式（默认）     |
+| `force_stream` | 无论客户端是否请求，都强制使用流式   |
+| `force_close`  | 无论客户端是否请求，都强制使用非流式 |
 
 **`ModelDetailedSettings` 说明**：
+
 - 手动覆盖上游 API 返回的模型上下文长度、最大输出 Token 数和能力列表
 - 当上游 API 不返回元数据或返回的值不准确时非常有用
 - `Capabilities` 字段可选（`omitempty`），当有定义时优先使用此处的配置，否则使用全局 `Capabilities`
@@ -233,21 +236,22 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 
 页面功能一览：
 
-| 功能 | 说明 |
-|------|------|
-| 📡 **上游 API** | 修改 `OPENAI_BASE`，密钥输入明文后**自动加密保存**（留空表示保持当前密钥） |
-| 🔌 **测试连接** | 一键测试上游连通性，显示上游可用模型列表 |
-| � **访问密码** | 设置 `WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改） |
-| 🖥️ **监听设置** | 修改 `IP` / `PORT`（需重启程序生效） |
-| 📜 **日志设置** | 调整日志清理阈值、响应/请求头/请求体打印开关 |
-| 🧩 **模型显示** | 前后缀、流式策略、能力声明 |
-| 🔖 **模型别名** | 可视化增删 `ModelAlias` 映射 |
-| 📐 **模型详细设置** | 可视化增删 `ModelDetailedSettings`（上下文长度、最大输出、能力） |
-| ✂️ **提示词替换规则** | 可视化增删 `RequestPromptReplace` 规则 |
+| 功能                         | 说明                                                                               |
+| ---------------------------- | ---------------------------------------------------------------------------------- |
+| 📡**上游 API**         | 修改`OPENAI_BASE`，密钥输入明文后**自动加密保存**（留空表示保持当前密钥）  |
+| 🔌**测试连接**         | 一键测试上游连通性，显示上游可用模型列表                                           |
+| �**访问密码**         | 设置`WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改） |
+| 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            |
+| 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
+| 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                         |
+| 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                      |
+| 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力）                  |
+| ✂️**提示词替换规则** | 可视化增删`RequestPromptReplace` 规则                                            |
 
 保存后配置**立即写入 `config.json` 并同步到运行内存**（除 `IP`/`PORT` 外均即时生效），支持 `Ctrl+S` 快捷保存。
 
 > 🔒 **安全说明**：
+>
 > - 配置接口不会返回明文密钥/密码，仅在输入新值时自动加密写入
 > - **`OPENAI_KEY` 与 `WebConfigPassword` 均使用 AES-GCM 加密存储**（机器指纹 + UUID 双重校验），config.json 中不保留明文
 > - 首次输入明文密码后程序自动加密回写；换设备需重新输入
@@ -333,6 +337,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 ### 🏷️ 模型别名
 
 通过 `ModelAlias` 映射，你可以：
+
 - 让模型显示更友好的名称
 - 多个模型共用一个别名
 - 搭配前后缀实现分类显示
@@ -340,6 +345,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 ### 🧠 模型详细设置
 
 通过 `ModelDetailedSettings` 你可以为每个模型单独设置：
+
 - **上下文长度** (ContextLength) — 覆盖上游返回的值
 - **最大输出 Token** (MaxOutputTokens) — 控制单次最大生成量
 - **能力列表** (Capabilities) — 可选，当有定义时优先于此配置覆盖全局 `Capabilities`
@@ -348,6 +354,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 ### � 请求提示词替换
 
 通过 `RequestPromptReplace` 你可以自动篡改客户端发来的请求消息中的指定文本，适用于以下场景：
+
 - **篡改 Copilot 内置提示词** — 例如将「你叫 GitHub Copilot」替换为「你叫亚丝娜」
 - **移除微软限制指令** — 替换掉系统级约束，让 AI 回答更多领域问题
 - **自定义角色设定** — 替换身份、语气、风格等系统提示词
@@ -356,22 +363,30 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 
 每条规则包含以下字段：
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `enable` | bool | 是否启用该规则 |
-| `role` | string | 按角色过滤（如 `"system"`、`"user"`），可选 |
-| `index` | int | 按索引取第 N 条消息，可选 |
-| `prompt` | string | 要查找替换的原文（必须完全匹配才能替换） |
-| `replace` | string | 替换后的文本 |
+| 字段      | 类型   | 说明                                                          |
+| --------- | ------ | ------------------------------------------------------------ |
+| `enable`  | bool   | 是否启用该规则                                                |
+| `mode`    | string | **替换模式枚举**（可选）：`normal`=普通替换 / `whole`=匹配整段替换 / `force`=强制替换，默认 `normal` |
+| `role`    | string | 按角色过滤（如`"system"`、`"user"`），可选                    |
+| `index`   | int    | 按索引取第 N 条消息，可选                                     |
+| `prompt`  | string | 要查找替换的原文（必须完全匹配才能替换；强制替换时忽略）      |
+| `replace` | string | 替换后的文本（`whole` / `force` 模式时 = 消息的完整新内容）   |
 
 #### 匹配优先级
 
-| 组合方式 | 行为 |
-|---------|------|
+| 组合方式                  | 行为                                                              |
+| ------------------------- | ----------------------------------------------------------------- |
 | `role` + `index` 都有 | **先按 role 过滤**，再取过滤后第 N 条消息进行替换（最精确） |
-| 仅有 `role` | 替换所有匹配该 role 的消息 |
-| 仅有 `index` | 按消息数组的索引取第 N 条替换 |
-| 两者都省略 | 不对 messages 数组处理 |
+| 仅有`role`              | 替换所有匹配该 role 的消息                                        |
+| 仅有`index`             | 按消息数组的索引取第 N 条替换                                     |
+| 两者都省略                | 不对 messages 数组处理                                            |
+
+> ⚡ **三种替换模式（`mode` 枚举，互斥只能选一种）**：
+> - `normal`（普通替换，默认）：仅将 `prompt` 出现的位置替换为 `replace`，消息其余内容保留
+> - `whole`（匹配整段替换）：先检查消息内容是否包含 `prompt`，匹配到就把**整条 content** 替换为 `replace`；未匹配到则不动。适合「检测到原文特征就整体换成自己的设定」
+> - `force`（强制替换）：不检查 `prompt` 是否匹配，只要定位到目标消息（按 role / index），就直接把整条 `content` 替换为 `replace`。适合「整个系统提示词换成自己的设定」这类场景，无需关心原文内容
+>
+> `mode` 可省略（默认 `normal`）。旧版 `force` / `replaceWhole` 布尔字段会自动迁移为 `mode` 枚举。
 
 #### 示例
 
@@ -459,15 +474,15 @@ Remote Convert Ollama/
 
 ### 关键技术点
 
-| 技术 | 用途 |
-|------|------|
-| Go `net/http` | HTTP 服务器和反向代理 |
-| AES-256-GCM | API Key 加密存储 |
-| SHA-256 | 机器指纹 + UUID 密钥派生 |
-| Server-Sent Events (SSE) | 流式响应实时转发 |
-| 系统调用 (Windows) | 控制台标题设置、磁盘卷序列号获取 |
-| `bufio` 流式解析 | OpenAI / Anthropic 流式数据实时转发 |
-| `sync.RWMutex` | reasoning_content 线程安全读写 |
+| 技术                     | 用途                                |
+| ------------------------ | ----------------------------------- |
+| Go`net/http`           | HTTP 服务器和反向代理               |
+| AES-256-GCM              | API Key 加密存储                    |
+| SHA-256                  | 机器指纹 + UUID 密钥派生            |
+| Server-Sent Events (SSE) | 流式响应实时转发                    |
+| 系统调用 (Windows)       | 控制台标题设置、磁盘卷序列号获取    |
+| `bufio` 流式解析       | OpenAI / Anthropic 流式数据实时转发 |
+| `sync.RWMutex`         | reasoning_content 线程安全读写      |
 
 ---
 
@@ -481,15 +496,18 @@ Remote Convert Ollama/
 3. 检查防火墙是否阻止了端口 `11434`
 4. 在浏览器中访问 `http://127.0.0.1:11434/api/version` 确认服务正常
 5. 检查终端日志是否有错误信息
+
 </details>
 
 <details>
 <summary><b>Q: 提示"机器码不匹配"？</b></summary>
 
 这是因为加密后的 API Key 绑定了当前机器的指纹。解决办法：
+
 1. 删掉 `config.json` 中的 `OPENAI_KEY` 字段（保留 `"OPENAI_KEY": ""` 留空）
 2. 在 `OPENAI_KEY` 中填入明文 API Key
 3. 重新启动程序，程序会自动重新加密并回写
+
 </details>
 
 <details>
@@ -499,31 +517,37 @@ Remote Convert Ollama/
 2. 启动时查看终端输出是否有"⚠️ 无法获取上游模型列表"的提示
 3. 关闭 VS Code，删除其模型缓存（VS Code 会缓存模型列表）
 4. 重新启动程序和 VS Code
+
 </details>
 
 <details>
 <summary><b>Q: 支持 HTTPS 吗？</b></summary>
 
 本程序本身只提供 HTTP 服务。如果需要在局域网中安全使用，建议在上层使用 Nginx 反向代理添加 HTTPS。
+
 </details>
 
 <details>
 <summary><b>Q: 日志太多怎么办？</b></summary>
 
 可以通过以下方式控制日志输出量：
+
 - 调整 `Log_Limit` 值，日志达到该阈值后终端会自动清屏。设置为 `0` 可禁用自动清理
 - 将 `Log_Headers` 设为 `false` 关闭请求头打印
 - 将 `Log_Body` 设为 `false` 关闭请求体打印
 - 将 `Log_Responses` 设为 `false` 关闭响应内容打印
+
 </details>
 
 <details>
 <summary><b>Q: DeepSeek 思考模式下对话历史不连贯？</b></summary>
 
 本程序会自动追踪上游返回的 `reasoning_content`，并在客户端下次请求时自动注入。如果仍然有问题：
+
 1. 确保使用的是 `StreamMode: "preserve"`（默认值）
 2. 检查客户端是否发送了完整的消息历史
 3. 某些客户端可能需要手动清除对话后重新开始
+
 </details>
 
 ---
