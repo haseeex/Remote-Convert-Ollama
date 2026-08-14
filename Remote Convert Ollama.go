@@ -1192,7 +1192,14 @@ header .logo{font-size:22px}
 header h1{font-size:17px;font-weight:600}
 header .sub{font-size:12px;color:var(--muted)}
 header .spacer{flex:1}
-.wrap{max-width:880px;margin:24px auto 0;padding:0 20px;display:flex;flex-direction:column;gap:18px}
+.layout{max-width:1120px;margin:24px auto 0;padding:0 20px;display:flex;gap:20px;align-items:flex-start}
+.tabs{width:176px;flex-shrink:0;display:flex;flex-direction:column;gap:6px;position:sticky;top:76px}
+.tab-item{display:flex;align-items:center;gap:9px;padding:11px 14px;border-radius:10px;border:1px solid transparent;color:var(--muted);font-size:13.5px;cursor:pointer;transition:.15s;user-select:none;background:transparent}
+.tab-item:hover{color:var(--text);background:rgba(22,27,34,.7)}
+.tab-item.active{color:var(--accent);background:var(--panel);border-color:var(--border);font-weight:600;box-shadow:inset 3px 0 0 var(--accent)}
+.panels{flex:1;min-width:0;display:flex;flex-direction:column}
+.panel{display:none;flex-direction:column;gap:18px}
+.panel.active{display:flex}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
 .card>.head{display:flex;align-items:center;gap:8px;padding:12px 18px;background:var(--panel2);border-bottom:1px solid var(--border);font-weight:600;font-size:14px}
 .card>.head .hint{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);text-align:right}
@@ -1207,6 +1214,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
 @media(max-width:680px){.grid2,.grid3{grid-template-columns:1fr}}
+@media(max-width:760px){.layout{flex-direction:column}.tabs{width:100%;flex-direction:row;overflow-x:auto;position:static;padding-bottom:4px}.tab-item{white-space:nowrap}}
 .switch{position:relative;display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
 .switch input{display:none}
 .switch .track{width:38px;height:21px;background:#30363d;border-radius:21px;position:relative;transition:.2s;flex-shrink:0}
@@ -1266,94 +1274,113 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
   <button class="btn" onclick="testConn()" id="btnTest">🔌 测试连接</button>
 </header>
 
-<div class="wrap">
-  <div class="card">
-    <div class="head">🖥️ 监听设置 <span class="hint">修改 IP / PORT 需重启程序生效</span></div>
-    <div class="body grid2">
-      <div class="row"><label>监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
-      <div class="row"><label>监听端口 PORT</label><input type="text" id="PORT" placeholder="11434"></div>
-    </div>
+<div class="layout">
+  <div class="tabs" role="tablist">
+    <div class="tab-item active" data-tab="conn" onclick="switchTab('conn')">🔌 连接设置</div>
+    <div class="tab-item" data-tab="sec" onclick="switchTab('sec')">🔒 安全设置</div>
+    <div class="tab-item" data-tab="log" onclick="switchTab('log')">📜 日志设置</div>
+    <div class="tab-item" data-tab="model" onclick="switchTab('model')">🧩 模型设置</div>
+    <div class="tab-item" data-tab="rules" onclick="switchTab('rules')">✂️ 提示词替换</div>
   </div>
-
-  <div class="card">
-    <div class="head">📡 上游 API <span class="hint">OPENAI_KEY 留空表示保持当前密钥</span></div>
-    <div class="body">
-      <div class="row"><label>OPENAI_BASE <span class="req">必填</span></label><input type="text" id="OPENAI_BASE" placeholder="https://api.example.com/v1"></div>
-      <div class="row">
-        <label>OPENAI_KEY <span id="keyStatus" class="badge hidden">已加密保存</span></label>
-        <input type="password" id="OPENAI_KEY" placeholder="留空保持不变；输入明文新密钥将自动加密保存" autocomplete="off">
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="head">🔒 访问密码 <span class="hint">防止局域网内被他人乱改，留空保持不变</span></div>
-    <div class="body">
-      <div class="row">
-        <label>配置页面访问密码 WebConfigPassword <span id="pwStatus" class="badge hidden">已启用</span></label>
-        <input type="password" id="WebConfigPassword" placeholder="留空保持不变；设置新密码后需重新登录" autocomplete="new-password">
-      </div>
-      <div class="row"><label class="mono" style="color:var(--muted);font-size:12px">💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改</label></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="head">📜 日志设置</div>
-    <div class="body">
-      <div class="grid2">
-        <div class="row"><label>终端日志清理阈值 Log_Limit</label><input type="number" id="Log_Limit" min="1"></div>
-        <div class="row"></div>
-      </div>
-      <div class="grid3">
-        <label class="switch"><input type="checkbox" id="Log_Responses"><span class="track"></span><span class="lbl">打印响应内容</span></label>
-        <label class="switch"><input type="checkbox" id="Log_Headers"><span class="track"></span><span class="lbl">打印请求头</span></label>
-        <label class="switch"><input type="checkbox" id="Log_Body"><span class="track"></span><span class="lbl">打印请求体</span></label>
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="head">🧩 模型显示 <span class="hint">仅影响客户端看到的模型名称</span></div>
-    <div class="body">
-      <div class="grid2">
-        <div class="row"><label>模型名前缀 OpenAI_Prefix</label><input type="text" id="OpenAI_Prefix" placeholder="[VC反代] "></div>
-        <div class="row"><label>模型名后缀 OpenAI_Suffix</label><input type="text" id="OpenAI_Suffix"></div>
-      </div>
-      <div class="grid2">
-        <div class="row">
-          <label>流式策略 StreamMode</label>
-          <select id="StreamMode">
-            <option value="preserve">preserve · 不覆写（默认）</option>
-            <option value="force_stream">force_stream · 强制流式</option>
-            <option value="force_close">force_close · 强制关闭</option>
-          </select>
+  <div class="panels">
+    <div class="panel active" id="tab-conn">
+      <div class="card">
+        <div class="head">🖥️ 监听设置 <span class="hint">修改 IP / PORT 需重启程序生效</span></div>
+        <div class="body grid2">
+          <div class="row"><label>监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
+          <div class="row"><label>监听端口 PORT</label><input type="text" id="PORT" placeholder="11434"></div>
         </div>
-        <div class="row"><label>能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
+      </div>
+
+      <div class="card">
+        <div class="head">📡 上游 API <span class="hint">OPENAI_KEY 留空表示保持当前密钥</span></div>
+        <div class="body">
+          <div class="row"><label>OPENAI_BASE <span class="req">必填</span></label><input type="text" id="OPENAI_BASE" placeholder="https://api.example.com/v1"></div>
+          <div class="row">
+            <label>OPENAI_KEY <span id="keyStatus" class="badge hidden">已加密保存</span></label>
+            <input type="password" id="OPENAI_KEY" placeholder="留空保持不变；输入明文新密钥将自动加密保存" autocomplete="off">
+          </div>
+        </div>
       </div>
     </div>
-  </div>
 
-  <div class="card">
-    <div class="head">🔖 模型别名 ModelAlias <span class="hint">将上游模型 ID 显示为友好名称</span></div>
-    <div class="body">
-      <div id="aliasList" class="dtable"></div>
-      <div><button class="btn small" onclick="addAlias()">＋ 添加别名</button></div>
+    <div class="panel" id="tab-sec">
+      <div class="card">
+        <div class="head">🔒 访问密码 <span class="hint">防止局域网内被他人乱改，留空保持不变</span></div>
+        <div class="body">
+          <div class="row">
+            <label>配置页面访问密码 WebConfigPassword <span id="pwStatus" class="badge hidden">已启用</span></label>
+            <input type="password" id="WebConfigPassword" placeholder="留空保持不变；设置新密码后需重新登录" autocomplete="new-password">
+          </div>
+          <div class="row"><label class="mono" style="color:var(--muted);font-size:12px">💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改</label></div>
+        </div>
+      </div>
     </div>
-  </div>
 
-  <div class="card">
-    <div class="head">📐 模型详细设置 ModelDetailedSettings <span class="hint">覆盖上游自动获取的值</span></div>
-    <div class="body">
-      <div id="detailList" style="display:flex;flex-direction:column;gap:10px"></div>
-      <div><button class="btn small" onclick="addDetail()">＋ 添加模型设置</button></div>
+    <div class="panel" id="tab-log">
+      <div class="card">
+        <div class="head">📜 日志设置</div>
+        <div class="body">
+          <div class="grid2">
+            <div class="row"><label>终端日志清理阈值 Log_Limit</label><input type="number" id="Log_Limit" min="1"></div>
+            <div class="row"></div>
+          </div>
+          <div class="grid3">
+            <label class="switch"><input type="checkbox" id="Log_Responses"><span class="track"></span><span class="lbl">打印响应内容</span></label>
+            <label class="switch"><input type="checkbox" id="Log_Headers"><span class="track"></span><span class="lbl">打印请求头</span></label>
+            <label class="switch"><input type="checkbox" id="Log_Body"><span class="track"></span><span class="lbl">打印请求体</span></label>
+          </div>
+        </div>
+      </div>
     </div>
-  </div>
 
-  <div class="card">
-    <div class="head">✂️ 请求提示词替换 RequestPromptReplace <span class="hint">自动替换请求中的指定文本</span></div>
-    <div class="body">
-      <div id="ruleList" style="display:flex;flex-direction:column;gap:10px"></div>
-      <div><button class="btn small" onclick="addRule()">＋ 添加替换规则</button></div>
+    <div class="panel" id="tab-model">
+      <div class="card">
+        <div class="head">🧩 模型显示 <span class="hint">仅影响客户端看到的模型名称</span></div>
+        <div class="body">
+          <div class="grid2">
+            <div class="row"><label>模型名前缀 OpenAI_Prefix</label><input type="text" id="OpenAI_Prefix" placeholder="[VC反代] "></div>
+            <div class="row"><label>模型名后缀 OpenAI_Suffix</label><input type="text" id="OpenAI_Suffix"></div>
+          </div>
+          <div class="grid2">
+            <div class="row">
+              <label>流式策略 StreamMode</label>
+              <select id="StreamMode">
+                <option value="preserve">preserve · 不覆写（默认）</option>
+                <option value="force_stream">force_stream · 强制流式</option>
+                <option value="force_close">force_close · 强制关闭</option>
+              </select>
+            </div>
+            <div class="row"><label>能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head">🔖 模型别名 ModelAlias <span class="hint">将上游模型 ID 显示为友好名称</span></div>
+        <div class="body">
+          <div id="aliasList" class="dtable"></div>
+          <div><button class="btn small" onclick="addAlias()">＋ 添加别名</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head">📐 模型详细设置 ModelDetailedSettings <span class="hint">覆盖上游自动获取的值</span></div>
+        <div class="body">
+          <div id="detailList" style="display:flex;flex-direction:column;gap:10px"></div>
+          <div><button class="btn small" onclick="addDetail()">＋ 添加模型设置</button></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-rules">
+      <div class="card">
+        <div class="head">✂️ 请求提示词替换 RequestPromptReplace <span class="hint">自动替换请求中的指定文本</span></div>
+        <div class="body">
+          <div id="ruleList" style="display:flex;flex-direction:column;gap:10px"></div>
+          <div><button class="btn small" onclick="addRule()">＋ 添加替换规则</button></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1381,6 +1408,16 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 var state = { aliases: [], details: [], rules: [] };
 
 function $(id){ return document.getElementById(id); }
+
+// -------- Tab 切换（左侧导航 / 右侧内容）--------
+function switchTab(name){
+  document.querySelectorAll('.tab-item').forEach(function(t){
+    t.classList.toggle('active', t.getAttribute('data-tab') === name);
+  });
+  document.querySelectorAll('.panel').forEach(function(p){
+    p.classList.toggle('active', p.id === 'tab-' + name);
+  });
+}
 
 function esc(s){
   return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
