@@ -18,6 +18,7 @@
 
 <p align="center">
   <img src="images/%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE%202026-07-28%20083154.png" alt="Remote API Convert Ollama 预览" width="400"/>
+  <img src="images/屏幕截图 2026-09-02 165345.png" alt="Remote API Convert Ollama 预览" width="400"/>
 </p>
 
 ---
