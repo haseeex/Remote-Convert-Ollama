@@ -32,3 +32,6 @@ go.work.sum
 # .vscode/
 *.json
 *.zip
+
+# 忽略视觉代理识别缓存目录
+vision_cache/

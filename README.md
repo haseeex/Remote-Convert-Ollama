@@ -92,6 +92,7 @@
 - **流式策略**：支持 `preserve` / `force_stream` / `force_close` 三种模式灵活切换
 - **日志分级**：可分别控制请求头(`Log_Headers`)、请求体(`Log_Body`)、响应内容(`Log_Responses`)的日志打印
 - **模型详细设置**：`ModelDetailedSettings` 支持为每个模型单独指定上下文长度、最大输出 Token 和能力列表
+- **视觉代理模型**：`VisionProxyModel` 为主模型指定视觉代理，图片请求自动识别后合并文本，识别结果本地缓存防重复消耗 token
 - **请求提示词替换**：`RequestPromptReplace` 支持自动替换请求消息中的指定文本，实现 Copilot 自有提示词篡改等高级玩法
 
 ---
@@ -154,6 +155,10 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
             "ContextLength": 1000000,
             "MaxOutputTokens": 64000,
             "Capabilities": ["tools", "vision"]
+        },
+        "deepseek-v3": {
+            "VisionProxyModel": "gpt-4o",
+            "VisionProxyPrompt": "请详细描述图片内容"
         }
     },
     "RequestPromptReplace": {
@@ -184,7 +189,8 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `OPENAI_BASE`           | 上游 OpenAI 兼容 API 地址                                                | **必填**                         |
 | `OPENAI_KEY`            | 上游 API 密钥                                                            | **必填**，首次输入明文后自动加密 |
 | `ModelAlias`            | 模型别名映射`{上游ID: 显示名称}`                                       | `{}`                                 |
-| `ModelDetailedSettings` | 模型详细设置`{上游ID: {ContextLength, MaxOutputTokens, Capabilities}}` | `{}`                                 |
+| `ModelDetailedSettings` | 模型详细设置`{上游ID: {ContextLength, MaxOutputTokens, Capabilities, VisionProxyModel, VisionProxyPrompt}}` | `{}`                                 |
+| `VisionProxyPrompt`    | 全局默认视觉代理提示词（模型未自定义时使用）                                       | 内置默认提示词                       |
 | `RequestPromptReplace`  | 请求提示词替换规则`{规则名: {enable, mode, role, index, prompt, replace}}`   | `{}`                                 |
 
 **`StreamMode` 说明**：
@@ -201,6 +207,17 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 - 当上游 API 不返回元数据或返回的值不准确时非常有用
 - `Capabilities` 字段可选（`omitempty`），当有定义时优先使用此处的配置，否则使用全局 `Capabilities`
 - 示例：`{"gpt-4o": {"ContextLength": 128000, "MaxOutputTokens": 16384, "Capabilities": ["tools", "vision"]}}`
+
+**`VisionProxyModel` 视觉代理模型说明**：
+
+- 当主模型不支持图片（`Capabilities` 无 `vision`）时，可为其指定一个支持视觉的上游模型 ID 作为视觉代理
+- 收到图片请求时，程序会**先用代理模型识别图片内容**，再把识别文本合并进主模型请求，图片本身不再转发给主模型
+- `VisionProxyPrompt` 可选，用于自定义视觉代理的识别提示词（留空使用默认提示词）
+- **全局默认提示词**：`VisionProxyPrompt` 顶层配置项可设置全局默认视觉提示词，模型未自定义时使用
+- **提示词优先级**：模型自定义 `VisionProxyPrompt` > 全局 `VisionProxyPrompt` > 内置默认提示词
+- **本地缓存**：识别结果按「图片内容 + 提示词」哈希缓存到 `vision_cache/` 目录，相同图片再次出现时直接命中缓存，不重复调用代理模型、不浪费 token
+- 识别失败时自动跳过该图片，请求原样转发，不影响正常使用
+- 示例：`{"deepseek-chat": {"VisionProxyModel": "gpt-4o", "VisionProxyPrompt": "请描述图片内容"}}`
 
 > **兼容说明**：旧版 `EnableStream=true/false` 会在首次启动时自动迁移为 `StreamMode=preserve/force_close`。
 
@@ -245,7 +262,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
 | 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                         |
 | 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                      |
-| 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力）                  |
+| 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力、视觉代理模型与提示词）                  |
 | ✂️**提示词替换规则** | 可视化增删`RequestPromptReplace` 规则                                            |
 
 保存后配置**立即写入 `config.json` 并同步到运行内存**（除 `IP`/`PORT` 外均即时生效），支持 `Ctrl+S` 快捷保存。
@@ -349,6 +366,9 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 - **上下文长度** (ContextLength) — 覆盖上游返回的值
 - **最大输出 Token** (MaxOutputTokens) — 控制单次最大生成量
 - **能力列表** (Capabilities) — 可选，当有定义时优先于此配置覆盖全局 `Capabilities`
+- **视觉代理模型** (VisionProxyModel) — 主模型不支持图片时，指定一个支持视觉的上游模型 ID，收到图片请求时先用它识别图片，再把识别文本合并进主模型请求
+- **视觉代理提示词** (VisionProxyPrompt) — 自定义视觉代理的识别提示词（留空=默认提示词）
+- 识别结果按「图片内容 + 提示词」哈希缓存到 `vision_cache/` 目录，重复图片直接命中缓存，不浪费 token
 - 适用于上游 API 不返回元数据或返回不准确的场景
 
 ### � 请求提示词替换

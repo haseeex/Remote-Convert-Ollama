@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -35,6 +36,11 @@ type ModelDetailedSetting struct {
 	ContextLength   int64    `json:"ContextLength"`
 	MaxOutputTokens int64    `json:"MaxOutputTokens"`
 	Capabilities    []string `json:"Capabilities,omitempty"`
+	// VisionProxyModel 视觉代理模型：主模型不支持图片时，指定一个支持视觉的上游模型 ID，
+	// 收到图片请求时先用它识别图片，再把识别文本合并进主模型请求（图片本身不再转发给主模型）
+	VisionProxyModel string `json:"VisionProxyModel,omitempty"`
+	// VisionProxyPrompt 视觉代理自定义提示词：帮助代理模型更好地识别图片（可留空使用默认提示词）
+	VisionProxyPrompt string `json:"VisionProxyPrompt,omitempty"`
 }
 
 // PromptReplaceRule 定义请求提示词替换规则
@@ -115,6 +121,8 @@ type Config struct {
 	ModelAlias            map[string]string               `json:"ModelAlias"`
 	ModelDetailedSettings map[string]ModelDetailedSetting `json:"ModelDetailedSettings"`
 	RequestPromptReplace  map[string]PromptReplaceRule    `json:"RequestPromptReplace,omitempty"`
+	// VisionProxyPrompt 全局默认视觉代理提示词：模型未自定义 VisionProxyPrompt 时使用（留空=内置默认提示词）
+	VisionProxyPrompt string `json:"VisionProxyPrompt,omitempty"`
 }
 
 var requestCount int64
@@ -632,6 +640,359 @@ func detectImageMIME(b64 string) string {
 	}
 }
 
+// ==================== 视觉代理模型（Vision Proxy） ====================
+// 当主模型不支持图片（Capabilities 无 vision）但配置了 VisionProxyModel 时，
+// 先用视觉代理模型识别图片内容，再把识别文本合并进主模型请求，图片本身不再转发给主模型。
+// 识别结果按「图片内容 + 提示词」哈希缓存到本地 vision_cache/ 目录，重复图片直接命中缓存，不浪费 token。
+
+// visionCacheDir 视觉识别结果缓存目录
+const visionCacheDir = "vision_cache"
+
+// defaultVisionProxyPrompt 默认视觉代理提示词
+const defaultVisionProxyPrompt = "请仔细查看这张图片，用简体中文详细描述图片中的全部内容。包括：1) 图片中的文字（OCR，逐字提取）；2) 图片中的物体、场景、人物；3) 图表、表格、代码等结构化内容请完整还原。描述要详尽准确，不要遗漏任何细节。"
+
+// visionCacheMutex 保护视觉缓存目录的并发读写
+var visionCacheMutex sync.Mutex
+
+// visionImage 表示请求中的一张图片（base64 数据 + MIME 类型）
+type visionImage struct {
+	Base64 string
+	MIME   string
+}
+
+// visionCachePath 计算图片识别结果的缓存文件路径
+// 缓存键 = SHA256(图片base64 + 提示词)，命中缓存则直接复用识别结果，不重复调用代理模型
+func visionCachePath(img visionImage, prompt string) string {
+	sum := sha256.Sum256([]byte(img.Base64 + "\x00" + prompt))
+	return filepath.Join(visionCacheDir, hex.EncodeToString(sum[:])+".txt")
+}
+
+// loadVisionCache 读取视觉识别缓存，命中返回 true 和缓存内容
+func loadVisionCache(img visionImage, prompt string) (string, bool) {
+	visionCacheMutex.Lock()
+	defer visionCacheMutex.Unlock()
+	data, err := os.ReadFile(visionCachePath(img, prompt))
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+// saveVisionCache 保存视觉识别结果到本地缓存
+func saveVisionCache(img visionImage, prompt string, result string) {
+	visionCacheMutex.Lock()
+	defer visionCacheMutex.Unlock()
+	if err := os.MkdirAll(visionCacheDir, 0755); err != nil {
+		return
+	}
+	_ = os.WriteFile(visionCachePath(img, prompt), []byte(result), 0644)
+}
+
+// recognizeImageWithProxy 调用视觉代理模型识别单张图片，返回识别文本
+// 优先命中本地缓存；未命中则调用上游视觉模型，成功后写入缓存
+func recognizeImageWithProxy(img visionImage, proxyModel string, prompt string) (string, error) {
+	// 1. 尝试命中本地缓存
+	if cached, ok := loadVisionCache(img, prompt); ok {
+		fmt.Println("💾 视觉代理: 命中本地缓存，跳过识别")
+		return cached, nil
+	}
+
+	// 2. 构建识别请求（只发图片 + 提示词，不携带历史消息，节省 token）
+	userContent := []interface{}{
+		map[string]interface{}{
+			"type": "image_url",
+			"image_url": map[string]interface{}{
+				"url": "data:" + img.MIME + ";base64," + img.Base64,
+			},
+		},
+		map[string]interface{}{
+			"type": "text",
+			"text": prompt,
+		},
+	}
+	payload := map[string]interface{}{
+		"model": proxyModel,
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": userContent},
+		},
+		"stream": false,
+	}
+	b, _ := json.Marshal(payload)
+
+	httpReq, err := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("视觉代理模型返回 HTTP %d: %s", resp.StatusCode, string(raw))
+	}
+
+	// 3. 解析识别结果（支持 content 为 string 或数组两种格式）
+	var upstreamResp struct {
+		Choices []struct {
+			Message struct {
+				Content interface{} `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(raw, &upstreamResp); err != nil {
+		return "", err
+	}
+	if len(upstreamResp.Choices) == 0 {
+		return "", errors.New("视觉代理模型无返回内容")
+	}
+
+	var result string
+	switch c := upstreamResp.Choices[0].Message.Content.(type) {
+	case string:
+		result = c
+	case []interface{}:
+		var parts []string
+		for _, block := range c {
+			if blockMap, ok := block.(map[string]interface{}); ok {
+				if t, _ := blockMap["type"].(string); t == "text" {
+					if text, ok := blockMap["text"].(string); ok {
+						parts = append(parts, text)
+					}
+				}
+			}
+		}
+		result = strings.Join(parts, "\n")
+	default:
+		result = fmt.Sprintf("%v", c)
+	}
+	result = strings.TrimSpace(result)
+	if result == "" {
+		return "", errors.New("视觉代理模型返回空内容")
+	}
+
+	// 4. 保存缓存
+	saveVisionCache(img, prompt, result)
+	return result, nil
+}
+
+// getVisionProxySetting 获取指定模型的视觉代理配置（代理模型ID + 提示词）
+// 返回 (代理模型ID, 提示词, 是否启用)
+// 提示词优先级：模型自定义 VisionProxyPrompt > 全局 VisionProxyPrompt > 内置默认提示词
+func getVisionProxySetting(modelID string) (string, string, bool) {
+	setting, ok := cfg.ModelDetailedSettings[modelID]
+	if !ok || strings.TrimSpace(setting.VisionProxyModel) == "" {
+		return "", "", false
+	}
+	prompt := strings.TrimSpace(setting.VisionProxyPrompt)
+	if prompt == "" {
+		prompt = strings.TrimSpace(cfg.VisionProxyPrompt)
+	}
+	if prompt == "" {
+		prompt = defaultVisionProxyPrompt
+	}
+	return setting.VisionProxyModel, prompt, true
+}
+
+// applyVisionProxy 视觉代理主入口：若请求包含图片且主模型配置了视觉代理，
+// 则用代理模型识别所有图片，将识别文本合并进请求（图片本身移除），返回处理后的请求体。
+// 返回 (新请求体, 是否发生了代理处理)
+//
+// 重要：识别结果只追加到「包含该图片的那条消息」中，不能全局合并后追加到所有含图片的消息。
+// 否则第二次对话时（客户端会携带历史消息），历史图片消息会被追加新图片的描述，
+// 导致 AI 混淆不同图片（例如把图片 B 误认为图片 A）。
+func applyVisionProxy(body []byte, modelID string) ([]byte, bool) {
+	proxyModel, prompt, ok := getVisionProxySetting(modelID)
+	if !ok {
+		return body, false
+	}
+
+	// 解析请求体
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, false
+	}
+
+	messages, _ := req["messages"].([]interface{})
+	modified := false
+
+	for _, msg := range messages {
+		msgMap, _ := msg.(map[string]interface{})
+		if msgMap == nil {
+			continue
+		}
+
+		// 提取本条消息中的图片（支持四种格式）
+		var msgImages []visionImage
+		hasImagesArray := false
+		hasImageBlock := false
+
+		// 格式1: Ollama images 数组
+		if imagesRaw, ok := msgMap["images"].([]interface{}); ok && len(imagesRaw) > 0 {
+			hasImagesArray = true
+			for _, img := range imagesRaw {
+				if imgStr, ok := img.(string); ok && imgStr != "" {
+					msgImages = append(msgImages, visionImage{Base64: imgStr, MIME: detectImageMIME(imgStr)})
+				}
+			}
+		}
+
+		// 格式2/3/4: content 数组中的图片块
+		if contentArr, ok := msgMap["content"].([]interface{}); ok {
+			for _, block := range contentArr {
+				blockMap, _ := block.(map[string]interface{})
+				if blockMap == nil {
+					continue
+				}
+				switch blockMap["type"] {
+				case "image":
+					// Ollama: {"type":"image","image_base64":"..."}
+					if b64, ok := blockMap["image_base64"].(string); ok && b64 != "" {
+						msgImages = append(msgImages, visionImage{Base64: b64, MIME: detectImageMIME(b64)})
+						hasImageBlock = true
+						continue
+					}
+					// Anthropic: {"type":"image","source":{"type":"base64","media_type":"...","data":"..."}}
+					if source, ok := blockMap["source"].(map[string]interface{}); ok {
+						data, _ := source["data"].(string)
+						if data != "" {
+							mediaType, _ := source["media_type"].(string)
+							if mediaType == "" {
+								mediaType = detectImageMIME(data)
+							}
+							msgImages = append(msgImages, visionImage{Base64: data, MIME: mediaType})
+							hasImageBlock = true
+						}
+					}
+				case "image_url":
+					// OpenAI: {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+					if iu, ok := blockMap["image_url"].(map[string]interface{}); ok {
+						urlStr, _ := iu["url"].(string)
+						if urlStr != "" {
+							if idx := strings.Index(urlStr, ";base64,"); idx >= 0 {
+								mime := strings.TrimPrefix(urlStr[:idx], "data:")
+								msgImages = append(msgImages, visionImage{Base64: urlStr[idx+len(";base64,"):], MIME: mime})
+								hasImageBlock = true
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if len(msgImages) == 0 {
+			continue
+		}
+
+		// 统一处理：每条含图片的消息都「缓存优先，未命中则识别」。
+		// 注意：不能只识别最后一条 user 消息的图片——图片可能出现在 system 消息、
+		// 或非最后一条 user 消息中（先发图 → AI 回复 → 文字追问），跳过会导致图片不识别。
+		// 历史图片命中缓存时直接复用（毫秒级），未命中才调用代理模型。
+		var descriptions []string
+		var pending []visionImage
+		for _, img := range msgImages {
+			if desc, ok := loadVisionCache(img, prompt); ok {
+				descriptions = append(descriptions, desc)
+			} else {
+				pending = append(pending, img)
+			}
+		}
+		if len(pending) > 0 {
+			fmt.Printf("🖼️ 视觉代理: 本条消息 %d 张图片中 %d 张未命中缓存，并发识别中...\n", len(msgImages), len(pending))
+			// 并发识别（限制最多 3 个并发，避免打爆上游限流）
+			concurrency := 3
+			if len(pending) < concurrency {
+				concurrency = len(pending)
+			}
+			sem := make(chan struct{}, concurrency)
+			var wg sync.WaitGroup
+			results := make([]string, len(pending))
+			for i, img := range pending {
+				wg.Add(1)
+				sem <- struct{}{}
+				go func(idx int, img visionImage) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					desc, err := recognizeImageWithProxy(img, proxyModel, prompt)
+					if err != nil {
+						fmt.Printf("⚠️ 视觉代理: 第 %d 张图片识别失败: %v\n", idx+1, err)
+						return
+					}
+					results[idx] = desc
+				}(i, img)
+			}
+			wg.Wait()
+			for _, desc := range results {
+				if desc != "" {
+					descriptions = append(descriptions, desc)
+				}
+			}
+		}
+		if len(descriptions) == 0 {
+			continue
+		}
+
+		mergedText := strings.Join(descriptions, "\n\n")
+
+		// 移除 images 数组
+		if hasImagesArray {
+			delete(msgMap, "images")
+			modified = true
+		}
+
+		// 移除 content 数组中的图片块，识别文本合并进本条消息
+		if hasImageBlock || hasImagesArray {
+			switch c := msgMap["content"].(type) {
+			case string:
+				// content 为纯字符串：识别文本直接追加到字符串末尾
+				msgMap["content"] = c + "\n\n[图片内容识别结果]\n" + mergedText
+			case []interface{}:
+				// content 为数组：移除图片块，识别文本作为 text 块追加
+				var newContent []interface{}
+				for _, block := range c {
+					blockMap, _ := block.(map[string]interface{})
+					if blockMap == nil {
+						newContent = append(newContent, block)
+						continue
+					}
+					switch blockMap["type"] {
+					case "image", "image_url":
+						// 图片块移除
+					default:
+						newContent = append(newContent, block)
+					}
+				}
+				newContent = append(newContent, map[string]interface{}{
+					"type": "text",
+					"text": "\n\n[图片内容识别结果]\n" + mergedText,
+				})
+				msgMap["content"] = newContent
+			default:
+				// content 缺失或为空：直接设置为识别文本
+				msgMap["content"] = "[图片内容识别结果]\n" + mergedText
+			}
+			modified = true
+		}
+	}
+
+	if !modified {
+		return body, false
+	}
+
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	fmt.Println("✅ 视觉代理: 图片已替换为识别文本，请求体已更新")
+	return newBody, true
+}
+
 // makeOllamaMessage 构建 Ollama 格式的消息响应
 func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, thinkingContent string) map[string]interface{} {
 	msg := map[string]interface{}{
@@ -664,6 +1025,7 @@ func getDefaultConfig() Config {
 		ModelAlias:            map[string]string{},               // 模型别名：key=上游模型ID, value=显示名称
 		ModelDetailedSettings: map[string]ModelDetailedSetting{}, // 模型详细设置：key=上游模型ID, value={ContextLength, MaxOutputTokens, Capabilities}
 		RequestPromptReplace:  map[string]PromptReplaceRule{},    // 请求提示词替换规则
+		VisionProxyPrompt:     defaultVisionProxyPrompt,          // 全局默认视觉代理提示词
 	}
 }
 
@@ -684,9 +1046,16 @@ func printConfigHelp() {
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
 	fmt.Println(" ▼ ModelAlias      : 模型别名映射,仅影响模型名字显示 {上游模型ID: 显示名称, 上游模型ID: 显示名称, ...}")
 	fmt.Println(" ▼ ModelDetailedSettings : 模型详细设置,覆盖上游自动获取的值")
-	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出, Capabilities: [能力列表]}, ...}")
+	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出, Capabilities: [能力列表], VisionProxyModel: 视觉代理模型ID, VisionProxyPrompt: 视觉代理提示词}}")
 	fmt.Println("                     当 Capabilities 有定义时,优先使用此处的配置,否则使用全局 Capabilities")
+	fmt.Println("                     VisionProxyModel: 主模型不支持图片时,收到图片请求会先用此模型识别图片,")
+	fmt.Println("                       再把识别文本合并进主模型请求(图片本身不再转发给主模型)")
+	fmt.Println("                     VisionProxyPrompt: 视觉代理自定义提示词(留空=使用全局 VisionProxyPrompt)")
+	fmt.Println("                     识别结果按图片内容+提示词哈希缓存到 vision_cache/ 目录,重复图片直接命中缓存,不浪费 token")
 	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384}}")
+	fmt.Println("                     示例: {\"deepseek-chat\": {\"VisionProxyModel\": \"gpt-4o\", \"VisionProxyPrompt\": \"请描述图片内容\"}}")
+	fmt.Println(" ▼ VisionProxyPrompt : 全局默认视觉代理提示词,模型未自定义提示词时使用(留空=内置默认提示词)")
+	fmt.Println("                     优先级: 模型自定义 VisionProxyPrompt > 全局 VisionProxyPrompt > 内置默认提示词")
 	fmt.Println(" ▼ RequestPromptReplace: 请求提示词替换规则,自动替换请求中的指定文本")
 	fmt.Println("                     格式: {规则名称: {enable, role, index, prompt, replace}}")
 	fmt.Println("                     优先级:")
@@ -861,6 +1230,10 @@ func loadConfig() {
 	}
 	if _, ok := rawMap["RequestPromptReplace"]; !ok {
 		stored.RequestPromptReplace = defaultCfg.RequestPromptReplace
+		needSave = true
+	}
+	if _, ok := rawMap["VisionProxyPrompt"]; !ok {
+		stored.VisionProxyPrompt = defaultCfg.VisionProxyPrompt
 		needSave = true
 	}
 	// 迁移旧版替换规则：force / replaceWhole 布尔字段 → mode 枚举
@@ -1353,6 +1726,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
             </div>
             <div class="row"><label>能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
           </div>
+          <div class="row"><label>全局视觉代理提示词 VisionProxyPrompt <span class="hint" style="color:var(--muted);font-weight:400">模型未自定义提示词时使用；留空=内置默认提示词</span></label><textarea rows="3" id="VisionProxyPrompt" placeholder="请仔细查看这张图片，用简体中文详细描述图片中的全部内容..."></textarea></div>
         </div>
       </div>
 
@@ -1365,7 +1739,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
       </div>
 
       <div class="card">
-        <div class="head">📐 模型详细设置 ModelDetailedSettings <span class="hint">覆盖上游自动获取的值</span></div>
+        <div class="head">📐 模型详细设置 ModelDetailedSettings <span class="hint">覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理</span></div>
         <div class="body">
           <div id="detailList" style="display:flex;flex-direction:column;gap:10px"></div>
           <div><button class="btn small" onclick="addDetail()">＋ 添加模型设置</button></div>
@@ -1551,6 +1925,7 @@ async function loadCfg(notify){
     $('OpenAI_Suffix').value = c.OpenAI_Suffix || '';
     $('StreamMode').value = c.StreamMode || 'preserve';
     $('Capabilities').value = (c.Capabilities || []).join(', ');
+    $('VisionProxyPrompt').value = c.VisionProxyPrompt || '';
 
     state.aliases = [];
     if(c.ModelAlias){
@@ -1564,7 +1939,7 @@ async function loadCfg(notify){
     if(c.ModelDetailedSettings){
       Object.keys(c.ModelDetailedSettings).forEach(function(k){
         var s = c.ModelDetailedSettings[k] || {};
-        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', ') });
+        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', '), vpm: s.VisionProxyModel || '', vpp: s.VisionProxyPrompt || '' });
       });
     }
     renderDetails();
@@ -1619,7 +1994,9 @@ function renderDetails(){
       '<div class="row"><label>上下文长度 ContextLength</label><input type="number" min="0" value="' + esc(d.cl) + '" placeholder="默认 1000000" oninput="state.details[' + i + '].cl=this.value"></div>' +
       '<div class="row"><label>最大输出 MaxOutputTokens</label><input type="number" min="0" value="' + esc(d.mot) + '" placeholder="默认 384000" oninput="state.details[' + i + '].mot=this.value"></div>' +
       '<div class="row"><label>能力 Capabilities（逗号分隔）</label><input type="text" value="' + esc(d.caps) + '" placeholder="tools, vision" oninput="state.details[' + i + '].caps=this.value"></div>' +
-      '</div>';
+      '</div>' +
+      '<div class="row"><label>视觉代理模型 VisionProxyModel（主模型不支持图片时，用此模型识别图片）</label><input type="text" class="mono" value="' + esc(d.vpm) + '" placeholder="支持视觉的上游模型ID，如 gpt-4o" oninput="state.details[' + i + '].vpm=this.value"></div>' +
+      '<div class="row"><label>视觉代理提示词 VisionProxyPrompt（留空=默认提示词）</label><textarea rows="2" placeholder="请仔细查看这张图片，用简体中文详细描述图片中的全部内容..." oninput="state.details[' + i + '].vpp=this.value">' + esc(d.vpp) + '</textarea></div>';
     box.appendChild(el);
   });
 }
@@ -1659,7 +2036,7 @@ function renderRules(){
 }
 
 function addAlias(){ state.aliases.push({ key: '', value: '' }); renderAliases(); }
-function addDetail(){ state.details.push({ model: '', cl: '', mot: '', caps: '' }); renderDetails(); }
+function addDetail(){ state.details.push({ model: '', cl: '', mot: '', caps: '', vpm: '', vpp: '' }); renderDetails(); }
 function addRule(){ state.rules.push({ name: '', enable: true, mode: 'normal', role: '', index: '', prompt: '', replace: '' }); renderRules(); }
 function removeAt(arr, i, render){ arr.splice(i, 1); render(); }
 
@@ -1675,6 +2052,8 @@ function collectCfg(){
     if(d.mot !== '' && d.mot != null){ o.MaxOutputTokens = parseInt(d.mot, 10); }
     var dc = splitList(d.caps);
     if(dc.length){ o.Capabilities = dc; }
+    if(d.vpm && d.vpm.trim()){ o.VisionProxyModel = d.vpm.trim(); }
+    if(d.vpp && d.vpp.trim()){ o.VisionProxyPrompt = d.vpp.trim(); }
     details[d.model] = o;
   });
 
@@ -1701,6 +2080,7 @@ function collectCfg(){
     OpenAI_Suffix: $('OpenAI_Suffix').value,
     StreamMode: $('StreamMode').value,
     Capabilities: splitList($('Capabilities').value),
+    VisionProxyPrompt: $('VisionProxyPrompt').value.trim(),
     OPENAI_BASE: $('OPENAI_BASE').value.trim(),
     OPENAI_KEY: $('OPENAI_KEY').value.trim(),
     WebConfigPassword: $('WebConfigPassword').value.trim(),
@@ -2041,6 +2421,7 @@ func applyConfigToRuntime(newCfg Config) {
 	cfg.ModelAlias = newCfg.ModelAlias
 	cfg.ModelDetailedSettings = newCfg.ModelDetailedSettings
 	cfg.RequestPromptReplace = newCfg.RequestPromptReplace
+	cfg.VisionProxyPrompt = newCfg.VisionProxyPrompt
 }
 
 // apiTestConfig 测试上游 API 连通性并返回模型列表
@@ -2434,6 +2815,7 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	var fullContent strings.Builder
 	var reasoningContent strings.Builder // 累积 reasoning_content（思考模式）
 	lastThinkingLen := 0                 // 已发送的 thinking 长度（用于增量发送）
+	contentStarted := false              // 正文是否已开始输出（之后不再发送 thinking 块，避免思考/正文交错显示混乱）
 	reader := bufio.NewReader(resp.Body)
 
 	// 流式 tool_calls 累积器
@@ -2556,8 +2938,15 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 					if cfg.Log_Responses {
 						fmt.Print("[思考:" + rc + "]")
 					}
-					// 实时推送 thinking 增量（sendOllamaChunk 内部自动计算增量）
-					sendOllamaChunk("", false, 0, nil, reasoningContent.String())
+					// 正文开始后，上游可能还会交错输出思考碎片（DeepSeek 思考模式特性）。
+					// 此时不再转发 thinking 块，避免客户端出现"思考/正文交错拼接"的混乱显示。
+					if !contentStarted {
+						// 实时推送 thinking 增量（sendOllamaChunk 内部自动计算增量）
+						sendOllamaChunk("", false, 0, nil, reasoningContent.String())
+					} else {
+						// 正文已开始：同步 lastThinkingLen，防止后续正文块夹带思考碎片
+						lastThinkingLen = reasoningContent.Len()
+					}
 				}
 				if tcRaw, ok := deltaMap["tool_calls"]; ok {
 					hasToolCalls = true
@@ -2603,6 +2992,7 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 			if cfg.Log_Responses {
 				fmt.Print(content)
 			}
+			contentStarted = true
 			sendOllamaChunk(content, false, 0, nil, reasoningContent.String())
 		}
 
@@ -2846,8 +3236,11 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 							}
 						}
 					} else {
-						// thinking 结束后，从 delta 中移除 reasoning_text（如果有）
+						// 正文开始后，上游可能还会交错输出思考碎片（DeepSeek 思考模式特性）。
+						// 从 delta 中移除 reasoning_text 和 reasoning_content，
+						// 避免客户端出现"思考/正文交错拼接"的混乱显示。
 						delete(delta, "reasoning_text")
+						delete(delta, "reasoning_content")
 					}
 				}
 			}
@@ -4132,6 +4525,21 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 
 	// 应用请求提示词替换
 	body = applyRequestPromptReplace(body)
+
+	// 视觉代理：主模型不支持图片但配置了 VisionProxyModel 时，
+	// 先用代理模型识别图片，再把识别文本合并进请求（图片本身不再转发给主模型）
+	if hasImage {
+		// 提取请求中的模型 ID
+		var reqMeta struct {
+			Model string `json:"model"`
+		}
+		json.Unmarshal(body, &reqMeta)
+		if reqMeta.Model != "" {
+			if newBody, proxied := applyVisionProxy(body, reqMeta.Model); proxied {
+				body = newBody
+			}
+		}
+	}
 
 	// 把 body 放回去，否则后面 handler 读不到
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
