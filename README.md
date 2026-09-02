@@ -280,6 +280,10 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 
 ### 3️⃣ 在 VS Code 中配置
 
+> ⚠️ **重要提醒（VS Code 用户必看）**：
+>
+> **请务必安装 Ollama 扩展**（VS Code 扩展市场搜索 `Ollama`，作者 `ollama`）。VS Code 自带的 Ollama 支持已经损坏——**连上下文用量都看不到**（一直显示 `0/1M`），无法正常使用本代理。安装官方 Ollama 扩展后，上下文用量、模型列表等才能正常显示。
+
 1. 打开 VS Code → 设置 → `github.copilot.advanced`
 2. 将 **Chat Provider** 设置为 `Ollama`
 3. 将 **Ollama URL** 设置为 `http://127.0.0.1:11434`
