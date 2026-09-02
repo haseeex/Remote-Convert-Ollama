@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Remote Convert Ollama · 配置管理</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--accent2:#1f6feb;--green:#3fb950;--yellow:#d29922;--red:#f85149;--radius:12px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:linear-gradient(180deg,#0d1117 0%,#0a0e14 100%);color:var(--text);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;min-height:100vh;padding-bottom:120px}
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:12px;padding:14px 24px;background:rgba(13,17,23,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+header .logo{font-size:22px}
+header h1{font-size:17px;font-weight:600}
+header .sub{font-size:12px;color:var(--muted)}
+header .spacer{flex:1}
+.layout{max-width:1440px;margin:24px auto 0;padding:0 20px;display:flex;gap:16px;align-items:flex-start}
+.tabs{width:150px;flex-shrink:0;display:flex;flex-direction:column;gap:4px;position:sticky;top:76px}
+.tab-item{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:9px;border:1px solid transparent;color:var(--muted);font-size:13px;cursor:pointer;transition:.15s;user-select:none;background:transparent}
+.tab-item:hover{color:var(--text);background:rgba(22,27,34,.7)}
+.tab-item.active{color:var(--accent);background:var(--panel);border-color:var(--border);font-weight:600;box-shadow:inset 3px 0 0 var(--accent)}
+.panels{flex:1;min-width:0;display:flex;flex-direction:column}
+.panel{display:none;flex-direction:column;gap:18px}
+.panel.active{display:flex}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.card>.head{display:flex;align-items:center;gap:8px;padding:12px 18px;background:var(--panel2);border-bottom:1px solid var(--border);font-weight:600;font-size:14px}
+.card>.head .hint{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);text-align:right}
+.card>.body{padding:16px 18px;display:flex;flex-direction:column;gap:14px}
+.row{display:flex;flex-direction:column;gap:6px}
+.row label{font-size:12.5px;color:var(--muted);display:flex;align-items:center;gap:8px}
+.row label .req{color:var(--yellow)}
+input[type=text],input[type=number],input[type=password],select,textarea{width:100%;padding:9px 12px;background:#0d1117;color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:13.5px;font-family:inherit;outline:none;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+select{appearance:none;-webkit-appearance:none;background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"><path d="M0 0l5 6 5-6z" fill="%238b949e"/></svg>');background-repeat:no-repeat;background-position:right 10px center;background-size:10px 6px;padding-right:34px;cursor:pointer}
+textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-size:12.5px;line-height:1.5}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+@media(max-width:680px){.grid2,.grid3{grid-template-columns:1fr}}
+@media(max-width:760px){.layout{flex-direction:column}.tabs{width:100%;flex-direction:row;overflow-x:auto;position:static;padding-bottom:4px}.tab-item{white-space:nowrap}}
+.switch{position:relative;display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.switch input{display:none}
+.switch .track{width:38px;height:21px;background:#30363d;border-radius:21px;position:relative;transition:.2s;flex-shrink:0}
+.switch .track::after{content:"";position:absolute;top:2.5px;left:3px;width:16px;height:16px;background:#8b949e;border-radius:50%;transition:.2s}
+.switch input:checked+.track{background:var(--accent2)}
+.switch input:checked+.track::after{left:19px;background:#fff}
+.switch .lbl{font-size:13px}
+.mode-group{display:flex;gap:8px;flex-wrap:wrap}
+.mode-opt{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px solid var(--border);border-radius:8px;cursor:pointer;font-size:12.5px;color:var(--muted);transition:.15s;background:transparent;user-select:none}
+.mode-opt:hover{border-color:var(--accent);color:var(--text)}
+.mode-opt input{accent-color:var(--accent2);cursor:pointer}
+.mode-opt:has(input:checked){border-color:var(--accent);background:rgba(88,166,255,.12);color:var(--accent);font-weight:500}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font-size:13px;font-weight:500;cursor:pointer;transition:.15s;font-family:inherit}
+.btn:hover{border-color:var(--accent);color:#fff}
+.btn.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
+.btn.primary:hover{filter:brightness(1.15)}
+.btn.danger{background:transparent;border-color:transparent;color:var(--red);padding:6px 10px}
+.btn.danger:hover{background:rgba(248,81,73,.12)}
+.btn.small{padding:5px 12px;font-size:12px}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.dtable{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.drow{display:grid;grid-template-columns:1fr 1fr auto;gap:8px;align-items:center}
+.card-item{border:1px solid var(--border);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:10px;background:var(--panel2)}
+.card-item .item-head{display:flex;align-items:center;gap:8px}
+.card-item .item-head .name{font-weight:600;font-size:13px;color:var(--accent);white-space:nowrap}
+/* 超宽屏下规则/详细设置卡片两列并排，提升空间利用率；窄屏单列舒展 */
+#ruleList,#detailList{display:grid!important;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
+@media(max-width:1200px){#ruleList,#detailList{grid-template-columns:1fr}}
+@media(max-width:900px){.dtable{grid-template-columns:1fr}}
+#toast{position:fixed;top:72px;right:20px;transform:translateX(120%);background:#1c2128;border:1px solid var(--border);color:var(--text);padding:12px 16px;border-radius:12px;font-size:13.5px;opacity:0;transition:all .3s;z-index:99;max-width:min(440px,82vw);box-shadow:0 8px 24px rgba(0,0,0,.4);display:flex;align-items:center;gap:10px}
+#toast.show{opacity:1;transform:translateX(0)}
+#toast.ok{border-color:var(--green);box-shadow:0 8px 24px rgba(0,0,0,.4),0 0 0 1px rgba(63,185,80,.15)}
+#toast.err{border-color:var(--red);box-shadow:0 8px 24px rgba(0,0,0,.4),0 0 0 1px rgba(248,81,73,.15)}
+#toast .toast-msg{flex:1;word-break:break-all}
+#toast .toast-time{font-family:Consolas,"Courier New",monospace;font-size:11px;color:var(--muted);background:rgba(139,148,158,.12);border:1px solid var(--border);padding:2px 8px;border-radius:20px;white-space:nowrap;letter-spacing:.5px;flex-shrink:0}
+.footerbar{position:fixed;bottom:0;left:0;right:0;z-index:10;display:flex;align-items:center;justify-content:center;gap:14px;padding:16px;background:rgba(13,17,23,.92);backdrop-filter:blur(10px);border-top:1px solid var(--border)}
+.gh-link{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border:1px solid var(--border);border-radius:20px;color:var(--muted);font-size:12.5px;text-decoration:none;transition:.15s;background:var(--panel2)}
+.gh-link:hover{color:var(--text);border-color:var(--accent);background:rgba(88,166,255,.1)}
+.gh-link img{border-radius:50%;flex-shrink:0}
+.mono{font-family:Consolas,monospace}
+.hidden{display:none!important}
+.badge{font-size:11px;padding:2px 8px;border-radius:20px;background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}
+.empty{color:var(--muted);font-size:13px;text-align:center;padding:10px}
+#loginOverlay{position:fixed;inset:0;z-index:200;background:rgba(5,8,12,.88);backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center}
+#loginOverlay.hidden{display:none}
+.login-box{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:36px 40px;width:min(380px,90vw);display:flex;flex-direction:column;gap:14px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+.login-box .login-icon{font-size:46px;line-height:1}
+.login-box h2{margin:0;font-size:18px;font-weight:600}
+.login-box .login-sub{color:var(--muted);font-size:13px;margin:0}
+.login-box input{padding:11px 14px;font-size:14px;text-align:center}
+.login-box .btn{width:100%;justify-content:center;padding:11px}
+.login-err{color:var(--red);font-size:12.5px;min-height:16px;margin:0}
+.login-tip{color:var(--muted);font-size:11.5px;margin:0}
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">🐭</span>
+  <div>
+    <h1 data-i18n="title">Remote Convert Ollama · 配置管理</h1>
+    <div class="sub" data-i18n="subListen">监听 <span id="listenAddr">-</span> · 保存后立即写入 config.json</div>
+  </div>
+  <div class="spacer"></div>
+  <a class="gh-link" href="https://github.com/haseeex/Remote-Convert-Ollama" target="_blank" rel="noopener" title="GitHub: haseeex/Remote-Convert-Ollama">
+    <img src="https://avatars.githubusercontent.com/u/62563787?v=4" alt="haseeex" width="22" height="22">
+    <span>haseeex</span>
+  </a>
+  <button class="btn" onclick="toggleLang()" id="btnLang" title="切换语言 / Switch language">🌐 EN</button>
+  <button class="btn" onclick="testConn()" id="btnTest" data-i18n="btnTest">🔌 测试连接</button>
+</header>
+
+<div class="layout">
+  <div class="tabs" role="tablist">
+    <div class="tab-item active" data-tab="conn" onclick="switchTab('conn')" data-i18n="tabConn">🔌 连接设置</div>
+    <div class="tab-item" data-tab="sec" onclick="switchTab('sec')" data-i18n="tabSec">🔒 安全设置</div>
+    <div class="tab-item" data-tab="log" onclick="switchTab('log')" data-i18n="tabLog">📜 日志设置</div>
+    <div class="tab-item" data-tab="model" onclick="switchTab('model')" data-i18n="tabModel">🧩 模型设置</div>
+    <div class="tab-item" data-tab="rules" onclick="switchTab('rules')" data-i18n="tabRules">✂️ 提示词替换</div>
+  </div>
+  <div class="panels">
+    <div class="panel active" id="tab-conn">
+      <div class="card">
+        <div class="head" data-i18n="connListen">🖥️ 监听设置 <span class="hint" data-i18n="connListenHint">修改 IP / PORT 需重启程序生效</span></div>
+        <div class="body grid2">
+          <div class="row"><label data-i18n="lblIP">监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
+          <div class="row"><label data-i18n="lblPort">监听端口 PORT</label><input type="text" id="PORT" placeholder="11434"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="connUpstream">📡 上游 API <span class="hint" data-i18n="connUpstreamHint">OPENAI_KEY 留空表示保持当前密钥</span></div>
+        <div class="body">
+          <div class="row"><label data-i18n="lblBase">OPENAI_BASE <span class="req">*</span></label><input type="text" id="OPENAI_BASE" placeholder="https://api.example.com/v1"></div>
+          <div class="row">
+            <label data-i18n="lblKey">OPENAI_KEY <span id="keyStatus" class="badge hidden" data-i18n="keyEncrypted">已加密保存</span></label>
+            <input type="password" id="OPENAI_KEY" data-i18n-ph="keyPlaceholder" placeholder="留空保持不变；输入明文新密钥将自动加密保存" autocomplete="off">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-sec">
+      <div class="card">
+        <div class="head" data-i18n="secPw">🔒 访问密码 <span class="hint" data-i18n="secPwHint">防止局域网内被他人乱改，留空保持不变</span></div>
+        <div class="body">
+          <div class="row">
+            <label data-i18n="lblWebPw">配置页面访问密码 WebConfigPassword <span id="pwStatus" class="badge hidden" data-i18n="pwEnabled">已启用</span></label>
+            <input type="password" id="WebConfigPassword" data-i18n-ph="webPwPlaceholder" placeholder="留空保持不变；设置新密码后需重新登录" autocomplete="new-password">
+          </div>
+          <div class="row"><label class="mono" style="color:var(--muted);font-size:12px" data-i18n="secPwTip">💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改</label></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-log">
+      <div class="card">
+        <div class="head" data-i18n="logTitle">📜 日志设置</div>
+        <div class="body">
+          <div class="grid2">
+            <div class="row"><label data-i18n="lblLogLimit">终端日志清理阈值 Log_Limit</label><input type="number" id="Log_Limit" min="1"></div>
+            <div class="row"></div>
+          </div>
+          <div class="grid3">
+            <label class="switch"><input type="checkbox" id="Log_Responses"><span class="track"></span><span class="lbl" data-i18n="lblLogResp">打印响应内容</span></label>
+            <label class="switch"><input type="checkbox" id="Log_Headers"><span class="track"></span><span class="lbl" data-i18n="lblLogHeaders">打印请求头</span></label>
+            <label class="switch"><input type="checkbox" id="Log_Body"><span class="track"></span><span class="lbl" data-i18n="lblLogBody">打印请求体</span></label>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-model">
+      <div class="card">
+        <div class="head" data-i18n="modelDisplay">🧩 模型显示 <span class="hint" data-i18n="modelDisplayHint">仅影响客户端看到的模型名称</span></div>
+        <div class="body">
+          <div class="grid2">
+            <div class="row"><label data-i18n="lblPrefix">模型名前缀 OpenAI_Prefix</label><input type="text" id="OpenAI_Prefix" placeholder="[VC反代] "></div>
+            <div class="row"><label data-i18n="lblSuffix">模型名后缀 OpenAI_Suffix</label><input type="text" id="OpenAI_Suffix"></div>
+          </div>
+          <div class="grid2">
+            <div class="row">
+              <label data-i18n="lblStreamMode">流式策略 StreamMode</label>
+              <select id="StreamMode">
+                <option value="preserve" data-i18n="smPreserve">preserve · 不覆写（默认）</option>
+                <option value="force_stream" data-i18n="smForceStream">force_stream · 强制流式</option>
+                <option value="force_close" data-i18n="smForceClose">force_close · 强制关闭</option>
+              </select>
+            </div>
+            <div class="row"><label data-i18n="lblCaps">能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
+          </div>
+          <div class="row"><label data-i18n="lblVisionPrompt">全局视觉代理提示词 VisionProxyPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionPromptHint">模型未自定义提示词时使用；留空=内置默认提示词</span></label><textarea rows="3" id="VisionProxyPrompt" data-i18n-ph="visionPromptPh" placeholder="请仔细查看这张图片，用简体中文详细描述图片中的全部内容..."></textarea></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="modelAlias">🔖 模型别名 ModelAlias <span class="hint" data-i18n="modelAliasHint">将上游模型 ID 显示为友好名称</span></div>
+        <div class="body">
+          <div id="aliasList" class="dtable"></div>
+          <div><button class="btn small" onclick="addAlias()" data-i18n="btnAddAlias">＋ 添加别名</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="modelDetail">📐 模型详细设置 ModelDetailedSettings <span class="hint" data-i18n="modelDetailHint">覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理</span></div>
+        <div class="body">
+          <div id="detailList"></div>
+          <div><button class="btn small" onclick="addDetail()" data-i18n="btnAddDetail">＋ 添加模型设置</button></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-rules">
+      <div class="card">
+        <div class="head" data-i18n="rulesTitle">✂️ 请求提示词替换 RequestPromptReplace <span class="hint" data-i18n="rulesHint">自动替换请求中的指定文本</span></div>
+        <div class="body">
+          <div id="ruleList"></div>
+          <div><button class="btn small" onclick="addRule()" data-i18n="btnAddRule">＋ 添加替换规则</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footerbar">
+  <button class="btn" onclick="loadCfg(true)" data-i18n="btnReload">🔄 重新加载</button>
+  <button class="btn primary" onclick="saveCfg()" id="btnSave" data-i18n="btnSave">💾 保存配置</button>
+  <button class="btn" onclick="doLogout()" id="btnLogout" data-i18n="btnLogout" title="使当前登录令牌立即失效">🔒 退出登录</button>
+</div>
+
+<div id="toast"></div>
+
+<div id="loginOverlay" class="hidden">
+  <div class="login-box">
+    <div class="login-icon">🔒</div>
+    <h2 data-i18n="loginTitle">配置管理已加锁</h2>
+    <p class="login-sub" data-i18n="loginSub">请输入访问密码以继续</p>
+    <input type="password" id="loginPw" data-i18n-ph="loginPwPh" placeholder="访问密码" autocomplete="current-password">
+    <button class="btn primary" onclick="doLogin()" data-i18n="btnUnlock">🔓 解锁</button>
+    <p class="login-err" id="loginErr"></p>
+  </div>
+</div>
+
+<script>
+var state = { aliases: [], details: [], rules: [] };
+
+function $(id){ return document.getElementById(id); }
+
+// ================= 中英文切换 =================
+var I18N = {
+  'zh-CN': {
+    title: 'Remote Convert Ollama · 配置管理',
+    subListen: '监听 {addr} · 保存后立即写入 config.json',
+    btnTest: '🔌 测试连接',
+    tabConn: '🔌 连接设置', tabSec: '🔒 安全设置', tabLog: '📜 日志设置', tabModel: '🧩 模型设置', tabRules: '✂️ 提示词替换',
+    connListen: '🖥️ 监听设置', connListenHint: '修改 IP / PORT 需重启程序生效',
+    lblIP: '监听地址 IP', lblPort: '监听端口 PORT',
+    connUpstream: '📡 上游 API', connUpstreamHint: 'OPENAI_KEY 留空表示保持当前密钥',
+    lblBase: 'OPENAI_BASE', lblKey: 'OPENAI_KEY', keyEncrypted: '已加密保存', keyPlaceholder: '留空保持不变；输入明文新密钥将自动加密保存',
+    secPw: '🔒 访问密码', secPwHint: '防止局域网内被他人乱改，留空保持不变',
+    lblWebPw: '配置页面访问密码 WebConfigPassword', pwEnabled: '已启用', webPwPlaceholder: '留空保持不变；设置新密码后需重新登录',
+    secPwTip: '💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改',
+    logTitle: '📜 日志设置', lblLogLimit: '终端日志清理阈值 Log_Limit',
+    lblLogResp: '打印响应内容', lblLogHeaders: '打印请求头', lblLogBody: '打印请求体',
+    modelDisplay: '🧩 模型显示', modelDisplayHint: '仅影响客户端看到的模型名称',
+    lblPrefix: '模型名前缀 OpenAI_Prefix', lblSuffix: '模型名后缀 OpenAI_Suffix',
+    lblStreamMode: '流式策略 StreamMode', smPreserve: 'preserve · 不覆写（默认）', smForceStream: 'force_stream · 强制流式', smForceClose: 'force_close · 强制关闭',
+    lblCaps: '能力声明 Capabilities（逗号分隔）',
+    lblVisionPrompt: '全局视觉代理提示词 VisionProxyPrompt', visionPromptHint: '模型未自定义提示词时使用；留空=内置默认提示词', visionPromptPh: '请仔细查看这张图片，用简体中文详细描述图片中的全部内容...',
+    modelAlias: '🔖 模型别名 ModelAlias', modelAliasHint: '将上游模型 ID 显示为友好名称', btnAddAlias: '＋ 添加别名',
+    modelDetail: '📐 模型详细设置 ModelDetailedSettings', modelDetailHint: '覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理', btnAddDetail: '＋ 添加模型设置',
+    rulesTitle: '✂️ 请求提示词替换 RequestPromptReplace', rulesHint: '自动替换请求中的指定文本', btnAddRule: '＋ 添加替换规则',
+    btnReload: '🔄 重新加载', btnSave: '💾 保存配置', btnLogout: '🔒 退出登录',
+    loginTitle: '配置管理已加锁', loginSub: '请输入访问密码以继续', loginPwPh: '访问密码', btnUnlock: '🔓 解锁',
+    // 动态渲染文本
+    emptyAlias: '暂无别名配置', emptyDetail: '暂无模型详细设置', emptyRule: '暂无替换规则',
+    lblModel: '模型', lblContextLength: '上下文长度 ContextLength', lblMaxOutput: '最大输出 MaxOutputTokens',
+    lblCapsShort: '能力 Capabilities（逗号分隔）', lblVisionProxyModel: '视觉代理模型 VisionProxyModel（主模型不支持图片时，用此模型识别图片）',
+    lblVisionProxyPrompt: '视觉代理提示词 VisionProxyPrompt（留空=默认提示词）', visionProxyPh: '请仔细查看这张图片，用简体中文详细描述图片中的全部内容...',
+    lblEnable: '启用', lblRuleName: '规则名', ruleNamePh: '规则名称（唯一）',
+    lblMode: '替换模式（互斥，只能选一种）', modeNormal: '📄 普通替换', modeWhole: '📝 匹配整段替换', modeForce: '⚡ 强制替换',
+    lblRole: '目标角色 role（留空=任意）', optAny: '任意', lblIndex: '消息索引 index（0=第1条）', indexPh: '留空=按角色',
+    lblPrompt: '文本匹配 prompt', lblPromptForce: '文本匹配 prompt（强制替换时忽略）', promptPh: '要查找的文本',
+    lblReplace: '替换为 replace', lblReplaceWhole: '替换为 replace（此模式 = 消息的完整新内容）',
+    btnDelete: '删除', upModelIdPh: '上游模型ID', upModelIdPh2: '上游模型ID，如 deepseek-chat', showNamePh: '显示名称',
+    // 提示/状态
+    toastReloaded: '✅ 已重新加载配置', toastLoadFail: '加载配置失败: ', toastSaveOk: '配置已保存 ✓', toastSaveFail: '保存失败: ',
+    toastNeedBase: '请填写 OPENAI_BASE', toastSaving: '⏳ 保存中...', toastTesting: '⏳ 测试中...',
+    toastConnOk: '✅ 连接成功！发现 {n} 个模型', toastConnFail: '❌ ', toastUnlockOk: '🔓 解锁成功',
+    toastLogoutOk: '🔒 已退出登录', loginErrEmpty: '请输入密码', loginErrWrong: '密码错误', loginErrFail: '登录失败: ',
+    authExpired: '未授权，会话已失效，请重新解锁', etc: ' 等'
+  },
+  'en': {
+    title: 'Remote Convert Ollama · Config',
+    subListen: 'Listening {addr} · saved to config.json immediately',
+    btnTest: '🔌 Test Connection',
+    tabConn: '🔌 Connection', tabSec: '🔒 Security', tabLog: '📜 Logging', tabModel: '🧩 Models', tabRules: '✂️ Prompt Replace',
+    connListen: '🖥️ Listen Settings', connListenHint: 'IP / PORT changes require restart',
+    lblIP: 'Listen IP', lblPort: 'Listen Port',
+    connUpstream: '📡 Upstream API', connUpstreamHint: 'Leave OPENAI_KEY empty to keep current key',
+    lblBase: 'OPENAI_BASE', lblKey: 'OPENAI_KEY', keyEncrypted: 'Encrypted', keyPlaceholder: 'Leave empty to keep; enter plaintext to auto-encrypt',
+    secPw: '🔒 Access Password', secPwHint: 'Prevent others on LAN from modifying; leave empty to keep',
+    lblWebPw: 'Config page password WebConfigPassword', pwEnabled: 'Enabled', webPwPlaceholder: 'Leave empty to keep; new password requires re-login',
+    secPwTip: '💡 After setting, /config requires password and all config APIs are protected',
+    logTitle: '📜 Logging', lblLogLimit: 'Terminal log limit Log_Limit',
+    lblLogResp: 'Print response', lblLogHeaders: 'Print headers', lblLogBody: 'Print body',
+    modelDisplay: '🧩 Model Display', modelDisplayHint: 'Only affects model names seen by client',
+    lblPrefix: 'Model name prefix OpenAI_Prefix', lblSuffix: 'Model name suffix OpenAI_Suffix',
+    lblStreamMode: 'Stream mode StreamMode', smPreserve: 'preserve · no override (default)', smForceStream: 'force_stream · force streaming', smForceClose: 'force_close · force close',
+    lblCaps: 'Capabilities (comma separated)',
+    lblVisionPrompt: 'Global vision proxy prompt VisionProxyPrompt', visionPromptHint: 'Used when model has no custom prompt; empty = built-in default', visionPromptPh: 'Please look at this image carefully and describe all its contents in detail...',
+    modelAlias: '🔖 Model Alias ModelAlias', modelAliasHint: 'Show friendly names for upstream model IDs', btnAddAlias: '＋ Add Alias',
+    modelDetail: '📐 Model Detailed Settings ModelDetailedSettings', modelDetailHint: 'Override upstream values; VisionProxyModel sets a vision proxy for the main model', btnAddDetail: '＋ Add Model Setting',
+    rulesTitle: '✂️ Request Prompt Replace RequestPromptReplace', rulesHint: 'Automatically replace specified text in requests', btnAddRule: '＋ Add Rule',
+    btnReload: '🔄 Reload', btnSave: '💾 Save Config', btnLogout: '🔒 Logout',
+    loginTitle: 'Config Locked', loginSub: 'Enter access password to continue', loginPwPh: 'Access password', btnUnlock: '🔓 Unlock',
+    emptyAlias: 'No aliases', emptyDetail: 'No model settings', emptyRule: 'No rules',
+    lblModel: 'Model', lblContextLength: 'Context Length', lblMaxOutput: 'Max Output Tokens',
+    lblCapsShort: 'Capabilities (comma separated)', lblVisionProxyModel: 'Vision proxy model VisionProxyModel (used to recognize images when main model lacks vision)',
+    lblVisionProxyPrompt: 'Vision proxy prompt VisionProxyPrompt (empty = default)', visionProxyPh: 'Please look at this image carefully and describe all its contents in detail...',
+    lblEnable: 'Enable', lblRuleName: 'Rule name', ruleNamePh: 'Rule name (unique)',
+    lblMode: 'Replace mode (mutually exclusive)', modeNormal: '📄 Normal replace', modeWhole: '📝 Whole-match replace', modeForce: '⚡ Force replace',
+    lblRole: 'Target role (empty = any)', optAny: 'Any', lblIndex: 'Message index (0 = first)', indexPh: 'empty = by role',
+    lblPrompt: 'Match text prompt', lblPromptForce: 'Match text prompt (ignored in force mode)', promptPh: 'Text to find',
+    lblReplace: 'Replace with', lblReplaceWhole: 'Replace with (this mode = full new message content)',
+    btnDelete: 'Delete', upModelIdPh: 'Upstream model ID', upModelIdPh2: 'Upstream model ID, e.g. deepseek-chat', showNamePh: 'Display name',
+    toastReloaded: '✅ Config reloaded', toastLoadFail: 'Failed to load config: ', toastSaveOk: 'Config saved ✓', toastSaveFail: 'Save failed: ',
+    toastNeedBase: 'Please fill OPENAI_BASE', toastSaving: '⏳ Saving...', toastTesting: '⏳ Testing...',
+    toastConnOk: '✅ Connected! Found {n} models', toastConnFail: '❌ ', toastUnlockOk: '🔓 Unlocked',
+    toastLogoutOk: '🔒 Logged out', loginErrEmpty: 'Please enter password', loginErrWrong: 'Wrong password', loginErrFail: 'Login failed: ',
+    authExpired: 'Unauthorized, session expired, please unlock again', etc: ' etc.'
+  }
+};
+var currentLang = localStorage.getItem('cfg_lang') || 'zh-CN';
+
+function t(key, params){
+  var dict = I18N[currentLang] || I18N['zh-CN'];
+  var s = dict[key] != null ? dict[key] : (I18N['zh-CN'][key] != null ? I18N['zh-CN'][key] : key);
+  if(params){ for(var k in params){ s = s.replace('{' + k + '}', params[k]); } }
+  return s;
+}
+
+// 替换元素文本但保留子元素（如 label 内嵌的 req 星号 / hint / keyStatus / pwStatus）
+function setI18nText(el, text){
+  if(el.children.length === 0){
+    el.innerHTML = text;
+    return;
+  }
+  // 有子元素：只替换直接文本节点，保留子元素结构
+  var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  var first = true;
+  var node;
+  while((node = walker.nextNode())){
+    if(first){ node.nodeValue = text; first = false; }
+    else { node.nodeValue = ''; }
+  }
+  if(first){ el.insertBefore(document.createTextNode(text), el.firstChild); }
+}
+
+function applyI18n(){
+  // 静态元素（subListen 含 {addr} 占位符，由 updateListenAddr 统一处理，跳过）
+  document.querySelectorAll('[data-i18n]').forEach(function(el){
+    if(el.getAttribute('data-i18n') === 'subListen'){ return; }
+    setI18nText(el, t(el.getAttribute('data-i18n')));
+  });
+  document.querySelectorAll('[data-i18n-ph]').forEach(function(el){
+    el.setAttribute('placeholder', t(el.getAttribute('data-i18n-ph')));
+  });
+  // 语言按钮
+  $('btnLang').textContent = currentLang === 'zh-CN' ? '🌐 EN' : '🌐 中文';
+  // 动态渲染的列表
+  renderAliases(); renderDetails(); renderRules();
+  // 更新监听地址（含翻译）
+  updateListenAddr();
+}
+
+function toggleLang(){
+  currentLang = currentLang === 'zh-CN' ? 'en' : 'zh-CN';
+  localStorage.setItem('cfg_lang', currentLang);
+  document.documentElement.lang = currentLang;
+  applyI18n();
+}
+
+function updateListenAddr(){
+  var ip = $('IP').value || '0.0.0.0';
+  var port = $('PORT').value || '11434';
+  // 更新 sub 里的监听地址（subListen 含 {addr} 占位符）
+  var sub = document.querySelector('[data-i18n="subListen"]');
+  if(sub){ sub.innerHTML = t('subListen', { addr: '<span id="listenAddr">' + ip + ':' + port + '</span>' }); }
+}
+// ================= 中英文切换结束 =================
+
+// -------- Tab 切换（左侧导航 / 右侧内容）--------
+function switchTab(name){
+  document.querySelectorAll('.tab-item').forEach(function(t){
+    t.classList.toggle('active', t.getAttribute('data-tab') === name);
+  });
+  document.querySelectorAll('.panel').forEach(function(p){
+    p.classList.toggle('active', p.id === 'tab-' + name);
+  });
+}
+
+function esc(s){
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function toast(msg, type){
+  var t = $('toast');
+  var now = new Date();
+  var hh = ('0' + now.getHours()).slice(-2);
+  var mm = ('0' + now.getMinutes()).slice(-2);
+  var ss = ('0' + now.getSeconds()).slice(-2);
+  var time = hh + ':' + mm + ':' + ss;
+  // 消息用 textContent 填充，避免注入；时间徽章单独渲染
+  t.innerHTML = '<span class="toast-msg"></span><span class="toast-time">🕐 ' + time + '</span>';
+  t.querySelector('.toast-msg').textContent = msg;
+  t.className = 'show ' + (type || 'ok');
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(function(){ t.className = ''; }, 3500);
+}
+
+// -------- 访问密码鉴权（服务端会话令牌）--------
+// 登录成功后服务端签发随机 token，前端只存 token（不存密码），
+// token 保存在服务端内存 —— 服务端重启后所有会话失效，必须重新登录
+function authHeader(){
+  var token = sessionStorage.getItem('cfg_token');
+  return token ? { 'X-Config-Token': token } : {};
+}
+
+function clearSession(){
+  sessionStorage.removeItem('cfg_token');
+  sessionStorage.removeItem('cfg_pw'); // 清理旧版遗留
+}
+
+function showLogin(){
+  $('loginOverlay').classList.remove('hidden');
+  setTimeout(function(){ $('loginPw').focus(); }, 60);
+}
+
+function hideLogin(){
+  $('loginOverlay').classList.add('hidden');
+}
+
+async function doLogin(){
+  var pw = $('loginPw').value;
+  if(!pw){ $('loginErr').textContent = t('loginErrEmpty'); return; }
+  try{
+    var res = await fetch('/api/config/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw })
+    });
+    var data = null;
+    try { data = await res.json(); } catch(e){}
+    if(!res.ok){
+      $('loginErr').textContent = (data && data.message) || t('loginErrWrong');
+      return;
+    }
+    // 存服务端签发的令牌，而不是密码本身
+    if(data.token){ sessionStorage.setItem('cfg_token', data.token); }
+    clearSession();
+    if(data.token){ sessionStorage.setItem('cfg_token', data.token); }
+    $('loginPw').value = '';
+    $('loginErr').textContent = '';
+    hideLogin();
+    toast(t('toastUnlockOk'));
+    loadCfg();
+  }catch(e){
+    $('loginErr').textContent = t('loginErrFail') + e.message;
+  }
+}
+
+async function doLogout(){
+  try{
+    await fetch('/api/config/logout', { method: 'POST', headers: authHeader() });
+  }catch(e){}
+  clearSession();
+  showLogin();
+  toast(t('toastLogoutOk'));
+}
+
+async function initAuth(){
+  try{
+    var res = await fetch('/api/config/auth', { cache: 'no-store' });
+    var auth = await res.json();
+    if(auth.required && !sessionStorage.getItem('cfg_token')){
+      showLogin();
+    } else {
+      loadCfg();
+    }
+  }catch(e){
+    // 接口异常时直接尝试加载
+    loadCfg();
+  }
+}
+
+async function api(url, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers, authHeader());
+  var res = await fetch(url, opts);
+  if(res.status === 401){
+    clearSession();
+    showLogin();
+    throw new Error(t('authExpired'));
+  }
+  var data = null;
+  try { data = await res.json(); } catch(e){}
+  if(!res.ok){ throw new Error(data && data.message ? data.message : ('HTTP ' + res.status)); }
+  return data;
+}
+
+function splitList(s){
+  return String(s || '').split(',').map(function(x){ return x.trim(); }).filter(Boolean);
+}
+
+async function loadCfg(notify){
+  try{
+    var c = await api('/api/config');
+    $('IP').value = c.IP || '';
+    $('PORT').value = c.PORT || '';
+    $('OPENAI_BASE').value = c.OPENAI_BASE || '';
+    $('OPENAI_KEY').value = '';
+    if(c.OPENAI_KEY_SET){ $('keyStatus').classList.remove('hidden'); } else { $('keyStatus').classList.add('hidden'); }
+    $('WebConfigPassword').value = '';
+    if(c.WEB_CONFIG_PASSWORD_SET){ $('pwStatus').classList.remove('hidden'); } else { $('pwStatus').classList.add('hidden'); }
+    $('Log_Limit').value = c.Log_Limit != null ? c.Log_Limit : 100;
+    $('Log_Responses').checked = !!c.Log_Responses;
+    $('Log_Headers').checked = !!c.Log_Headers;
+    $('Log_Body').checked = !!c.Log_Body;
+    $('OpenAI_Prefix').value = c.OpenAI_Prefix || '';
+    $('OpenAI_Suffix').value = c.OpenAI_Suffix || '';
+    $('StreamMode').value = c.StreamMode || 'preserve';
+    $('Capabilities').value = (c.Capabilities || []).join(', ');
+    $('VisionProxyPrompt').value = c.VisionProxyPrompt || '';
+
+    state.aliases = [];
+    if(c.ModelAlias){
+      Object.keys(c.ModelAlias).forEach(function(k){
+        state.aliases.push({ key: k, value: c.ModelAlias[k] || '' });
+      });
+    }
+    renderAliases();
+
+    state.details = [];
+    if(c.ModelDetailedSettings){
+      Object.keys(c.ModelDetailedSettings).forEach(function(k){
+        var s = c.ModelDetailedSettings[k] || {};
+        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', '), vpm: s.VisionProxyModel || '', vpp: s.VisionProxyPrompt || '' });
+      });
+    }
+    renderDetails();
+
+    state.rules = [];
+    if(c.RequestPromptReplace){
+      Object.keys(c.RequestPromptReplace).forEach(function(k){
+        var rr = c.RequestPromptReplace[k] || {};
+        // 读取 mode 枚举（兼容旧版 force / replaceWhole 布尔字段）
+        var mode = rr.mode || 'normal';
+        if(mode === 'normal'){
+          if(rr.force){ mode = 'force'; }
+          else if(rr.ReplaceWhole){ mode = 'whole'; }
+        }
+        state.rules.push({ name: k, enable: rr.enable !== false, mode: mode, role: rr.role || '', index: rr.index != null ? rr.index : '', prompt: rr.prompt || '', replace: rr.replace || '' });
+      });
+    }
+    renderRules();
+    updateListenAddr();
+    if(notify){ toast(t('toastReloaded')); }
+  }catch(e){
+    toast(t('toastLoadFail') + e.message, 'err');
+  }
+}
+
+function renderAliases(){
+  var box = $('aliasList');
+  box.innerHTML = '';
+  if(!state.aliases.length){ box.innerHTML = '<div class="empty">' + t('emptyAlias') + '</div>'; return; }
+  state.aliases.forEach(function(a, i){
+    var row = document.createElement('div');
+    row.className = 'drow';
+    row.innerHTML =
+      '<input type="text" class="mono" value="' + esc(a.key) + '" placeholder="' + t('upModelIdPh') + '" oninput="state.aliases[' + i + '].key=this.value">' +
+      '<input type="text" value="' + esc(a.value) + '" placeholder="' + t('showNamePh') + '" oninput="state.aliases[' + i + '].value=this.value">' +
+      '<button class="btn danger" onclick="removeAt(state.aliases,' + i + ',renderAliases)" title="' + t('btnDelete') + '">✕</button>';
+    box.appendChild(row);
+  });
+}
+
+function renderDetails(){
+  var box = $('detailList');
+  box.innerHTML = '';
+  if(!state.details.length){ box.innerHTML = '<div class="empty">' + t('emptyDetail') + '</div>'; return; }
+  state.details.forEach(function(d, i){
+    var el = document.createElement('div');
+    el.className = 'card-item';
+    el.innerHTML =
+      '<div class="item-head"><span class="name">' + t('lblModel') + '</span>' +
+      '<input type="text" class="mono" style="flex:1" value="' + esc(d.model) + '" placeholder="' + t('upModelIdPh2') + '" oninput="state.details[' + i + '].model=this.value">' +
+      '<button class="btn danger" onclick="removeAt(state.details,' + i + ',renderDetails)" title="' + t('btnDelete') + '">✕</button></div>' +
+      '<div class="grid3">' +
+      '<div class="row"><label>' + t('lblContextLength') + '</label><input type="number" min="0" value="' + esc(d.cl) + '" placeholder="1000000" oninput="state.details[' + i + '].cl=this.value"></div>' +
+      '<div class="row"><label>' + t('lblMaxOutput') + '</label><input type="number" min="0" value="' + esc(d.mot) + '" placeholder="384000" oninput="state.details[' + i + '].mot=this.value"></div>' +
+      '<div class="row"><label>' + t('lblCapsShort') + '</label><input type="text" value="' + esc(d.caps) + '" placeholder="tools, vision" oninput="state.details[' + i + '].caps=this.value"></div>' +
+      '</div>' +
+      '<div class="row"><label>' + t('lblVisionProxyModel') + '</label><input type="text" class="mono" value="' + esc(d.vpm) + '" placeholder="gpt-4o" oninput="state.details[' + i + '].vpm=this.value"></div>' +
+      '<div class="row"><label>' + t('lblVisionProxyPrompt') + '</label><textarea rows="2" placeholder="' + t('visionProxyPh') + '" oninput="state.details[' + i + '].vpp=this.value">' + esc(d.vpp) + '</textarea></div>';
+    box.appendChild(el);
+  });
+}
+
+function renderRules(){
+  var box = $('ruleList');
+  box.innerHTML = '';
+  if(!state.rules.length){ box.innerHTML = '<div class="empty">' + t('emptyRule') + '</div>'; return; }
+  state.rules.forEach(function(r, i){
+    var el = document.createElement('div');
+    el.className = 'card-item';
+    el.innerHTML =
+      '<div class="item-head">' +
+      '<label class="switch"><input type="checkbox" ' + (r.enable ? 'checked' : '') + ' onchange="state.rules[' + i + '].enable=this.checked"><span class="track"></span><span class="lbl">' + t('lblEnable') + '</span></label>' +
+      '<span class="name">' + t('lblRuleName') + '</span>' +
+      '<input type="text" style="flex:1" value="' + esc(r.name) + '" placeholder="' + t('ruleNamePh') + '" oninput="state.rules[' + i + '].name=this.value">' +
+      '<button class="btn danger" onclick="removeAt(state.rules,' + i + ',renderRules)" title="' + t('btnDelete') + '">✕</button></div>' +
+      '<div class="row"><label>' + t('lblMode') + '</label>' +
+      '<div class="mode-group">' +
+      '<label class="mode-opt" title="' + t('modeNormal') + '"><input type="radio" name="rmode_' + i + '" value="normal" ' + (r.mode === 'normal' ? 'checked' : '') + ' onchange="state.rules[' + i + '].mode=this.value"><span>' + t('modeNormal') + '</span></label>' +
+      '<label class="mode-opt" title="' + t('modeWhole') + '"><input type="radio" name="rmode_' + i + '" value="whole" ' + (r.mode === 'whole' ? 'checked' : '') + ' onchange="state.rules[' + i + '].mode=this.value"><span>' + t('modeWhole') + '</span></label>' +
+      '<label class="mode-opt" title="' + t('modeForce') + '"><input type="radio" name="rmode_' + i + '" value="force" ' + (r.mode === 'force' ? 'checked' : '') + ' onchange="state.rules[' + i + '].mode=this.value"><span>' + t('modeForce') + '</span></label>' +
+      '</div></div>' +
+      '<div class="grid3">' +
+      '<div class="row"><label>' + t('lblRole') + '</label><select onchange="state.rules[' + i + '].role=this.value">' +
+      '<option value="">' + t('optAny') + '</option>' +
+      '<option value="system"' + (r.role === 'system' ? ' selected' : '') + '>system</option>' +
+      '<option value="user"' + (r.role === 'user' ? ' selected' : '') + '>user</option>' +
+      '<option value="assistant"' + (r.role === 'assistant' ? ' selected' : '') + '>assistant</option>' +
+      '</select></div>' +
+      '<div class="row"><label>' + t('lblIndex') + '</label><input type="number" min="0" value="' + esc(r.index) + '" placeholder="' + t('indexPh') + '" oninput="state.rules[' + i + '].index=this.value"></div>' +
+      '<div class="row"><label>' + (r.mode === 'force' ? t('lblPromptForce') : t('lblPrompt')) + '</label><input type="text" value="' + esc(r.prompt) + '" placeholder="' + t('promptPh') + '" oninput="state.rules[' + i + '].prompt=this.value"></div>' +
+      '</div>' +
+      '<div class="row"><label>' + (r.mode !== 'normal' ? t('lblReplaceWhole') : t('lblReplace')) + '</label><textarea oninput="state.rules[' + i + '].replace=this.value">' + esc(r.replace) + '</textarea></div>';
+    box.appendChild(el);
+  });
+}
+
+function addAlias(){ state.aliases.push({ key: '', value: '' }); renderAliases(); }
+function addDetail(){ state.details.push({ model: '', cl: '', mot: '', caps: '', vpm: '', vpp: '' }); renderDetails(); }
+function addRule(){ state.rules.push({ name: '', enable: true, mode: 'normal', role: '', index: '', prompt: '', replace: '' }); renderRules(); }
+function removeAt(arr, i, render){ arr.splice(i, 1); render(); }
+
+function collectCfg(){
+  var aliases = {};
+  state.aliases.forEach(function(a){ if(a.key){ aliases[a.key] = a.value; } });
+
+  var details = {};
+  state.details.forEach(function(d){
+    if(!d.model) return;
+    var o = {};
+    if(d.cl !== '' && d.cl != null){ o.ContextLength = parseInt(d.cl, 10); }
+    if(d.mot !== '' && d.mot != null){ o.MaxOutputTokens = parseInt(d.mot, 10); }
+    var dc = splitList(d.caps);
+    if(dc.length){ o.Capabilities = dc; }
+    if(d.vpm && d.vpm.trim()){ o.VisionProxyModel = d.vpm.trim(); }
+    if(d.vpp && d.vpp.trim()){ o.VisionProxyPrompt = d.vpp.trim(); }
+    details[d.model] = o;
+  });
+
+  var rules = {};
+  state.rules.forEach(function(r){
+    if(!r.name) return;
+    var o = { enable: r.enable };
+    if(r.mode && r.mode !== 'normal'){ o.mode = r.mode; }
+    if(r.role){ o.role = r.role; }
+    if(r.index !== '' && r.index != null){ o.index = parseInt(r.index, 10); }
+    o.prompt = r.prompt || '';
+    o.replace = r.replace || '';
+    rules[r.name] = o;
+  });
+
+  return {
+    IP: $('IP').value.trim(),
+    PORT: $('PORT').value.trim(),
+    Log_Limit: parseInt($('Log_Limit').value, 10) || 100,
+    Log_Responses: $('Log_Responses').checked,
+    Log_Headers: $('Log_Headers').checked,
+    Log_Body: $('Log_Body').checked,
+    OpenAI_Prefix: $('OpenAI_Prefix').value,
+    OpenAI_Suffix: $('OpenAI_Suffix').value,
+    StreamMode: $('StreamMode').value,
+    Capabilities: splitList($('Capabilities').value),
+    VisionProxyPrompt: $('VisionProxyPrompt').value.trim(),
+    OPENAI_BASE: $('OPENAI_BASE').value.trim(),
+    OPENAI_KEY: $('OPENAI_KEY').value.trim(),
+    WebConfigPassword: $('WebConfigPassword').value.trim(),
+    ModelAlias: aliases,
+    ModelDetailedSettings: details,
+    RequestPromptReplace: rules
+  };
+}
+
+async function saveCfg(){
+  var btn = $('btnSave');
+  btn.disabled = true;
+  btn.innerHTML = t('toastSaving');
+  try{
+    var c = collectCfg();
+    if(!c.OPENAI_BASE){ toast(t('toastNeedBase'), 'err'); btn.disabled = false; btn.innerHTML = t('btnSave'); return; }
+    var res = await api('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) });
+    toast(res.message || t('toastSaveOk'));
+    await loadCfg();
+  }catch(e){
+    toast(t('toastSaveFail') + e.message, 'err');
+  }finally{
+    btn.disabled = false;
+    btn.innerHTML = t('btnSave');
+  }
+}
+
+async function testConn(){
+  var btn = $('btnTest');
+  btn.disabled = true;
+  btn.innerHTML = t('toastTesting');
+  try{
+    var res = await api('/api/config/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ OPENAI_BASE: $('OPENAI_BASE').value.trim(), OPENAI_KEY: $('OPENAI_KEY').value.trim() }) });
+    var models = res.models || [];
+    var msg = t('toastConnOk', { n: models.length });
+    if(models.length){ msg += '：' + models.slice(0, 6).join(', ') + (models.length > 6 ? t('etc') : ''); }
+    toast(msg, 'ok');
+  }catch(e){
+    toast(t('toastConnFail') + e.message, 'err');
+  }finally{
+    btn.disabled = false;
+    btn.innerHTML = t('btnTest');
+  }
+}
+
+document.addEventListener('keydown', function(e){
+  if((e.ctrlKey || e.metaKey) && e.key === 's'){ e.preventDefault(); saveCfg(); }
+});
+// 登录框回车提交
+$('loginPw').addEventListener('keydown', function(e){
+  if(e.key === 'Enter'){ e.preventDefault(); doLogin(); }
+});
+window.addEventListener('DOMContentLoaded', function(){
+  document.documentElement.lang = currentLang;
+  applyI18n();
+  initAuth();
+});
+</script>
+</body>
+</html>
