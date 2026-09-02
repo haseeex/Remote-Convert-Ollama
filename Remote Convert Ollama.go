@@ -177,7 +177,10 @@ const DefaultContextLength = 1000000
 const DefaultMaxOutputTokens = 384000
 
 // OllamaToolCall 是 Ollama 格式的工具调用
+// ID 非标准 Ollama 字段（omitempty），用于在响应中保留上游 tool_call id：
+// 客户端回传 assistant 消息时可直接配对，避免 tool 消息与 tool_calls 关联断裂导致 Agent 死循环
 type OllamaToolCall struct {
+	ID       string `json:"id,omitempty"`
 	Function struct {
 		Name      string      `json:"name"`
 		Arguments interface{} `json:"arguments"` // JSON 对象（非字符串）
@@ -338,6 +341,8 @@ func extractContent(resp *OpenAIResp) string {
 }
 
 // extractToolCalls 从 OpenAI 响应中提取 tool_calls 并转为 Ollama 格式
+// 保留上游 tool_call id（空则生成 call_N 兜底），客户端回传 assistant 消息时
+// 可与 tool 消息的 tool_call_id 严格配对，避免 Agent 死循环
 func extractToolCalls(msg map[string]interface{}) []OllamaToolCall {
 	tcRaw, ok := msg["tool_calls"]
 	if !ok {
@@ -350,6 +355,7 @@ func extractToolCalls(msg map[string]interface{}) []OllamaToolCall {
 	}
 
 	var result []OllamaToolCall
+	seq := 0
 	for _, tc := range tcList {
 		tcMap, ok := tc.(map[string]interface{})
 		if !ok {
@@ -366,6 +372,11 @@ func extractToolCalls(msg map[string]interface{}) []OllamaToolCall {
 		}
 
 		var otc OllamaToolCall
+		otc.ID, _ = tcMap["id"].(string)
+		if otc.ID == "" {
+			seq++
+			otc.ID = fmt.Sprintf("call_%d", seq)
+		}
 		name, _ := funcMap["name"].(string)
 		otc.Function.Name = name
 
@@ -386,8 +397,14 @@ func extractToolCalls(msg map[string]interface{}) []OllamaToolCall {
 }
 
 // convertMessagesToOpenAI 将 Ollama 格式的消息列表转为 OpenAI 格式
+// 关键：维护 tool_call_id 闭环 —— assistant.tool_calls[].id 与后续 tool 消息的
+// tool_call_id 必须严格配对，否则上游 API 无法关联工具结果，
+// 模型会认为"调用没有返回结果"而反复重试同一调用（Agent 死循环的根源）
 func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 	var result []interface{}
+	toolCallSeq := 0            // 本请求内 tool_call id 生成序号
+	var pendingToolIDs []string // 待消费的 tool_call id 队列（assistant 声明 → tool 消息按序消费）
+
 	for _, msg := range messages {
 		msgMap, ok := msg.(map[string]interface{})
 		if !ok {
@@ -397,17 +414,29 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 
 		role, _ := msgMap["role"].(string)
 
-		// 处理 tool 角色消息：添加 tool_call_id 如果不存在
+		// 处理 tool 角色消息：补齐 tool_call_id（按顺序消费前面 assistant 声明的 id）
 		if role == "tool" {
 			newMsg := make(map[string]interface{})
 			for k, v := range msgMap {
 				newMsg[k] = v
 			}
-			if _, hasID := newMsg["tool_call_id"]; !hasID {
-				newMsg["tool_call_id"] = ""
+			if id, hasID := newMsg["tool_call_id"].(string); !hasID || id == "" {
+				if len(pendingToolIDs) > 0 {
+					// 从队列头部取对应的 tool_call id
+					newMsg["tool_call_id"] = pendingToolIDs[0]
+					pendingToolIDs = pendingToolIDs[1:]
+				} else {
+					toolCallSeq++
+					newMsg["tool_call_id"] = fmt.Sprintf("call_%d", toolCallSeq)
+				}
 			}
 			result = append(result, newMsg)
 			continue
+		}
+
+		// 非 tool 消息出现时清空待消费队列（assistant 无 tool_calls / user / system）
+		if role != "assistant" {
+			pendingToolIDs = nil
 		}
 
 		// 处理 assistant 消息中的 tool_calls（转换为 OpenAI 格式）
@@ -425,6 +454,8 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 
 			tcRaw, hasTC := msgMap["tool_calls"]
 			if !hasTC {
+				// assistant 无 tool_calls：清空待消费队列，避免旧 id 错误配对到后面的 tool 消息
+				pendingToolIDs = nil
 				result = append(result, msgMap) // ← 修复：用 msgMap（可能含注入的 reasoning_content）
 				continue
 			}
@@ -438,6 +469,7 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 
 			tcList, ok := tcRaw.([]interface{})
 			if !ok {
+				pendingToolIDs = nil
 				result = append(result, msgMap) // ← 修复：用 msgMap
 				continue
 			}
@@ -474,9 +506,11 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 							openaiTC["function"] = fn
 						}
 					}
+					// 记录已声明的 id，供后续 tool 消息按序配对
+					pendingToolIDs = append(pendingToolIDs, existingID)
 					openaiTCs = append(openaiTCs, openaiTC)
 				} else {
-					// Ollama 格式（无 id）：从 function 字段构建
+					// Ollama 格式（无 id）：生成确定性 id 并登记到待消费队列
 					funcRaw, ok := tcMap["function"]
 					if !ok {
 						continue
@@ -486,8 +520,12 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 						continue
 					}
 
+					toolCallSeq++
+					genID := fmt.Sprintf("call_%d", toolCallSeq)
+					pendingToolIDs = append(pendingToolIDs, genID)
+
 					openaiTC := map[string]interface{}{
-						"id":   "", // 将由上游 API 分配，但留空
+						"id":   genID,
 						"type": "function",
 						"function": map[string]interface{}{
 							"name": funcMap["name"],
@@ -507,6 +545,7 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 				}
 			}
 			newMsg["tool_calls"] = openaiTCs
+			// assistant 带 tool_calls 时不清空 pendingToolIDs（刚登记的 id 等待 tool 消息消费）
 			result = append(result, newMsg)
 			continue
 		}
@@ -2642,6 +2681,70 @@ func hasCapability(caps []string, capability string) bool {
 	return false
 }
 
+// estimateTokens 估算文本的 token 数（粗略估计：ASCII 约 4 字符=1 token，中文等非 ASCII 约 1 字=1 token）
+// 用途：上游不返回 usage 时本地估算，保证 VS Code 上下文占用显示不为 0
+func estimateTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	ascii := 0
+	nonASCII := 0
+	for _, r := range text {
+		if r < 128 {
+			ascii++
+		} else {
+			nonASCII++
+		}
+	}
+	tokens := ascii/4 + nonASCII
+	if tokens < 1 {
+		tokens = 1
+	}
+	return tokens
+}
+
+// estimatePromptTokens 估算消息列表的 prompt token 数（含角色/结构开销，图片按固定值粗估）
+func estimatePromptTokens(messages []interface{}) int {
+	total := 0
+	for _, msg := range messages {
+		msgMap, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		total += 4 // role 等结构开销
+		switch c := msgMap["content"].(type) {
+		case string:
+			total += estimateTokens(c)
+		case []interface{}:
+			// content 数组（图片/文本块）
+			for _, block := range c {
+				if bm, ok := block.(map[string]interface{}); ok {
+					if t, ok := bm["text"].(string); ok {
+						total += estimateTokens(t)
+					} else if _, isImg := bm["image_url"]; isImg {
+						total += 800 // 图片粗略估算
+					} else if _, isImg2 := bm["image"]; isImg2 {
+						total += 800
+					}
+				}
+			}
+		}
+		// tool_calls 参数也计入
+		if tcs, ok := msgMap["tool_calls"].([]interface{}); ok {
+			for _, tc := range tcs {
+				if tm, ok := tc.(map[string]interface{}); ok {
+					if fn, ok := tm["function"].(map[string]interface{}); ok {
+						if args, ok := fn["arguments"].(string); ok {
+							total += estimateTokens(args)
+						}
+					}
+				}
+			}
+		}
+	}
+	return total
+}
+
 // -------------------- Ollama API: /api/chat --------------------
 func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
@@ -2749,6 +2852,29 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		setLastReasoningContent(reasoningContent)
 	}
 
+	// 提取上游 usage（真实 token 计数）
+	inputTokens := int64(0)
+	outputTokens := int64(0)
+	if usage, ok := upstreamResp["usage"].(map[string]interface{}); ok {
+		if pt, ok := usage["prompt_tokens"].(float64); ok && pt > 0 {
+			inputTokens = int64(pt)
+		}
+		if ct, ok := usage["completion_tokens"].(float64); ok && ct > 0 {
+			outputTokens = int64(ct)
+		}
+	}
+	// 上游未返回 usage 时本地估算，保证 VS Code 上下文占用显示不为 0
+	usageSource := "上游"
+	if inputTokens <= 0 {
+		inputTokens = int64(estimatePromptTokens(messages))
+		usageSource = "估算"
+	}
+	if outputTokens <= 0 {
+		outputTokens = int64(estimateTokens(content) + estimateTokens(reasoningContent))
+		usageSource = "估算"
+	}
+	fmt.Printf("🔢 Token [%s] 输入:%d 输出:%d (finish=%s)\n", usageSource, inputTokens, outputTokens, finishReason)
+
 	out := map[string]interface{}{
 		"model":             model,
 		"created_at":        time.Now().Format("2006-01-02T15:04:05"),
@@ -2757,8 +2883,8 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		"done_reason":       mapFinishReason(finishReason),
 		"total_duration":    1,
 		"load_duration":     1,
-		"prompt_eval_count": 1,
-		"eval_count":        1,
+		"prompt_eval_count": inputTokens,
+		"eval_count":        outputTokens,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2827,7 +2953,6 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	}
 	var accToolCalls []*accToolCall
 	hasToolCalls := false
-	isToolCallFinish := false
 	upstreamFinishReason := "" // 记录上游返回的 finish_reason
 
 	// 发送 Ollama 流式消息块
@@ -2921,11 +3046,10 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 		}
 
 		choice := chunk.Choices[0]
-		finishReason := choice.FinishReason
 
 		// 保存上游返回的 finish_reason（用于最终 done_reason）
-		if finishReason != nil && *finishReason != "" {
-			upstreamFinishReason = *finishReason
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			upstreamFinishReason = *choice.FinishReason
 		}
 
 		// 检查 delta 中是否包含 tool_calls
@@ -2995,11 +3119,6 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 			contentStarted = true
 			sendOllamaChunk(content, false, 0, nil, reasoningContent.String())
 		}
-
-		// 检查是否 tool_calls 结束
-		if finishReason != nil && *finishReason == "tool_calls" {
-			isToolCallFinish = true
-		}
 	}
 
 	if cfg.Log_Responses {
@@ -3011,15 +3130,42 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 		fmt.Println("UPSTREAM STREAM:", fullContent.String())
 	}
 
+	// 上游未返回 usage（很多中转流式不返回）时本地估算兜底，
+	// 保证 VS Code 上下文占用显示不为 0（VS Code 从 prompt_eval_count/eval_count 计算）
+	usageSource := "上游"
+	if inputTokens <= 0 {
+		if msgs, ok := payload["messages"].([]interface{}); ok {
+			inputTokens = estimatePromptTokens(msgs)
+		}
+		usageSource = "估算"
+	}
+	if outputTokens <= 0 {
+		outputTokens = estimateTokens(fullContent.String()) + estimateTokens(reasoningContent.String())
+		usageSource = "估算"
+	}
+	fmt.Printf("🔢 Token[%s] 输入:%d 输出:%d (finish=%s, tool_calls=%v)\n", usageSource, inputTokens, outputTokens, upstreamFinishReason, hasToolCalls)
+
 	// 构建最终消息
-	if hasToolCalls && isToolCallFinish {
+	// 注意：不再要求 finish_reason == "tool_calls" 才下发 tool_calls。
+	// 很多上游（qwen3 系列中转、部分网关）流式输出 tool_calls 后 finish_reason 返回
+	// "stop" 甚至缺失，旧逻辑会静默丢弃已累积的 tool_calls → 客户端收到空回复 →
+	// Agent 认为模型没调用工具而反复重试 → 死循环。
+	if hasToolCalls {
 		// 将累积的 tool_calls 转为 Ollama 格式
 		var ollamaTCs []OllamaToolCall
+		tcSeq := 0
 		for _, atc := range accToolCalls {
-			if atc == nil {
-				continue
+			if atc == nil || (atc.name == "" && atc.argsBld.Len() == 0) {
+				continue // 跳过空累积器
 			}
 			var otc OllamaToolCall
+			otc.ID = atc.id // 保留上游 id
+			if otc.ID == "" {
+				// 上游未给 id 时生成兜底 id（与非流式 extractToolCalls 保持一致），
+				// 客户端回传 assistant 消息时可直接与 tool 消息配对
+				tcSeq++
+				otc.ID = fmt.Sprintf("call_%d", tcSeq)
+			}
 			otc.Function.Name = atc.name
 			// arguments 是 JSON 字符串，转为对象
 			argsStr := atc.argsBld.String()
@@ -3446,6 +3592,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	inputTokens := 0
 	outputTokens := 0
 	msgStarted := false
+	streamClosed := false // 是否已发送 message_stop（防止重复收尾）
 
 	// 内容块跟踪：0=text, 1=tool_use...
 	type anthropicBlock struct {
@@ -3454,6 +3601,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 		started     bool
 		toolUseID   string
 		toolUseName string
+		accIndex    int // 对应 accToolCalls 累积器下标（-1 = 文本块），用于防重复开块
 	}
 	var blocks []*anthropicBlock
 	currentBlockIndex := 0
@@ -3590,6 +3738,11 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 		}
 
 		// --- 发送适当的 content_block 事件 ---
+		// 收尾后抑制：message_stop 已发出，后续 chunk（如 usage-only 残留 delta）
+		// 不得再发内容事件，否则破坏 SSE 事件顺序导致客户端解析混乱
+		if streamClosed {
+			continue
+		}
 
 		// 文本内容 delta
 		if deltaContent != "" {
@@ -3598,6 +3751,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				blocks = append(blocks, &anthropicBlock{
 					index:     currentBlockIndex,
 					blockType: "text",
+					accIndex:  -1,
 				})
 				currentBlockIndex++
 			}
@@ -3630,30 +3784,16 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			if atc == nil || (atc.id == "" && atc.name == "") {
 				continue
 			}
-			// 检查是否已经为此 tool_call 创建了块
+			// 检查是否已经为此 tool_call 创建了块（按累积器下标精确匹配，防止重复开块）
 			existingBlock := false
 			for _, b := range blocks {
-				if b.blockType == "tool_use" && b.toolUseID == atc.id && b.toolUseName == atc.name && atc.id != "" {
+				if b.blockType == "tool_use" && b.accIndex == i {
 					existingBlock = true
 					break
 				}
 			}
 			if existingBlock {
 				continue
-			}
-
-			// 检查之前是否已经为这个索引创建了块（通过 id 空匹配）
-			if atc.id == "" && atc.name != "" {
-				// 如果有任何 tool_use 块已存在，跳过
-				for _, b := range blocks {
-					if b.blockType == "tool_use" && b.index == i+100 {
-						existingBlock = true
-						break
-					}
-				}
-				if existingBlock {
-					continue
-				}
 			}
 
 			// 新开 tool_use 块
@@ -3667,6 +3807,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				blockType:   "tool_use",
 				toolUseID:   useID,
 				toolUseName: useName,
+				accIndex:    i,
 				started:     true,
 			})
 			currentBlockIndex++
@@ -3684,13 +3825,15 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 		}
 
 		// 发送 tool_use 的 input_json_delta
-		for _, atc := range accToolCalls {
+		// 注意：不能要求 atc.id != "" —— 部分上游流式 delta 不带 id，
+		// 此时按累积器索引匹配对应 block（block.accIndex 记录了创建时的累积器下标）
+		for i, atc := range accToolCalls {
 			if atc == nil || atc.argsBld.Len() == 0 {
 				continue
 			}
 			// 找到对应的 block
 			for _, b := range blocks {
-				if b.blockType == "tool_use" && b.toolUseID == atc.id && atc.id != "" {
+				if b.blockType == "tool_use" && b.accIndex == i {
 					sendSSEEvent(w, flusher, "content_block_delta", map[string]interface{}{
 						"type":  "content_block_delta",
 						"index": b.index,
@@ -3707,7 +3850,12 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 		}
 
 		// --- 结束标记 ---
-		if finishReason != nil {
+		// 注意：部分上游流式输出 tool_calls 后 finish_reason 返回 "stop" 或缺失，
+		// 若仅在 finishReason != nil 时收尾，流正常结束（EOF）但从未收到 finish_reason
+		// 会导致 message_stop 永远不发 → 客户端挂起/重试 → 死循环。
+		// 收到 finish_reason 时立即收尾；流结束后（循环外）若尚未收尾则强制收尾。
+		if finishReason != nil && !streamClosed {
+			streamClosed = true
 			// 发送所有已开始块的 content_block_stop
 			for _, b := range blocks {
 				if b.started {
@@ -3718,10 +3866,22 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 					b.started = false
 				}
 			}
+			stopReason := toAnthropicStopReason(*finishReason)
+			// 与非流式 convertOpenAIToAnthropic 保持一致：已发送 tool_use 块时
+			// 强制 stop_reason="tool_use"。部分上游（qwen3 中转）返回 tool_calls
+			// 却给 finish_reason=stop，客户端会误判"模型没调用工具"而重试 → 死循环
+			if stopReason != "tool_use" {
+				for _, atc := range accToolCalls {
+					if atc != nil && (atc.id != "" || atc.name != "") {
+						stopReason = "tool_use"
+						break
+					}
+				}
+			}
 			sendSSEEvent(w, flusher, "message_delta", map[string]interface{}{
 				"type": "message_delta",
 				"delta": map[string]interface{}{
-					"stop_reason":   toAnthropicStopReason(*finishReason),
+					"stop_reason":   stopReason,
 					"stop_sequence": nil,
 				},
 				"usage": map[string]interface{}{
@@ -3732,6 +3892,76 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				"type": "message_stop",
 			})
 		}
+	}
+
+	// 流结束兜底：上游从未给 finish_reason（EOF/[DONE] 直接结束）时强制收尾，
+	// 有 tool_use 块则按 tool_use 收尾，否则按 end_turn
+	if msgStarted && !streamClosed {
+		streamClosed = true
+		for _, b := range blocks {
+			if b.started {
+				sendSSEEvent(w, flusher, "content_block_stop", map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": b.index,
+				})
+				b.started = false
+			}
+		}
+		stopReason := "end_turn"
+		for _, atc := range accToolCalls {
+			if atc != nil && (atc.id != "" || atc.name != "") {
+				stopReason = "tool_use"
+				break
+			}
+		}
+		sendSSEEvent(w, flusher, "message_delta", map[string]interface{}{
+			"type": "message_delta",
+			"delta": map[string]interface{}{
+				"stop_reason":   stopReason,
+				"stop_sequence": nil,
+			},
+			"usage": map[string]interface{}{
+				"output_tokens": outputTokens,
+			},
+		})
+		sendSSEEvent(w, flusher, "message_stop", map[string]interface{}{
+			"type": "message_stop",
+		})
+	}
+
+	// 零 chunk 兜底：上游返回 200 但一个 delta 都没发（空响应/网关异常），
+	// 若什么都不发客户端会挂起并重试 → 死循环。补发一个完整的空消息。
+	if !msgStarted {
+		sendSSEEvent(w, flusher, "message_start", map[string]interface{}{
+			"type": "message_start",
+			"message": map[string]interface{}{
+				"id":            msgID,
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []interface{}{},
+				"model":         areq.Model,
+				"stop_reason":   "end_turn",
+				"stop_sequence": nil,
+				"usage": map[string]interface{}{
+					"input_tokens":  inputTokens,
+					"output_tokens": 0,
+				},
+			},
+		})
+		sendSSEEvent(w, flusher, "message_delta", map[string]interface{}{
+			"type": "message_delta",
+			"delta": map[string]interface{}{
+				"stop_reason":   "end_turn",
+				"stop_sequence": nil,
+			},
+			"usage": map[string]interface{}{
+				"output_tokens": 0,
+			},
+		})
+		sendSSEEvent(w, flusher, "message_stop", map[string]interface{}{
+			"type": "message_stop",
+		})
+		fmt.Println("⚠️ Anthropic 流式：上游零 chunk 响应，已补发空消息")
 	}
 
 	flusher.Flush()
@@ -3780,9 +4010,13 @@ func extractAnthropicContent(content interface{}) string {
 	}
 }
 
-// convertAnthropicContentToOpenAI 将 Anthropic 消息内容（含图片）转为 OpenAI 格式
+// convertAnthropicContentToOpenAI 将 Anthropic 消息内容（含图片/工具块）转为 OpenAI 格式
 // Anthropic 图片格式: {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"base64..."}}
 // OpenAI 图片格式: {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}
+// 工具块转换（Agent 工具调用闭环的关键，缺失会导致模型收不到工具结果而反复重试 → 死循环）：
+//
+//	assistant 的 tool_use 块 → OpenAI assistant.tool_calls
+//	user 的 tool_result 块   → OpenAI role:"tool" 消息（tool_call_id + content）
 func convertAnthropicContentToOpenAI(content interface{}) interface{} {
 	switch v := content.(type) {
 	case string:
@@ -3890,9 +4124,91 @@ func convertAnthropicToOpenAI(areq *AnthropicReq) ([]byte, error) {
 		})
 	}
 
-	// 转换每条消息（含图片处理）
+	// 转换每条消息（含图片/工具块处理）
+	// pendingToolUseIDs 必须在消息循环外声明：Anthropic 协议中 tool_result 块
+	// 总在下一条 user 消息里，跨消息才能消费前面 assistant.tool_use 声明的 id
+	var pendingToolUseIDs []string
 	for _, msg := range areq.Messages {
 		content := convertAnthropicContentToOpenAI(msg.Content)
+
+		// 处理工具调用闭环：
+		// 1) assistant 消息含 tool_use 块 → 转为 OpenAI tool_calls
+		// 2) user 消息含 tool_result 块 → 拆为 role:"tool" 消息（OpenAI 要求 tool 结果独立成条）
+		if blocks, ok := msg.Content.([]interface{}); ok {
+			var toolUses []map[string]interface{}    // assistant.tool_calls
+			var toolResults []map[string]interface{} // role:"tool" 消息
+			var textParts []string
+
+			for _, block := range blocks {
+				blockMap, ok := block.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				switch blockMap["type"] {
+				case "tool_use":
+					tcID, _ := blockMap["id"].(string)
+					name, _ := blockMap["name"].(string)
+					// input 是对象，序列化为 JSON 字符串（OpenAI 格式）
+					argsBytes, _ := json.Marshal(blockMap["input"])
+					toolUses = append(toolUses, map[string]interface{}{
+						"id":   tcID,
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      name,
+							"arguments": string(argsBytes),
+						},
+					})
+					// 记录 id 供后续 tool_result 兜底配对（Anthropic 客户端可能省略 id）
+					if tcID != "" {
+						pendingToolUseIDs = append(pendingToolUseIDs, tcID)
+					}
+				case "tool_result":
+					tcID, _ := blockMap["tool_use_id"].(string)
+					// content 可能是 string 或 [{type:"text",text:...}] 数组
+					resultText := extractAnthropicContent(blockMap["content"])
+					// tool_use_id 缺失时按顺序消费前面 tool_use 声明的 id（兜底配对）
+					if tcID == "" && len(pendingToolUseIDs) > 0 {
+						tcID = pendingToolUseIDs[0]
+						pendingToolUseIDs = pendingToolUseIDs[1:]
+					}
+					toolResults = append(toolResults, map[string]interface{}{
+						"role":         "tool",
+						"tool_call_id": tcID,
+						"content":      resultText,
+					})
+				case "text":
+					if text, ok := blockMap["text"].(string); ok && text != "" {
+						textParts = append(textParts, text)
+					}
+				}
+			}
+
+			// user 消息含 tool_result → 输出 tool 消息（可附带同条消息里的文本）
+			if len(toolResults) > 0 {
+				for _, tr := range toolResults {
+					messages = append(messages, tr)
+				}
+				if len(textParts) > 0 {
+					messages = append(messages, map[string]interface{}{
+						"role":    msg.Role,
+						"content": strings.Join(textParts, "\n"),
+					})
+				}
+				continue
+			}
+
+			// assistant 消息含 tool_use → 转为 tool_calls 格式
+			if len(toolUses) > 0 {
+				am := map[string]interface{}{
+					"role":       "assistant",
+					"content":    content,
+					"tool_calls": toolUses,
+				}
+				messages = append(messages, am)
+				continue
+			}
+		}
+
 		messages = append(messages, map[string]interface{}{
 			"role":    msg.Role,
 			"content": content,
@@ -3953,9 +4269,16 @@ func convertOpenAIToAnthropic(raw []byte, model string) ([]byte, error) {
 			// 提取 tool_calls → 转为 Anthropic tool_use 内容块
 			if tcRaw, ok := msg["tool_calls"]; ok {
 				if tcList, ok := tcRaw.([]interface{}); ok {
+					tcSeq := 0
 					for _, tc := range tcList {
 						if tcMap, ok := tc.(map[string]interface{}); ok {
 							toolUseID, _ := tcMap["id"].(string)
+							// id 缺失时生成兜底 id（Anthropic 客户端要求 tool_use.id 与
+							// tool_result.tool_use_id 配对，空 id 会导致死循环）
+							if toolUseID == "" {
+								tcSeq++
+								toolUseID = "toolu_" + generateMsgID() + fmt.Sprintf("_%d", tcSeq)
+							}
 							if funcRaw, ok := tcMap["function"].(map[string]interface{}); ok {
 								name, _ := funcRaw["name"].(string)
 								var input interface{} = funcRaw["arguments"]
@@ -3983,6 +4306,13 @@ func convertOpenAIToAnthropic(raw []byte, model string) ([]byte, error) {
 		if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
 			finishReason = toAnthropicStopReason(fr)
 		}
+	}
+
+	// 有 tool_use 块但 finish_reason 不是 tool_use 时强制修正：
+	// 部分上游（qwen3 中转等）返回 tool_calls 却给 finish_reason=stop，
+	// 客户端会误以为模型没调用工具而重试 → 死循环
+	if len(toolUseBlocks) > 0 && finishReason != "tool_use" {
+		finishReason = "tool_use"
 	}
 
 	// 提取 usage
