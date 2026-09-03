@@ -4111,6 +4111,45 @@ func hasImageInBody(body []byte) bool {
 	return false
 }
 
+// stripModelPrefixSuffix 剥离请求体中的模型名前缀/后缀
+// 客户端（VS Code Copilot 等）会用 /api/tags、/v1/models 返回的显示名
+// （含 OpenAI_Prefix/OpenAI_Suffix）发起请求，这里还原为上游真实模型 ID。
+// 支持 OpenAI /v1/chat/completions、Ollama /api/chat、Anthropic /v1/messages 三种格式。
+func stripModelPrefixSuffix(body []byte) []byte {
+	if len(body) == 0 || (cfg.OpenAIPrefix == "" && cfg.OpenAISuffix == "") {
+		return body
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	model, _ := req["model"].(string)
+	if model == "" {
+		return body
+	}
+
+	cleaned := model
+	if cfg.OpenAIPrefix != "" && strings.HasPrefix(cleaned, cfg.OpenAIPrefix) {
+		cleaned = strings.TrimPrefix(cleaned, cfg.OpenAIPrefix)
+	}
+	if cfg.OpenAISuffix != "" && strings.HasSuffix(cleaned, cfg.OpenAISuffix) {
+		cleaned = strings.TrimSuffix(cleaned, cfg.OpenAISuffix)
+	}
+	if cleaned == model {
+		return body
+	}
+
+	req["model"] = cleaned
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	fmt.Printf("🔧 模型名还原: %q → %q\n", model, cleaned)
+	return newBody
+}
+
 // applyRequestPromptReplace 对请求体中的 messages 进行提示词替换
 // 根据配置的 RequestPromptReplace 规则，查找并替换指定位置消息中的文本
 func applyRequestPromptReplace(body []byte) []byte {
@@ -4270,6 +4309,10 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 
 	// 应用请求提示词替换
 	body = applyRequestPromptReplace(body)
+
+	// 剥离模型名前缀/后缀：客户端会用显示名（含 OpenAI_Prefix/OpenAI_Suffix）发起请求，
+	// 必须还原为上游真实模型 ID，否则上游报 model_not_found
+	body = stripModelPrefixSuffix(body)
 
 	// 视觉代理：主模型不支持图片但配置了 VisionProxyModel 时，
 	// 先用代理模型识别图片，再把识别文本合并进请求（图片本身不再转发给主模型）
