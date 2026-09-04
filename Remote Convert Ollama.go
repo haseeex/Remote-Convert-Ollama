@@ -19,6 +19,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/gif"
+	"image/png"
 	"io"
 	"net/http"
 	"os"
@@ -52,6 +55,67 @@ type PromptReplaceRule struct {
 	Role    string `json:"role,omitempty"`  // 按角色定位（如 "system"）
 	Prompt  string `json:"prompt"`
 	Replace string `json:"replace"`
+}
+
+// ModelContextPrompt 配置：在请求中自动注入当前模型信息（模型ID/上下文长度/最大输出），
+// 让 AI 模型了解自身运行环境，帮助更合理地规划回复。
+// Position 支持：prepend（插入到首条 system 消息开头，无 system 则创建一条）/ append（追加到末尾）
+type ModelContextPrompt struct {
+	Enable   bool   `json:"Enable"`
+	Position string `json:"Position,omitempty"` // 插入位置：prepend（默认）/ append
+	Template string `json:"Template,omitempty"` // 模板，占位符 {model} {context_length} {max_output_tokens}
+}
+
+// 模型上下文注入位置常量
+const ctxPosPrepend = "prepend"
+const ctxPosAppend = "append"
+
+// normalizeCtxPos 规范化插入位置，非法值回退为 prepend
+func normalizeCtxPos(pos string) string {
+	if strings.ToLower(strings.TrimSpace(pos)) == ctxPosAppend {
+		return ctxPosAppend
+	}
+	return ctxPosPrepend
+}
+
+// defaultModelContextTemplate 默认模型上下文信息模板
+// 占位符：{model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉能力说明
+const defaultModelContextTemplate = "当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。"
+
+// getModelCapabilities 获取指定模型的能力列表：优先用 ModelDetailedSettings 中的 Capabilities，否则用全局 Capabilities
+func getModelCapabilities(model string) []string {
+	if setting, ok := cfg.ModelDetailedSettings[model]; ok && len(setting.Capabilities) > 0 {
+		return setting.Capabilities
+	}
+	return cfg.Capabilities
+}
+
+// buildVisionNote 生成视觉能力说明文本，区分原生支持 / 靠代理模型识别 / 不支持
+// 优先级：VisionProxyModel 优先——用户显式配置了视觉代理，说明实际视觉处理走代理
+// （Capabilities 声明 vision 可能只是为了客户端允许发图片，不代表模型原生支持）
+func buildVisionNote(model string) string {
+	if proxyModel, _, ok := getVisionProxySetting(model); ok {
+		return "不原生支持视觉，图片将由视觉代理模型 " + proxyModel + " 识别"
+	}
+	caps := getModelCapabilities(model)
+	if hasCapability(caps, "vision") {
+		return "视觉为原生支持"
+	}
+	return "不支持视觉"
+}
+
+// renderModelContextTemplate 将模板占位符替换为实际模型信息
+func renderModelContextTemplate(model string, ctxLen, maxOut int64, capsList, visionNote string) string {
+	tpl := strings.TrimSpace(cfg.ModelContextPrompt.Template)
+	if tpl == "" {
+		tpl = defaultModelContextTemplate
+	}
+	tpl = strings.ReplaceAll(tpl, "{model}", model)
+	tpl = strings.ReplaceAll(tpl, "{context_length}", fmt.Sprintf("%d", ctxLen))
+	tpl = strings.ReplaceAll(tpl, "{max_output_tokens}", fmt.Sprintf("%d", maxOut))
+	tpl = strings.ReplaceAll(tpl, "{capabilities}", capsList)
+	tpl = strings.ReplaceAll(tpl, "{vision}", visionNote)
+	return tpl
 }
 
 // 替换模式枚举常量
@@ -124,12 +188,54 @@ type Config struct {
 	RequestPromptReplace  map[string]PromptReplaceRule    `json:"RequestPromptReplace,omitempty"`
 	// VisionProxyPrompt 全局默认视觉代理提示词：模型未自定义 VisionProxyPrompt 时使用（留空=内置默认提示词）
 	VisionProxyPrompt string `json:"VisionProxyPrompt,omitempty"`
+	// ModelContextPrompt 模型上下文信息注入：自动附加当前模型信息到提示词，帮助模型自我认知
+	ModelContextPrompt ModelContextPrompt `json:"ModelContextPrompt,omitempty"`
 }
 
 var requestCount int64
 var clear map[string]func() //创建一个用于存储清除函数的映射
 
 var cfg Config
+
+// modelMetaCache 上游模型元数据缓存，避免每次请求都调用 /v1/models。
+// 配置加载/保存时刷新（getModelMetaCache 内部按需惰性刷新 + 配置变更时主动失效）。
+var (
+	modelMetaCache     map[string]upstreamModelMeta
+	modelMetaCacheInit bool
+	modelMetaCacheMu   sync.Mutex
+)
+
+// invalidateModelMetaCache 使模型元数据缓存失效，下次请求时重新获取
+func invalidateModelMetaCache() {
+	modelMetaCacheMu.Lock()
+	modelMetaCacheInit = false
+	modelMetaCacheMu.Unlock()
+}
+
+// getModelMetaCache 获取模型元数据缓存（惰性初始化；配置变更后可调用 invalidateModelMetaCache 刷新）
+func getModelMetaCache() map[string]upstreamModelMeta {
+	modelMetaCacheMu.Lock()
+	defer modelMetaCacheMu.Unlock()
+	if !modelMetaCacheInit {
+		modelMetaCache = fetchUpstreamModelMeta()
+		modelMetaCacheInit = true
+	}
+	return modelMetaCache
+}
+
+// getModelMetaFor 获取指定模型的元数据，未知模型返回默认值
+func getModelMetaFor(model string) (int64, int64) {
+	meta := getModelMetaCache()[model]
+	ctxLen := meta.ContextLength
+	maxOut := meta.MaxOutputTokens
+	if ctxLen <= 0 {
+		ctxLen = DefaultContextLength
+	}
+	if maxOut <= 0 {
+		maxOut = DefaultMaxOutputTokens
+	}
+	return ctxLen, maxOut
+}
 
 // storedOpenAIKey 保存 config.json 中持久化的 OPENAI_KEY（加密格式），
 // 供配置管理页面在用户未修改密钥时原样写回，避免密钥丢失
@@ -680,6 +786,41 @@ func detectImageMIME(b64 string) string {
 	}
 }
 
+// normalizeVisionImage 把可能不被视觉模型支持的 GIF 动图转换为 PNG 首帧，
+// 因为很多视觉模型（尤其中转网关）只接受静态 JPG/PNG/WebP，收到 GIF 会报 invalid image input。
+// 返回 (转换后的图, 是否发生了 GIF→PNG 转换)。
+// 若图片不是 GIF 或转换失败，原样返回（base64 不变，MIME 不变），converted=false。
+func normalizeVisionImage(img visionImage) (visionImage, bool) {
+	if img.MIME != "image/gif" {
+		return img, false
+	}
+	raw, err := base64.StdEncoding.DecodeString(img.Base64)
+	if err != nil {
+		return img, false // 解码失败，交给上游判断
+	}
+	in := bytes.NewReader(raw)
+	frame, err := gif.Decode(in)
+	if err != nil {
+		// 解码失败（可能 GIF 有特殊帧/格式），交给上游判断
+		return img, false
+	}
+	// 提取第一帧（gif.Decode 返回 image.Image 即首帧）并转为 RGBA 保证 PNG 编码完整
+	rgba := image.NewRGBA(frame.Bounds())
+	for i := 0; i < rgba.Bounds().Dx(); i++ {
+		for j := 0; j < rgba.Bounds().Dy(); j++ {
+			rgba.Set(i, j, frame.At(i, j))
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, rgba); err != nil {
+		return img, false
+	}
+	return visionImage{
+		Base64: base64.StdEncoding.EncodeToString(buf.Bytes()),
+		MIME:   "image/png",
+	}, true
+}
+
 // ==================== 视觉代理模型（Vision Proxy） ====================
 // 当主模型不支持图片（Capabilities 无 vision）但配置了 VisionProxyModel 时，
 // 先用视觉代理模型识别图片内容，再把识别文本合并进主模型请求，图片本身不再转发给主模型。
@@ -930,6 +1071,16 @@ func applyVisionProxy(body []byte, modelID string) ([]byte, bool) {
 			continue
 		}
 
+		// GIF 动图先转为 PNG 首帧（很多视觉模型/网关不接受 GIF，会报 invalid image input），
+		// 转换后再统一做缓存判断与识别，保证缓存键和识别数据一致。
+		for gi := range msgImages {
+			normalized, converted := normalizeVisionImage(msgImages[gi])
+			if converted {
+				fmt.Printf("🎞️ 视觉代理: 第 %d 张图片为 GIF 动图，已转换首帧为 PNG 再识别\n", gi+1)
+			}
+			msgImages[gi] = normalized
+		}
+
 		// 统一处理：每条含图片的消息都「缓存优先，未命中则识别」。
 		// 注意：不能只识别最后一条 user 消息的图片——图片可能出现在 system 消息、
 		// 或非最后一条 user 消息中（先发图 → AI 回复 → 文字追问），跳过会导致图片不识别。
@@ -1066,6 +1217,11 @@ func getDefaultConfig() Config {
 		ModelDetailedSettings: map[string]ModelDetailedSetting{}, // 模型详细设置：key=上游模型ID, value={ContextLength, MaxOutputTokens, Capabilities}
 		RequestPromptReplace:  map[string]PromptReplaceRule{},    // 请求提示词替换规则
 		VisionProxyPrompt:     defaultVisionProxyPrompt,          // 全局默认视觉代理提示词
+		ModelContextPrompt: ModelContextPrompt{
+			Enable:   false,
+			Position: ctxPosPrepend,
+			Template: defaultModelContextTemplate,
+		},
 	}
 }
 
@@ -1103,6 +1259,12 @@ func printConfigHelp() {
 	fmt.Println("                       role 单独  → 替换所有匹配 role 的消息")
 	fmt.Println("                       index 单独 → 按索引取第 N 条替换")
 	fmt.Println("                     示例: {\"替换系统提示词\": {\"enable\": true, \"role\": \"system\", \"index\": 0, \"prompt\": \"你是一个AI\", \"replace\": \"你是助手\"}}")
+	fmt.Println(" ▼ ModelContextPrompt : 模型上下文信息注入,在提示词中附加当前模型信息,帮助模型自我认知")
+	fmt.Println("                     格式: {Enable: 开关, Position: 插入位置(prepend=插入到首条system之前/无system则新建, append=追加到末尾), Template: 模板}")
+	fmt.Println("                     模板占位符: {model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉能力说明(原生/代理/不支持)")
+	fmt.Println("                     模型信息来自上游 /v1/models 元数据与 ModelDetailedSettings 手动配置(手动优先);能力优先用模型 Capabilities,否则用全局")
+	fmt.Println("                     视觉说明自动判断:Capabilities含vision=原生支持;否则若配置 VisionProxyModel=由该代理模型识别;否则=不支持")
+	fmt.Println("                     示例: {\"Enable\": true, \"Position\": \"prepend\", \"Template\": \"你运行在{model}上,上下文{context_length},最大输出{max_output_tokens},能力{capabilities},{vision}\"}")
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════════════════════════════════")
 	fmt.Println("")
 }
@@ -1275,6 +1437,13 @@ func loadConfig() {
 	if _, ok := rawMap["VisionProxyPrompt"]; !ok {
 		stored.VisionProxyPrompt = defaultCfg.VisionProxyPrompt
 		needSave = true
+	}
+	if _, ok := rawMap["ModelContextPrompt"]; !ok {
+		stored.ModelContextPrompt = defaultCfg.ModelContextPrompt
+		needSave = true
+	} else {
+		// 规范化插入位置
+		stored.ModelContextPrompt.Position = normalizeCtxPos(stored.ModelContextPrompt.Position)
 	}
 	// 迁移旧版替换规则：force / replaceWhole 布尔字段 → mode 枚举
 	if migrateRequestPromptReplace(&stored, rawMap) {
@@ -1845,6 +2014,8 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	storedOpenAIKey = newCfg.OpenAIKey
 	applyConfigToRuntime(newCfg)
 	cfg.OpenAIKey = plainKey
+	// 模型详细信息可能变化 → 使缓存失效，下次请求重新获取
+	invalidateModelMetaCache()
 
 	// 访问密码已变更 → 清除所有已签发会话，强制所有用户重新登录
 	if pwChanged {
@@ -1876,6 +2047,9 @@ func applyConfigToRuntime(newCfg Config) {
 	cfg.ModelDetailedSettings = newCfg.ModelDetailedSettings
 	cfg.RequestPromptReplace = newCfg.RequestPromptReplace
 	cfg.VisionProxyPrompt = newCfg.VisionProxyPrompt
+	// 规范化插入位置并应用
+	newCfg.ModelContextPrompt.Position = normalizeCtxPos(newCfg.ModelContextPrompt.Position)
+	cfg.ModelContextPrompt = newCfg.ModelContextPrompt
 }
 
 // apiTestConfig 测试上游 API 连通性并返回模型列表
@@ -4150,6 +4324,79 @@ func stripModelPrefixSuffix(body []byte) []byte {
 	return newBody
 }
 
+// injectModelContextPrompt 在请求体中注入当前模型信息提示词（模型ID/上下文长度/最大输出）。
+// 让 AI 模型了解自身运行环境，更合理地规划思考和输出长度。
+// Position 支持 prepend（插入到首条 system 消息开头，无 system 则新建）/ append（追加到末尾）。
+// 支持 OpenAI / Ollama chat 的 messages 数组格式。
+func injectModelContextPrompt(body []byte, model string) []byte {
+	if !cfg.ModelContextPrompt.Enable || model == "" || len(body) == 0 {
+		return body
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	rawMessages, ok := req["messages"].([]interface{})
+	if !ok {
+		// 非 messages 格式（如 Ollama 单条 prompt 或其它协议）不注入
+		return body
+	}
+
+	ctxLen, maxOut := getModelMetaFor(model)
+	capsList := strings.Join(getModelCapabilities(model), ", ")
+	if capsList == "" {
+		capsList = "无"
+	}
+	visionNote := buildVisionNote(model)
+	info := renderModelContextTemplate(model, ctxLen, maxOut, capsList, visionNote)
+	if strings.TrimSpace(info) == "" {
+		return body
+	}
+
+	position := normalizeCtxPos(cfg.ModelContextPrompt.Position)
+	if position == ctxPosAppend {
+		rawMessages = append(rawMessages, map[string]interface{}{
+			"role":    "system",
+			"content": info,
+		})
+	} else {
+		// prepend：插入到首条 system 消息内容开头；若没有 system 消息，则在最前面新建一条
+		systemInfo := "【运行环境】" + info
+		inserted := false
+		for _, rawMsg := range rawMessages {
+			msg, ok := rawMsg.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if role, _ := msg["role"].(string); role == "system" {
+				if content, ok := msg["content"].(string); ok {
+					msg["content"] = systemInfo + "\n\n" + content
+					inserted = true
+					break
+				}
+			}
+		}
+		if !inserted {
+			// 没有 system 消息，在数组最前面新建一条
+			newMsg := []interface{}{map[string]interface{}{
+				"role":    "system",
+				"content": systemInfo,
+			}}
+			rawMessages = append(newMsg, rawMessages...)
+		}
+	}
+
+	req["messages"] = rawMessages
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	fmt.Printf("🧭 模型上下文注入 [%s]: %s\n", model, info)
+	return newBody
+}
+
 // applyRequestPromptReplace 对请求体中的 messages 进行提示词替换
 // 根据配置的 RequestPromptReplace 规则，查找并替换指定位置消息中的文本
 func applyRequestPromptReplace(body []byte) []byte {
@@ -4307,12 +4554,21 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Println("================================")
 
-	// 应用请求提示词替换
-	body = applyRequestPromptReplace(body)
-
 	// 剥离模型名前缀/后缀：客户端会用显示名（含 OpenAI_Prefix/OpenAI_Suffix）发起请求，
 	// 必须还原为上游真实模型 ID，否则上游报 model_not_found
 	body = stripModelPrefixSuffix(body)
+
+	// 应用请求提示词替换（先执行，避免后加的模型信息被替换规则的 force/whole 整段覆盖）
+	body = applyRequestPromptReplace(body)
+
+	// 模型上下文信息注入：让 AI 了解自身模型/上下文/输出长度，辅助自我认知（最后执行，保证注入稳定不被替换规则误伤）
+	var curModel struct {
+		Model string `json:"model"`
+	}
+	json.Unmarshal(body, &curModel)
+	if curModel.Model != "" && cfg.ModelContextPrompt.Enable {
+		body = injectModelContextPrompt(body, curModel.Model)
+	}
 
 	// 视觉代理：主模型不支持图片但配置了 VisionProxyModel 时，
 	// 先用代理模型识别图片，再把识别文本合并进请求（图片本身不再转发给主模型）

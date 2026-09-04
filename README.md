@@ -8,8 +8,8 @@
 <h1 align="center">🐭 Remote API Convert Ollama</h1>
 
 <p align="center">
-  <b>将任意 OpenAI 兼容 API 转换为 Ollama API / Anthropic API 的本地反代网关</b><br>
-  <sub>让 VS Code Copilot 和 VS2026 能够使用第三方 OpenAI 兼容接口</sub>
+  <b>把任意 OpenAI 兼容 API 变成你的专属 AI 网关——不只是转换协议，更是夺舍与增强</b><br>
+  <sub>让 VS Code Copilot、VS2026 及一切 OpenAI 兼容客户端，都能用第三方接口并拥有超能力</sub>
 </p>
 
 <p align="center">
@@ -25,9 +25,16 @@
 
 ## 📖 概述
 
-**Remote API Convert Ollama** 是一个用 Go 编写的轻量级本地反向代理服务器。它监听在本地（或局域网）的 Ollama 兼容端口上，将 **Ollama API** 和 **Anthropic Messages API** 的请求实时转换为 **OpenAI 兼容 API** 请求，并转发到上游服务。
+**Remote API Convert Ollama** 是一个用 Go 编写的轻量级本地 AI 网关。它监听在本地（或局域网）的 Ollama 兼容端口上，将 **Ollama API** 和 **Anthropic Messages API** 的请求实时转换为 **OpenAI 兼容 API** 请求并转发到上游——同时，它更像一个"流量中间人"，能在请求经过时**主动改造对话**。
 
-> 💡 **简单来说**：你只需在 VS Code / VS2026 中配置 Ollama 作为 API 提供商，然后指向本程序，就能使用任何 **OpenAI 兼容的 API 服务**（如 DeepSeek、GPT、Claude 等）。
+除了协议转换，它还能在毫秒级拦截中做这些事：
+
+- 🧭 **告诉 AI 它是谁**：把模型ID、上下文长度、最大输出、能力（工具/视觉/视觉代理）注入提示词，让 AI 自我认知
+- ✂️ **夺舍 AI 人格**：替换/注入系统提示词，把 Copilot 改造成"亚丝娜"，移除微软的限制指令
+- 🖼️ **无中生有视觉**：主模型不支持图片时，自动用视觉代理模型识别后合并文本返回
+- 🛠️ **打通工具调用**：Ollama / OpenAI / Anthropic 三种格式的工具调用互相转换，解决 Agent 死循环
+
+> 💡 **简单来说**：你只需在 VS Code / VS2026 中配置 Ollama 作为 API 提供商，然后指向本程序，就能使用任何 **OpenAI 兼容的 API 服务**（如 DeepSeek、GPT、Claude 等）——并且还能把任何一个模型"调教"成你想要的样子。
 
 ---
 
@@ -39,6 +46,7 @@
 | ❌ VS2026 仅内置支持 OpenAI + Azure + Anthropic 官方   | ✅ 同时提供 Ollama API + Anthropic Messages API 两种接入方式 |
 | ❌ 官方限制多、地区不可用、价格高昂                    | ✅ 自由选择任意第三方 OpenAI 兼容服务商                      |
 | ❌ API Key 明文存储有泄露风险                          | ✅ AES-GCM 加密存储，绑定机器指纹 + UUID 双重校验            |
+| ❌ 模型被厂商"驯化"，不敢越界、不知道自己的能力     | ✅ 在请求中间层注入人格 + 自我认知，把任何模型"调教"成你想要的样子 |
 
 ---
 
@@ -95,6 +103,7 @@
 - **模型详细设置**：`ModelDetailedSettings` 支持为每个模型单独指定上下文长度、最大输出 Token 和能力列表
 - **视觉代理模型**：`VisionProxyModel` 为主模型指定视觉代理，图片请求自动识别后合并文本，识别结果本地缓存防重复消耗 token
 - **请求提示词替换**：`RequestPromptReplace` 支持自动替换请求消息中的指定文本，实现 Copilot 自有提示词篡改等高级玩法
+- **模型上下文注入**：`ModelContextPrompt` 在对话时自动把当前模型信息（模型ID/上下文长度/最大输出/能力/视觉说明）注入提示词，让 AI 自我认知，更合理地规划思考与输出长度
 
 ---
 
@@ -171,6 +180,12 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
             "prompt": "你要替换的原文",
             "replace": "替换后的文本"
         }
+    },
+    "VisionProxyPrompt": "请仔细查看这张图片，用简体中文详细描述图片中的全部内容。",
+    "ModelContextPrompt": {
+        "Enable": true,
+        "Position": "prepend",
+        "Template": "当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。"
     }
 }
 ```
@@ -193,6 +208,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `ModelDetailedSettings` | 模型详细设置`{上游ID: {ContextLength, MaxOutputTokens, Capabilities, VisionProxyModel, VisionProxyPrompt}}` | `{}`                                 |
 | `VisionProxyPrompt`    | 全局默认视觉代理提示词（模型未自定义时使用）                                       | 内置默认提示词                       |
 | `RequestPromptReplace`  | 请求提示词替换规则`{规则名: {enable, mode, role, index, prompt, replace}}`   | `{}`                                 |
+| `ModelContextPrompt`   | 模型上下文信息注入`{Enable, Position, Template}`                         | `{Enable:false, Position:"prepend", Template:内置默认}` |
 
 **`StreamMode` 说明**：
 
@@ -258,10 +274,11 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | ---------------------------- | ---------------------------------------------------------------------------------- |
 | 📡**上游 API**         | 修改`OPENAI_BASE`，密钥输入明文后**自动加密保存**（留空表示保持当前密钥）  |
 | 🔌**测试连接**         | 一键测试上游连通性，显示上游可用模型列表                                           |
-| �**访问密码**         | 设置`WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改） |
+| 🔒**访问密码**         | 设置`WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改） |
 | 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            |
 | 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
 | 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                         |
+| 🧭**模型上下文注入** | 可视化配置`ModelContextPrompt`（开关、插入位置、模板）                            |
 | 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                      |
 | 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力、视觉代理模型与提示词）                  |
 | ✂️**提示词替换规则** | 可视化增删`RequestPromptReplace` 规则                                            |
@@ -333,6 +350,10 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
                        role+index → 先按 role 过滤,再取第 N 条替换
                        role 单独  → 替换所有匹配 role 的消息
                        index 单独 → 按索引取第 N 条替换
+ ▼ ModelContextPrompt : 模型上下文信息注入,在提示词中附加当前模型信息,帮助模型自我认知
+                     格式: {Enable, Position(prepend/append), Template}
+                     模板占位符: {model} {context_length} {max_output_tokens} {capabilities} {vision}
+                     {vision} 自动判断: 配置了视觉代理→"图片由代理模型识别"; 否则Capabilities含vision→"原生支持"; 否则→"不支持"
 ════════════════════════════════════════════════════════════
 
 📋 上游拥有的模型:
@@ -376,7 +397,31 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 - 识别结果按「图片内容 + 提示词」哈希缓存到 `vision_cache/` 目录，重复图片直接命中缓存，不浪费 token
 - 适用于上游 API 不返回元数据或返回不准确的场景
 
-### � 请求提示词替换
+### 🧭 模型上下文注入
+
+通过 `ModelContextPrompt` 你可以让模型在对话中"知道"自己的运行环境，包括模型ID、上下文窗口长度、最大输出 token 数和能力，从而更合理地规划思考和输出（例如知道上下文有 1M、最大输出 384K，就会放心写更长更完整的内容）。
+
+示例配置：
+
+```json
+"ModelContextPrompt": {
+    "Enable": true,
+    "Position": "prepend",
+    "Template": "当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。"
+}
+```
+
+注入后的实际效果（假设模型配置了视觉代理，会自动点明）：
+
+```
+【运行环境】当前你运行在 ollama-deepseek-v4-flash:0731 模型上，上下文窗口长度 1000000 tokens，
+单次最大输出 384000 tokens，支持的能力：tools, vision。
+不原生支持视觉，图片将由视觉代理模型 gemma4:31b 识别。请据此合理分配你的思考和输出长度。
+```
+
+> 💡 **视觉说明自动判断**：只要该模型配置了 `VisionProxyModel`，即使 `Capabilities` 里声明了 `vision`，也会如实标注"图片由代理模型识别"——因为实际视觉处理确实走的是代理。
+
+### ✂️ 请求提示词替换
 
 通过 `RequestPromptReplace` 你可以自动篡改客户端发来的请求消息中的指定文本，适用于以下场景：
 
@@ -451,7 +496,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 
 > 💡 **提示**：替换规则按 `role+index` 的精确定位，只影响特定消息的文本内容，不影响消息结构。
 
-### �🛡️ 自定义加密 UUID
+###🛡️ 自定义加密 UUID
 
 修改源码中的 `secretUUID` 常量，使用 [UUID Generator](https://www.uuidgenerator.net/) 生成自己的 UUID，增强加密安全性。
 
@@ -477,6 +522,9 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 Remote Convert Ollama/
 ├── Remote Convert Ollama.go   # 主程序源码
 ├── config.json                # 配置文件（首次运行自动生成）
+├── web/config.html            # 可视化配置管理页面源码（go:embed 内嵌）
+├── images/                    # README 预览截图
+├── vision_cache/              # 视觉代理识别结果缓存目录
 ├── 构建.bat                   # Windows 混淆编译脚本
 ├── 构建(加密和压缩).bat       # Windows 混淆编译+压缩脚本
 ├── README.md                  # 本文件
