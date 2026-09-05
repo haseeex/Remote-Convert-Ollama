@@ -2827,7 +2827,37 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		// 重新序列化（因为可能修改了 message）
+		// 上游未返回 usage（部分中转不返回）时本地估算注入，
+		// 保证 VS Code 上下文窗口占用显示不为 0
+		if usage, ok := upstreamResp["usage"].(map[string]interface{}); !ok || len(usage) == 0 {
+			// 从请求体提取消息列表估算输入 token
+			var reqMeta struct {
+				Messages []interface{} `json:"messages"`
+			}
+			json.Unmarshal(body, &reqMeta)
+			inputTokens := estimatePromptTokens(reqMeta.Messages)
+			// 从响应估算输出 token（正文 + 思考）
+			outputTokens := 0
+			if choices, ok := upstreamResp["choices"].([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if msg, ok := choice["message"].(map[string]interface{}); ok {
+						if c, ok := msg["content"].(string); ok {
+							outputTokens += estimateTokens(c)
+						}
+						if rc, ok := msg["reasoning_content"].(string); ok {
+							outputTokens += estimateTokens(rc)
+						}
+					}
+				}
+			}
+			upstreamResp["usage"] = map[string]interface{}{
+				"prompt_tokens":     inputTokens,
+				"completion_tokens": outputTokens,
+				"total_tokens":      inputTokens + outputTokens,
+			}
+			fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
+		}
+		// 重新序列化（因为可能修改了 message / usage）
 		if modified, _ := json.Marshal(upstreamResp); modified != nil {
 			raw = modified
 		}
@@ -2888,6 +2918,19 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	reader := bufio.NewReader(resp.Body)
 	loggedContent := strings.Builder{}
 	thinkingDone := false // 标记 thinking 是否已结束（收到 content 后关闭 reasoning_text 注入）
+	// usage 追踪：上游流式可能只在末尾发 usage-only chunk，也可能完全不发，
+	// 需要记录并转发/兜底，保证 VS Code 上下文窗口占用显示不为 0
+	hasUpstreamUsage := false
+	// 预解析请求消息列表，用于上游未返回 usage 时的本地估算兜底
+	var requestMessages []interface{}
+	{
+		var reqMeta struct {
+			Messages []interface{} `json:"messages"`
+		}
+		if json.Unmarshal(body, &reqMeta) == nil {
+			requestMessages = reqMeta.Messages
+		}
+	}
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -2937,11 +2980,28 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 			continue
 		}
 
-		// usage-only chunk 跳过
-		if len(rawChunk.Choices) == 0 && rawChunk.Usage != nil {
-			if cfg.Log_Responses {
-				fmt.Println("UPSTREAM SSE: usage-only chunk skipped")
+		// 解析 chunk 中的 usage（部分上游在末尾发 usage-only chunk，部分在普通 chunk 里附带）
+		var chunkUsage map[string]interface{}
+		if rawChunk.Usage != nil {
+			_ = json.Unmarshal(*rawChunk.Usage, &chunkUsage)
+			if len(chunkUsage) > 0 {
+				hasUpstreamUsage = true
 			}
+		}
+
+		// usage-only chunk：不能跳过，必须转发给客户端。
+		// VS Code Copilot 依赖流末尾的 usage chunk 更新上下文窗口占用，
+		// 跳过会导致上下文占用一直显示 0。
+		if len(rawChunk.Choices) == 0 && len(chunkUsage) > 0 {
+			payload := map[string]interface{}{
+				"id":      rawChunk.ID,
+				"object":  rawChunk.Object,
+				"created": rawChunk.Created,
+				"model":   rawChunk.Model,
+				"choices": []interface{}{},
+				"usage":   chunkUsage,
+			}
+			out(payload)
 			continue
 		}
 
@@ -2995,8 +3055,31 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 				"model":   rawChunk.Model,
 				"choices": []map[string]interface{}{choicePayload},
 			}
+			if len(chunkUsage) > 0 {
+				payload["usage"] = chunkUsage
+			}
 			out(payload)
 		}
+	}
+
+	// 上游从未返回 usage（很多中转流式不返回）时本地估算兜底：
+	// 补发一个 usage-only chunk，保证 VS Code 上下文窗口占用显示不为 0
+	if !hasUpstreamUsage {
+		inputTokens := estimatePromptTokens(requestMessages)
+		outputTokens := estimateTokens(loggedContent.String())
+		out(map[string]interface{}{
+			"id":      "",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   "",
+			"choices": []interface{}{},
+			"usage": map[string]interface{}{
+				"prompt_tokens":     inputTokens,
+				"completion_tokens": outputTokens,
+				"total_tokens":      inputTokens + outputTokens,
+			},
+		})
+		fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
 	}
 
 	if cfg.Log_Responses && loggedContent.Len() > 0 {
@@ -3054,7 +3137,7 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. 转换响应体 OpenAI → Anthropic
-	anthropicBody, convErr := convertOpenAIToAnthropic(raw, areq.Model)
+	anthropicBody, convErr := convertOpenAIToAnthropic(raw, areq.Model, openaiBody)
 	if convErr != nil {
 		fmt.Println("Anthropic 转换失败:", convErr)
 		// 降级：透传原始响应
@@ -3141,6 +3224,17 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 		return
 	}
 
+	// 预估算输入 token（上游未返回 usage 时兜底，保证客户端上下文窗口占用显示不为 0）
+	estimatedInputTokens := 0
+	{
+		var oaiReq struct {
+			Messages []interface{} `json:"messages"`
+		}
+		if json.Unmarshal(openaiBody, &oaiReq) == nil {
+			estimatedInputTokens = estimatePromptTokens(oaiReq.Messages)
+		}
+	}
+
 	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(openaiBody))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -3178,10 +3272,21 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	}
 
 	msgID := "msg_" + generateMsgID()
-	inputTokens := 0
+	// 先以估算值兜底：上游返回 usage 后会被真实值覆盖
+	inputTokens := estimatedInputTokens
 	outputTokens := 0
 	msgStarted := false
-	streamClosed := false // 是否已发送 message_stop（防止重复收尾）
+	streamClosed := false        // 是否已发送 message_stop（防止重复收尾）
+	var fullText strings.Builder // 累积输出文本，用于上游未返回 usage 时的输出估算
+	// 获取输出 token：上游未返回时本地估算兜底（保证客户端上下文窗口占用显示不为 0）
+	getOutputTokens := func() int {
+		if outputTokens > 0 {
+			return outputTokens
+		}
+		est := estimateTokens(fullText.String())
+		fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, est)
+		return est
+	}
 
 	// 内容块跟踪：0=text, 1=tool_use...
 	type anthropicBlock struct {
@@ -3335,6 +3440,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 
 		// 文本内容 delta
 		if deltaContent != "" {
+			fullText.WriteString(deltaContent)
 			// 检查当前是否需要新开一个 text block
 			if len(blocks) == 0 || blocks[len(blocks)-1].blockType != "text" {
 				blocks = append(blocks, &anthropicBlock{
@@ -3474,7 +3580,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 					"stop_sequence": nil,
 				},
 				"usage": map[string]interface{}{
-					"output_tokens": outputTokens,
+					"output_tokens": getOutputTokens(),
 				},
 			})
 			sendSSEEvent(w, flusher, "message_stop", map[string]interface{}{
@@ -3510,7 +3616,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				"stop_sequence": nil,
 			},
 			"usage": map[string]interface{}{
-				"output_tokens": outputTokens,
+				"output_tokens": getOutputTokens(),
 			},
 		})
 		sendSSEEvent(w, flusher, "message_stop", map[string]interface{}{
@@ -3833,7 +3939,8 @@ func convertAnthropicToOpenAI(areq *AnthropicReq) ([]byte, error) {
 }
 
 // 转换 OpenAI 响应 → Anthropic 响应
-func convertOpenAIToAnthropic(raw []byte, model string) ([]byte, error) {
+// reqBody 为转换后的 OpenAI 请求体：上游未返回 usage 时用于本地估算输入 token
+func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte, error) {
 	var upstreamResp map[string]interface{}
 	if err := json.Unmarshal(raw, &upstreamResp); err != nil {
 		return nil, err
@@ -3912,6 +4019,22 @@ func convertOpenAIToAnthropic(raw []byte, model string) ([]byte, error) {
 		if ct, ok := usage["completion_tokens"].(float64); ok {
 			outputTokens = int(ct)
 		}
+	}
+
+	// 上游未返回 usage（部分中转不返回）时本地估算兜底，
+	// 保证 Anthropic 客户端（VS Code）上下文窗口占用显示不为 0
+	if inputTokens <= 0 || outputTokens <= 0 {
+		if inputTokens <= 0 {
+			var reqMeta struct {
+				Messages []interface{} `json:"messages"`
+			}
+			json.Unmarshal(reqBody, &reqMeta)
+			inputTokens = estimatePromptTokens(reqMeta.Messages)
+		}
+		if outputTokens <= 0 {
+			outputTokens = estimateTokens(textContent)
+		}
+		fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
 	}
 
 	id := "msg_" + generateMsgID()
