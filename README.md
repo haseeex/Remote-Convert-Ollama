@@ -66,6 +66,18 @@
 | `GET /v1/models`                 | →`GET /v1/models` (上游)            | 获取上游模型列表                            |
 | `GET /models`                    | →`GET /v1/models` (上游)            | VS Code 旧版 API 兼容                       |
 
+### 🧩 客户端接入方式
+
+本服务端对外提供 **三种 API 类型**，客户端按自己支持的协议**任选其一**连接即可——无论走哪种入口，程序都会统一转换为 **OpenAI 兼容 API** 转发给上游（`OPENAI_BASE`）：
+
+| 客户端接口类型                 | 连接地址（示例）                    | 典型客户端                                                                       | 说明                                             |
+| ------------------------------ | ----------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------ |
+| 🔵 **Ollama API**          | `http://127.0.0.1:11434`（`/api/chat`、`/api/tags`、`/api/version`、`/api/show`） | VS Code Copilot Chat、VS2026（Ollama 后端） | 最常用入口，Ollama 生态客户端开箱即用，零配置     |
+| 🟢 **OpenAI 兼容 API**    | `http://127.0.0.1:11434/v1`（`/v1/chat/completions`、`/v1/models`）               | 一切支持 OpenAI 格式的客户端（NextChat、Cherry Studio、LobeChat、自定义脚本等）   | 把 Base URL 指向本机 `/v1` 即可，无需任何转换     |
+| 🟣 **Anthropic Messages API** | `http://127.0.0.1:11434/v1`（`/v1/messages`、`/v1/messages/count_tokens`）       | 支持 Anthropic 格式的客户端（如 VS2026 Anthropic 后端）                          | 自动完成 Anthropic → OpenAI 转换后转发上游 |
+
+> 💡 **简单总结**：上游只需要是 **OpenAI 兼容 API**；而你的客户端无论是只认 **Ollama**、只认 **OpenAI**、还是只认 **Anthropic** 协议，都能直接连本服务端，协议差异由程序在中间自动转换。
+
 ### 🖥️ VS Code & VS2026 完美兼容
 
 - ✅ **Capabilities 声明** — 向客户端声明支持 `tools`、`vision` 等能力
@@ -313,6 +325,46 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 2. 选择 **Ollama** 作为后端
 3. 设置服务器地址为 `http://127.0.0.1:11434`
 4. 选择需要的模型开始使用
+
+#### ⚠️ VS2026 添加 OpenAI 第三方模型（手动编辑配置）
+
+VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手动添加第三方 OpenAI 模型**，只能通过手动编辑配置文件实现。配置文件位置：
+
+```
+%USERPROFILE%\AppData\Local\Microsoft\VisualStudio\Copilot\BringYourOwnModel\ConfiguredBringYourOwnModel_v2.json
+```
+
+> `%USERPROFILE%` 是 Windows 环境变量（通常为 `C:\Users\你的用户名`），资源管理器地址栏可直接粘贴上面的路径打开。
+
+在 `Models` 数组中按以下格式添加条目（模型 ID 需与程序终端「📋 上游拥有的模型」中显示的 ID 一致）：
+
+```json
+{
+    "ProviderName": "openai",
+    "IsCustom": true,
+    "IsSelected": true,
+    "CustomURL": "http://127.0.0.1:11434/v1",
+    "Id": "你的模型ID",
+    "DisplayName": "🥰 你的模型ID",
+    "IsToolCallingEnabled": true,
+    "IsVisionEnabled": true,
+    "MaxInputTokens": 1000000,
+    "MaxOutputTokens": 65536
+}
+```
+
+| 字段                     | 说明                                                         |
+| ------------------------ | ------------------------------------------------------------ |
+| `ProviderName`           | 提供方名称，OpenAI 协议固定填 `"openai"`                     |
+| `CustomURL`              | 本程序 OpenAI 接入地址，固定填 `http://127.0.0.1:11434/v1` |
+| `Id` / `DisplayName`     | 模型 ID 与显示名称（支持 emoji 前缀）                        |
+| `IsToolCallingEnabled`   | 是否启用工具调用（本程序支持，填 `true`）                    |
+| `IsVisionEnabled`        | 是否启用视觉（需模型支持 `vision` 能力或配置了视觉代理）     |
+| `MaxInputTokens` / `MaxOutputTokens` | 上下文长度与最大输出 Token（需与程序配置一致） |
+
+> 📝 **提示**：模型列表可在程序终端或配置页面（📡 上游 API → 🔌 测试连接）中查看；修改配置文件后需**重启 VS2026** 才能生效。
+
+> 💡 **其他客户端**：如果你用的是支持 **OpenAI** 或 **Anthropic** 协议的客户端，同样可以直接连本服务端——Base URL 填 `http://127.0.0.1:11434/v1` 即可（详见上文「🧩 客户端接入方式」）。
 
 ---
 
