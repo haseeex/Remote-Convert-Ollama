@@ -190,12 +190,100 @@ type Config struct {
 	VisionProxyPrompt string `json:"VisionProxyPrompt,omitempty"`
 	// ModelContextPrompt 模型上下文信息注入：自动附加当前模型信息到提示词，帮助模型自我认知
 	ModelContextPrompt ModelContextPrompt `json:"ModelContextPrompt,omitempty"`
+	// ConnPool 上游连接池设置（HTTP/2 + keep-alive），保存后立即生效，无需重启
+	ConnPool ConnPool `json:"ConnPool,omitempty"`
+}
+
+// ConnPool 上游连接池设置（HTTP/2 + keep-alive 连接复用）
+// 各字段为 0 时回退为内置默认值；保存后立即生效（重建连接池，无需重启）
+type ConnPool struct {
+	MaxIdleConns           int  `json:"MaxIdleConns"`           // 全局最大空闲连接数
+	MaxIdleConnsPerHost    int  `json:"MaxIdleConnsPerHost"`    // 每上游主机最大空闲连接数
+	MaxConnsPerHost        int  `json:"MaxConnsPerHost"`        // 每上游主机最大并发连接数
+	IdleConnTimeoutSec     int  `json:"IdleConnTimeoutSec"`     // 空闲连接回收时间（秒）
+	TLSHandshakeTimeoutSec int  `json:"TLSHandshakeTimeoutSec"` // TLS 握手超时（秒）
+	ForceHTTP2             bool `json:"ForceHTTP2"`             // 强制协商 HTTP/2（HTTPS 上游）
+}
+
+// defaultConnPool 连接池内置默认值
+var defaultConnPool = ConnPool{
+	MaxIdleConns:           100,
+	MaxIdleConnsPerHost:    32,
+	MaxConnsPerHost:        64,
+	IdleConnTimeoutSec:     90,
+	TLSHandshakeTimeoutSec: 10,
+	ForceHTTP2:             true,
+}
+
+// normalizeConnPool 将 0 值字段回退为默认值，保证配置合法
+func normalizeConnPool(cp ConnPool) ConnPool {
+	if cp.MaxIdleConns <= 0 {
+		cp.MaxIdleConns = defaultConnPool.MaxIdleConns
+	}
+	if cp.MaxIdleConnsPerHost <= 0 {
+		cp.MaxIdleConnsPerHost = defaultConnPool.MaxIdleConnsPerHost
+	}
+	if cp.MaxConnsPerHost <= 0 {
+		cp.MaxConnsPerHost = defaultConnPool.MaxConnsPerHost
+	}
+	if cp.IdleConnTimeoutSec <= 0 {
+		cp.IdleConnTimeoutSec = defaultConnPool.IdleConnTimeoutSec
+	}
+	if cp.TLSHandshakeTimeoutSec <= 0 {
+		cp.TLSHandshakeTimeoutSec = defaultConnPool.TLSHandshakeTimeoutSec
+	}
+	return cp
 }
 
 var requestCount int64
 var clear map[string]func() //创建一个用于存储清除函数的映射
 
 var cfg Config
+
+// sharedTransport 全局共享 HTTP 传输层（连接池）：
+// 所有 http.Client 共用，最大化连接复用（keep-alive），
+// 支持 HTTP/2 自动协商（ForceAttemptHTTP2），避免高并发时频繁重建 TCP/TLS 连接。
+// 连接池参数可通过配置页 ConnPool 调整，保存后由 applyConnPoolConfig 重建替换。
+var (
+	sharedTransport   = newTransportFromConnPool(defaultConnPool)
+	sharedTransportMu sync.RWMutex
+)
+
+// newTransportFromConnPool 按连接池配置构建 http.Transport
+func newTransportFromConnPool(cp ConnPool) *http.Transport {
+	return &http.Transport{
+		MaxIdleConns:          cp.MaxIdleConns,
+		MaxIdleConnsPerHost:   cp.MaxIdleConnsPerHost,
+		MaxConnsPerHost:       cp.MaxConnsPerHost,
+		IdleConnTimeout:       time.Duration(cp.IdleConnTimeoutSec) * time.Second,
+		TLSHandshakeTimeout:   time.Duration(cp.TLSHandshakeTimeoutSec) * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     cp.ForceHTTP2,
+	}
+}
+
+// getSharedTransport 获取当前共享 Transport（读锁保护引用替换）
+func getSharedTransport() *http.Transport {
+	sharedTransportMu.RLock()
+	defer sharedTransportMu.RUnlock()
+	return sharedTransport
+}
+
+// applyConnPoolConfig 应用连接池配置：重建 Transport 并原子替换引用，
+// 旧连接池的空闲连接被关闭，正在进行的请求不受影响（继续用旧 Transport）。
+// 每次请求创建 client 时通过 getSharedTransport 读取，新请求立即用新参数。
+func applyConnPoolConfig(cp ConnPool) {
+	cp = normalizeConnPool(cp)
+	t := newTransportFromConnPool(cp)
+	sharedTransportMu.Lock()
+	old := sharedTransport
+	sharedTransport = t
+	sharedTransportMu.Unlock()
+	old.CloseIdleConnections()
+	fmt.Printf("🔌 连接池已更新: 空闲=%d 每主机空闲=%d 每主机上限=%d 空闲超时=%ds TLS超时=%ds HTTP2=%v\n",
+		cp.MaxIdleConns, cp.MaxIdleConnsPerHost, cp.MaxConnsPerHost,
+		cp.IdleConnTimeoutSec, cp.TLSHandshakeTimeoutSec, cp.ForceHTTP2)
+}
 
 // modelMetaCache 上游模型元数据缓存，避免每次请求都调用 /v1/models。
 // 配置加载/保存时刷新（getModelMetaCache 内部按需惰性刷新 + 配置变更时主动失效）。
@@ -907,7 +995,7 @@ func recognizeImageWithProxy(img visionImage, proxyModel string, prompt string) 
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Transport: getSharedTransport(), Timeout: 120 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return "", err
@@ -1222,6 +1310,7 @@ func getDefaultConfig() Config {
 			Position: ctxPosPrepend,
 			Template: defaultModelContextTemplate,
 		},
+		ConnPool: defaultConnPool,
 	}
 }
 
@@ -1265,6 +1354,10 @@ func printConfigHelp() {
 	fmt.Println("                     模型信息来自上游 /v1/models 元数据与 ModelDetailedSettings 手动配置(手动优先);能力优先用模型 Capabilities,否则用全局")
 	fmt.Println("                     视觉说明自动判断:Capabilities含vision=原生支持;否则若配置 VisionProxyModel=由该代理模型识别;否则=不支持")
 	fmt.Println("                     示例: {\"Enable\": true, \"Position\": \"prepend\", \"Template\": \"你运行在{model}上,上下文{context_length},最大输出{max_output_tokens},能力{capabilities},{vision}\"}")
+	fmt.Println(" ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启")
+	fmt.Println("                     格式: {MaxIdleConns: 全局最大空闲连接数, MaxIdleConnsPerHost: 每上游主机最大空闲连接数, MaxConnsPerHost: 每上游主机最大并发连接数,")
+	fmt.Println("                           IdleConnTimeoutSec: 空闲连接回收秒数, TLSHandshakeTimeoutSec: TLS握手超时秒数, ForceHTTP2: 强制协商HTTP/2}")
+	fmt.Println("                     0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true")
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════════════════════════════════")
 	fmt.Println("")
 }
@@ -1278,7 +1371,7 @@ func printModelAliases() {
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Transport: getSharedTransport(), Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Println("⚠️ 无法连接上游获取模型列表:", err)
@@ -1445,6 +1538,12 @@ func loadConfig() {
 		// 规范化插入位置
 		stored.ModelContextPrompt.Position = normalizeCtxPos(stored.ModelContextPrompt.Position)
 	}
+	if _, ok := rawMap["ConnPool"]; !ok {
+		stored.ConnPool = defaultCfg.ConnPool
+		needSave = true
+	} else {
+		stored.ConnPool = normalizeConnPool(stored.ConnPool)
+	}
 	// 迁移旧版替换规则：force / replaceWhole 布尔字段 → mode 枚举
 	if migrateRequestPromptReplace(&stored, rawMap) {
 		needSave = true
@@ -1536,6 +1635,9 @@ func loadConfig() {
 	// 记录文件中持久化的密钥/密码格式，供配置管理页面在未修改时原样写回
 	storedOpenAIKey = stored.OpenAIKey
 	storedWebConfigPassword = stored.WebConfigPassword
+
+	// 应用连接池配置（构建共享 Transport）
+	applyConnPoolConfig(stored.ConnPool)
 }
 
 func pauseAndExit() {
@@ -2050,6 +2152,9 @@ func applyConfigToRuntime(newCfg Config) {
 	// 规范化插入位置并应用
 	newCfg.ModelContextPrompt.Position = normalizeCtxPos(newCfg.ModelContextPrompt.Position)
 	cfg.ModelContextPrompt = newCfg.ModelContextPrompt
+	// 应用连接池配置（重建共享 Transport，立即生效）
+	cfg.ConnPool = normalizeConnPool(newCfg.ConnPool)
+	applyConnPoolConfig(cfg.ConnPool)
 }
 
 // apiTestConfig 测试上游 API 连通性并返回模型列表
@@ -2092,7 +2197,7 @@ func apiTestConfig(w http.ResponseWriter, r *http.Request) {
 	httpReq.Header.Set("Authorization", "Bearer "+key)
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Transport: getSharedTransport(), Timeout: 15 * time.Second}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		http.Error(w, "连接失败: "+err.Error(), http.StatusBadGateway)
@@ -2153,7 +2258,7 @@ func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Transport: getSharedTransport(), Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return applyManualModelSettings(result)
@@ -2390,7 +2495,7 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		http.Error(w, "upstream error", 500)
@@ -2488,7 +2593,7 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		http.Error(w, "upstream error", 500)
@@ -2800,7 +2905,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "upstream error", 500)
@@ -2874,7 +2979,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "upstream error", 500)
@@ -3118,7 +3223,7 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, `{"error":{"type":"api_error","message":"upstream error"}}`, 500)
@@ -3182,7 +3287,7 @@ func anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Transport: getSharedTransport(), Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err == nil && resp.StatusCode == 200 {
 		defer resp.Body.Close()
@@ -3239,7 +3344,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, `{"error":{"type":"api_error","message":"upstream error"}}`, 500)
@@ -4095,7 +4200,7 @@ func openaiModels(w http.ResponseWriter, r *http.Request) {
 	req, _ := http.NewRequest("GET", cfg.OpenAIBase+"/models", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "upstream error", 500)
@@ -4125,7 +4230,7 @@ func openaiModelsLegacy(w http.ResponseWriter, r *http.Request) {
 	req, _ := http.NewRequest("GET", cfg.OpenAIBase+"/models", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "upstream error", 500)
@@ -4145,7 +4250,7 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 	req, _ := http.NewRequest("GET", cfg.OpenAIBase+"/models", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
-	client := &http.Client{}
+	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "upstream error", 500)
@@ -4750,7 +4855,7 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 			req.Header.Set("Content-Type", "application/json")
 
-			client := &http.Client{}
+			client := &http.Client{Transport: getSharedTransport()}
 			resp, err := client.Do(req)
 			if err == nil {
 				defer resp.Body.Close()

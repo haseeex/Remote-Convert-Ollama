@@ -33,6 +33,7 @@
 - ✂️ **夺舍 AI 人格**：替换/注入系统提示词，把 Copilot 改造成"亚丝娜"，移除微软的限制指令
 - 🖼️ **无中生有视觉**：主模型不支持图片时，自动用视觉代理模型识别后合并文本返回
 - 🛠️ **打通工具调用**：Ollama / OpenAI / Anthropic 三种格式的工具调用互相转换，解决 Agent 死循环
+- 🔌 **连接池调优**：HTTP/2 + keep-alive 连接复用，可配置空闲连接数/超时/并发上限，保存后立即生效无需重启
 
 > 💡 **简单来说**：你只需在 VS Code / VS2026 中配置 Ollama 作为 API 提供商，然后指向本程序，就能使用任何 **OpenAI 兼容的 API 服务**（如 DeepSeek、GPT、Claude 等）——并且还能把任何一个模型"调教"成你想要的样子。
 
@@ -116,6 +117,7 @@
 - **视觉代理模型**：`VisionProxyModel` 为主模型指定视觉代理，图片请求自动识别后合并文本，识别结果本地缓存防重复消耗 token
 - **请求提示词替换**：`RequestPromptReplace` 支持自动替换请求消息中的指定文本，实现 Copilot 自有提示词篡改等高级玩法
 - **模型上下文注入**：`ModelContextPrompt` 在对话时自动把当前模型信息（模型ID/上下文长度/最大输出/能力/视觉说明）注入提示词，让 AI 自我认知，更合理地规划思考与输出长度
+- **连接池设置**：`ConnPool` 可配置上游 HTTP/2 + keep-alive 连接池（空闲连接数/超时/并发上限），保存后立即生效，无需重启
 
 ---
 
@@ -198,6 +200,14 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
         "Enable": true,
         "Position": "prepend",
         "Template": "当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。"
+    },
+    "ConnPool": {
+        "MaxIdleConns": 100,
+        "MaxIdleConnsPerHost": 32,
+        "MaxConnsPerHost": 64,
+        "IdleConnTimeoutSec": 90,
+        "TLSHandshakeTimeoutSec": 10,
+        "ForceHTTP2": true
     }
 }
 ```
@@ -221,6 +231,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `VisionProxyPrompt`    | 全局默认视觉代理提示词（模型未自定义时使用）                                       | 内置默认提示词                       |
 | `RequestPromptReplace`  | 请求提示词替换规则`{规则名: {enable, mode, role, index, prompt, replace}}`   | `{}`                                 |
 | `ModelContextPrompt`   | 模型上下文信息注入`{Enable, Position, Template}`                         | `{Enable:false, Position:"prepend", Template:内置默认}` |
+| `ConnPool`            | 上游连接池设置`{MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}` | 内置默认（见下表） |
 
 **`StreamMode` 说明**：
 
@@ -249,6 +260,21 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 - 示例：`{"deepseek-chat": {"VisionProxyModel": "gpt-4o", "VisionProxyPrompt": "请描述图片内容"}}`
 
 > **兼容说明**：旧版 `EnableStream=true/false` 会在首次启动时自动迁移为 `StreamMode=preserve/force_close`。
+
+**`ConnPool` 连接池说明**：
+
+| 字段 | 说明 | 默认值 |
+| --- | --- | --- |
+| `MaxIdleConns` | 全局最大空闲连接数 | `100` |
+| `MaxIdleConnsPerHost` | 每上游主机最大空闲连接数（Go 默认仅 2，代理场景建议调大） | `32` |
+| `MaxConnsPerHost` | 每上游主机最大并发连接数（防止极端并发打爆文件描述符） | `64` |
+| `IdleConnTimeoutSec` | 空闲连接回收时间（秒） | `90` |
+| `TLSHandshakeTimeoutSec` | TLS 握手超时（秒） | `10` |
+| `ForceHTTP2` | 强制协商 HTTP/2（仅对 `https://` 上游生效，上游不支持自动回退 HTTP/1.1） | `true` |
+
+- 所有 `http.Client` 共享同一个连接池，连接复用率高，高并发时不再频繁重建 TCP/TLS 连接
+- **保存后立即生效（热更新连接池，无需重启）**；字段填 `0` 回退内置默认值
+- 可通过配置管理页面「🔌 连接设置 → 连接池设置 ConnPool」可视化调整
 
 > ⚠️ **注意**：`OPENAI_KEY` 在第一次启动后会自动加密并回写到配置文件中。后续启动将使用加密后的密钥，换机器会提示"机器码不匹配"。
 
@@ -287,8 +313,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | 📡**上游 API**         | 修改`OPENAI_BASE`，密钥输入明文后**自动加密保存**（留空表示保持当前密钥）  |
 | 🔌**测试连接**         | 一键测试上游连通性，显示上游可用模型列表                                           |
 | 🔒**访问密码**         | 设置`WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改） |
-| 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            |
-| 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
+| 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            || 🔌**连接池设置**     | 可视化调整`ConnPool`（HTTP/2 + keep-alive 连接复用），**保存后立即生效，无需重启** || 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
 | 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                         |
 | 🧭**模型上下文注入** | 可视化配置`ModelContextPrompt`（开关、插入位置、模板）                            |
 | 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                      |
@@ -406,6 +431,9 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
                      格式: {Enable, Position(prepend/append), Template}
                      模板占位符: {model} {context_length} {max_output_tokens} {capabilities} {vision}
                      {vision} 自动判断: 配置了视觉代理→"图片由代理模型识别"; 否则Capabilities含vision→"原生支持"; 否则→"不支持"
+ ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启
+                     格式: {MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}
+                     0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true
 ════════════════════════════════════════════════════════════
 
 📋 上游拥有的模型:

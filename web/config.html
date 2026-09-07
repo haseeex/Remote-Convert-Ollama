@@ -135,6 +135,22 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
           </div>
         </div>
       </div>
+
+      <div class="card">
+        <div class="head" data-i18n="poolTitle">🔌 连接池设置 ConnPool <span class="hint" data-i18n="poolHint">HTTP/2 + keep-alive 连接复用；0 值回退默认；保存后立即生效，无需重启</span></div>
+        <div class="body">
+          <div class="grid3">
+            <div class="row"><label data-i18n="poolMaxIdle">全局最大空闲连接 MaxIdleConns</label><input type="number" id="poolMaxIdle" min="0" placeholder="100"></div>
+            <div class="row"><label data-i18n="poolMaxIdlePerHost">每主机空闲连接 MaxIdleConnsPerHost</label><input type="number" id="poolMaxIdlePerHost" min="0" placeholder="32"></div>
+            <div class="row"><label data-i18n="poolMaxConnsPerHost">每主机并发上限 MaxConnsPerHost</label><input type="number" id="poolMaxConnsPerHost" min="0" placeholder="64"></div>
+          </div>
+          <div class="grid3">
+            <div class="row"><label data-i18n="poolIdleTimeout">空闲回收秒数 IdleConnTimeoutSec</label><input type="number" id="poolIdleTimeout" min="0" placeholder="90"></div>
+            <div class="row"><label data-i18n="poolTlsTimeout">TLS 握手超时秒数 TLSHandshakeTimeoutSec</label><input type="number" id="poolTlsTimeout" min="0" placeholder="10"></div>
+            <div class="row" style="align-items:flex-end"><label class="switch"><input type="checkbox" id="poolForceH2"><span class="track"></span><span class="lbl" data-i18n="poolForceH2">强制 HTTP/2（HTTPS 上游）</span></label></div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="panel" id="tab-sec">
@@ -268,6 +284,9 @@ var I18N = {
     lblIP: '监听地址 IP', lblPort: '监听端口 PORT',
     connUpstream: '📡 上游 API', connUpstreamHint: 'OPENAI_KEY 留空表示保持当前密钥',
     lblBase: 'OPENAI_BASE', lblKey: 'OPENAI_KEY', keyEncrypted: '已加密保存', keyPlaceholder: '留空保持不变；输入明文新密钥将自动加密保存',
+    poolTitle: '🔌 连接池设置 ConnPool', poolHint: 'HTTP/2 + keep-alive 连接复用；0 值回退默认；保存后立即生效，无需重启',
+    poolMaxIdle: '全局最大空闲连接 MaxIdleConns', poolMaxIdlePerHost: '每主机空闲连接 MaxIdleConnsPerHost', poolMaxConnsPerHost: '每主机并发上限 MaxConnsPerHost',
+    poolIdleTimeout: '空闲回收秒数 IdleConnTimeoutSec', poolTlsTimeout: 'TLS 握手超时秒数 TLSHandshakeTimeoutSec', poolForceH2: '强制 HTTP/2（HTTPS 上游）',
     secPw: '🔒 访问密码', secPwHint: '防止局域网内被他人乱改，留空保持不变',
     lblWebPw: '配置页面访问密码 WebConfigPassword', pwEnabled: '已启用', webPwPlaceholder: '留空保持不变；设置新密码后需重新登录',
     secPwTip: '💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改',
@@ -313,6 +332,9 @@ var I18N = {
     lblIP: 'Listen IP', lblPort: 'Listen Port',
     connUpstream: '📡 Upstream API', connUpstreamHint: 'Leave OPENAI_KEY empty to keep current key',
     lblBase: 'OPENAI_BASE', lblKey: 'OPENAI_KEY', keyEncrypted: 'Encrypted', keyPlaceholder: 'Leave empty to keep; enter plaintext to auto-encrypt',
+    poolTitle: '🔌 Connection Pool ConnPool', poolHint: 'HTTP/2 + keep-alive reuse; 0 = default; takes effect immediately after save',
+    poolMaxIdle: 'Global max idle MaxIdleConns', poolMaxIdlePerHost: 'Idle per host MaxIdleConnsPerHost', poolMaxConnsPerHost: 'Max conns per host MaxConnsPerHost',
+    poolIdleTimeout: 'Idle timeout (s) IdleConnTimeoutSec', poolTlsTimeout: 'TLS handshake timeout (s) TLSHandshakeTimeoutSec', poolForceH2: 'Force HTTP/2 (HTTPS upstream)',
     secPw: '🔒 Access Password', secPwHint: 'Prevent others on LAN from modifying; leave empty to keep',
     lblWebPw: 'Config page password WebConfigPassword', pwEnabled: 'Enabled', webPwPlaceholder: 'Leave empty to keep; new password requires re-login',
     secPwTip: '💡 After setting, /config requires password and all config APIs are protected',
@@ -550,6 +572,15 @@ async function loadCfg(notify){
     $('Capabilities').value = (c.Capabilities || []).join(', ');
     $('VisionProxyPrompt').value = c.VisionProxyPrompt || '';
 
+    // 连接池设置（0 = 使用默认）
+    var cp = c.ConnPool || {};
+    $('poolMaxIdle').value = cp.MaxIdleConns || '';
+    $('poolMaxIdlePerHost').value = cp.MaxIdleConnsPerHost || '';
+    $('poolMaxConnsPerHost').value = cp.MaxConnsPerHost || '';
+    $('poolIdleTimeout').value = cp.IdleConnTimeoutSec || '';
+    $('poolTlsTimeout').value = cp.TLSHandshakeTimeoutSec || '';
+    $('poolForceH2').checked = cp.ForceHTTP2 !== false;
+
     // 模型上下文信息注入
     var ctx = c.ModelContextPrompt || {};
     $('CtxEnable').checked = !!ctx.Enable;
@@ -715,6 +746,14 @@ function collectCfg(){
       Enable: $('CtxEnable').checked,
       Position: $('CtxPos').value === 'append' ? 'append' : 'prepend',
       Template: $('CtxTemplate').value.trim()
+    },
+    ConnPool: {
+      MaxIdleConns: parseInt($('poolMaxIdle').value, 10) || 0,
+      MaxIdleConnsPerHost: parseInt($('poolMaxIdlePerHost').value, 10) || 0,
+      MaxConnsPerHost: parseInt($('poolMaxConnsPerHost').value, 10) || 0,
+      IdleConnTimeoutSec: parseInt($('poolIdleTimeout').value, 10) || 0,
+      TLSHandshakeTimeoutSec: parseInt($('poolTlsTimeout').value, 10) || 0,
+      ForceHTTP2: $('poolForceH2').checked
     },
     OPENAI_BASE: $('OPENAI_BASE').value.trim(),
     OPENAI_KEY: $('OPENAI_KEY').value.trim(),
