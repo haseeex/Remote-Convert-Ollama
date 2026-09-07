@@ -20,7 +20,10 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	"image/gif"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"net/http"
@@ -45,6 +48,8 @@ type ModelDetailedSetting struct {
 	VisionProxyModel string `json:"VisionProxyModel,omitempty"`
 	// VisionProxyPrompt 视觉代理自定义提示词：帮助代理模型更好地识别图片（可留空使用默认提示词）
 	VisionProxyPrompt string `json:"VisionProxyPrompt,omitempty"`
+	// VisionImageQuality 本模型图片质量配置：优先于全局 VisionImageQuality（留空=使用全局）
+	VisionImageQuality *VisionQuality `json:"VisionImageQuality,omitempty"`
 }
 
 // PromptReplaceRule 定义请求提示词替换规则
@@ -188,6 +193,9 @@ type Config struct {
 	RequestPromptReplace  map[string]PromptReplaceRule    `json:"RequestPromptReplace,omitempty"`
 	// VisionProxyPrompt 全局默认视觉代理提示词：模型未自定义 VisionProxyPrompt 时使用（留空=内置默认提示词）
 	VisionProxyPrompt string `json:"VisionProxyPrompt,omitempty"`
+	// VisionImageQuality 全局图片质量配置：视觉识别时图片的压缩策略。
+	// 模型单独的 VisionImageQuality 优先；Quality 枚举：original=原图 / high=高质量 / balanced=平衡 / eco=节省流量 / custom=自定义
+	VisionImageQuality *VisionQuality `json:"VisionImageQuality,omitempty"`
 	// ModelContextPrompt 模型上下文信息注入：自动附加当前模型信息到提示词，帮助模型自我认知
 	ModelContextPrompt ModelContextPrompt `json:"ModelContextPrompt,omitempty"`
 	// ConnPool 上游连接池设置（HTTP/2 + keep-alive），保存后立即生效，无需重启
@@ -914,8 +922,213 @@ func normalizeVisionImage(img visionImage) (visionImage, bool) {
 // 先用视觉代理模型识别图片内容，再把识别文本合并进主模型请求，图片本身不再转发给主模型。
 // 识别结果按「图片内容 + 提示词」哈希缓存到本地 vision_cache/ 目录，重复图片直接命中缓存，不浪费 token。
 
+// 图片质量枚举（视觉识别时的图片压缩策略）
+// 枚举值小写存储，兼容 config.json 手写配置
+const (
+	visionQualityOriginal = "original" // 原图：不压缩，原样发送
+	visionQualityHigh     = "high"     // 高质量：压缩质量 90
+	visionQualityBalanced = "balanced" // 平衡：压缩质量 70（默认）
+	visionQualityEco      = "eco"      // 节省流量：压缩质量 40 + 最长边 1024
+	visionQualityCustom   = "custom"   // 自定义：使用 VisionImageQualityPercent 指定的压缩质量百分比（1-100）
+)
+
+// VisionQuality 全局图片质量配置：视觉识别时图片的压缩策略
+// 优先级：模型单独的 VisionImageQuality > 全局 VisionImageQuality
+// Quality 枚举：original / high / balanced / eco / custom
+// CustomPercent 仅当 Quality=custom 时生效：压缩质量百分比（1-100）
+type VisionQuality struct {
+	Quality       string `json:"Quality,omitempty"`       // 图片质量枚举：original=原图 / high=高质量 / balanced=平衡 / eco=节省流量 / custom=自定义
+	CustomPercent int    `json:"CustomPercent,omitempty"` // 自定义压缩质量百分比（1-100），仅 Quality=custom 时生效
+}
+
+// normalizeVisionQuality 规范化图片质量配置，非法值回退为 balanced
+func normalizeVisionQuality(vq VisionQuality) VisionQuality {
+	q := strings.ToLower(strings.TrimSpace(vq.Quality))
+	switch q {
+	case visionQualityOriginal, visionQualityHigh, visionQualityBalanced, visionQualityEco, visionQualityCustom:
+		// 合法枚举
+	default:
+		q = visionQualityBalanced
+	}
+	vq.Quality = q
+	if vq.CustomPercent < 1 {
+		vq.CustomPercent = 1
+	}
+	if vq.CustomPercent > 100 {
+		vq.CustomPercent = 100
+	}
+	return vq
+}
+
+// ptrOrZero 指针为 nil 时返回零值
+func ptrOrZero(p *VisionQuality) VisionQuality {
+	if p == nil {
+		return VisionQuality{}
+	}
+	return *p
+}
+
+// getVisionQualitySetting 获取指定模型的图片质量配置：优先模型单独配置，否则用全局配置
+func getVisionQualitySetting(modelID string) VisionQuality {
+	if setting, ok := cfg.ModelDetailedSettings[modelID]; ok && setting.VisionImageQuality != nil && setting.VisionImageQuality.Quality != "" {
+		return normalizeVisionQuality(*setting.VisionImageQuality)
+	}
+	if cfg.VisionImageQuality != nil {
+		return normalizeVisionQuality(*cfg.VisionImageQuality)
+	}
+	return normalizeVisionQuality(VisionQuality{Quality: visionQualityBalanced})
+}
+
+// decodeImageData 将 base64 图片数据解码为 image.Image 与 MIME 类型
+func decodeImageData(b64 string) (image.Image, string, error) {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return nil, "", err
+	}
+	mime := detectImageMIME(b64)
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, mime, err
+	}
+	return img, mime, nil
+}
+
+// compressVisionImage 按图片质量配置压缩图片：
+// original 原样返回；其余档位转 JPEG（保留透明底）并按质量/尺寸缩放
+// 返回 (新 base64, 新 MIME, 是否发生了转换)
+func compressVisionImage(img visionImage, vq VisionQuality) (visionImage, bool) {
+	img, _ = normalizeVisionImage(img) // 先做 GIF→PNG 首帧归一化，保证可解码
+	vq = normalizeVisionQuality(vq)
+	if vq.Quality == visionQualityOriginal {
+		return img, false // 原图：不压缩（仍保留 GIF 首帧归一化结果）
+	}
+
+	decoded, mime, err := decodeImageData(img.Base64)
+	if err != nil {
+		return img, false // 解码失败，原样交给上游
+	}
+
+	// 计算压缩质量与目标最长边
+	quality := 70
+	maxEdge := 0 // 0 = 不缩放
+	switch vq.Quality {
+	case visionQualityHigh:
+		quality = 90
+	case visionQualityBalanced:
+		quality = 70
+	case visionQualityEco:
+		quality = 40
+		maxEdge = 1024
+	case visionQualityCustom:
+		quality = vq.CustomPercent
+	}
+
+	// 统一转为 RGBA，透明像素填充白色背景（JPEG 不支持透明通道）
+	bounds := decoded.Bounds()
+	rgba := image.NewRGBA(bounds)
+	draw.Draw(rgba, bounds, &image.Uniform{C: color.White}, image.Point{}, draw.Src)
+	draw.Draw(rgba, bounds, decoded, bounds.Min, draw.Over)
+
+	src := rgba
+	srcBounds := bounds
+	if maxEdge > 0 && (srcBounds.Dx() > maxEdge || srcBounds.Dy() > maxEdge) {
+		// 等比缩放到最长边不超过 maxEdge（双线性插值）
+		scale := float64(maxEdge) / float64(max(srcBounds.Dx(), srcBounds.Dy()))
+		dw := int(float64(srcBounds.Dx()) * scale)
+		dh := int(float64(srcBounds.Dy()) * scale)
+		if dw < 1 {
+			dw = 1
+		}
+		if dh < 1 {
+			dh = 1
+		}
+		src = resizeBilinear(src, dw, dh)
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, src, &jpeg.Options{Quality: quality}); err != nil {
+		return img, false
+	}
+	converted := visionImage{
+		Base64: base64.StdEncoding.EncodeToString(buf.Bytes()),
+		MIME:   "image/jpeg",
+	}
+	if converted.Base64 == img.Base64 && mime == img.MIME {
+		return img, false
+	}
+	if maxEdge > 0 {
+		fmt.Printf("🗜️ 视觉代理: 图片已压缩为 JPEG (质量=%d%%, 最长边=%d)\n", quality, maxEdge)
+	} else {
+		fmt.Printf("🗜️ 视觉代理: 图片已压缩为 JPEG (质量=%d%%)\n", quality)
+	}
+	return converted, true
+}
+
 // visionCacheDir 视觉识别结果缓存目录
 const visionCacheDir = "vision_cache"
+
+// resizeBilinear 双线性插值缩放 RGBA 图片到目标尺寸（纯标准库实现）
+func resizeBilinear(src *image.RGBA, dw, dh int) *image.RGBA {
+	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	if sw < 1 || sh < 1 || dw < 1 || dh < 1 {
+		return dst
+	}
+	xr := float64(sw) / float64(dw)
+	yr := float64(sh) / float64(dh)
+	for y := 0; y < dh; y++ {
+		sy := float64(y) * yr
+		y0 := int(sy)
+		if y0 < 0 {
+			y0 = 0
+		}
+		if y0 >= sh {
+			y0 = sh - 1
+		}
+		y1 := y0 + 1
+		if y1 >= sh {
+			y1 = y0
+		}
+		fy := sy - float64(y0)
+		for x := 0; x < dw; x++ {
+			sx := float64(x) * xr
+			x0 := int(sx)
+			if x0 < 0 {
+				x0 = 0
+			}
+			if x0 >= sw {
+				x0 = sw - 1
+			}
+			x1 := x0 + 1
+			if x1 >= sw {
+				x1 = x0
+			}
+			fx := sx - float64(x0)
+			c00 := src.RGBAAt(src.Bounds().Min.X+x0, src.Bounds().Min.Y+y0)
+			c10 := src.RGBAAt(src.Bounds().Min.X+x1, src.Bounds().Min.Y+y0)
+			c01 := src.RGBAAt(src.Bounds().Min.X+x0, src.Bounds().Min.Y+y1)
+			c11 := src.RGBAAt(src.Bounds().Min.X+x1, src.Bounds().Min.Y+y1)
+			// 双线性插值各通道（含 Alpha）
+			r := lerpByte(lerpByte(c00.R, c10.R, fx), lerpByte(c01.R, c11.R, fx), fy)
+			g := lerpByte(lerpByte(c00.G, c10.G, fx), lerpByte(c01.G, c11.G, fx), fy)
+			b := lerpByte(lerpByte(c00.B, c10.B, fx), lerpByte(c01.B, c11.B, fx), fy)
+			a := lerpByte(lerpByte(c00.A, c10.A, fx), lerpByte(c01.A, c11.A, fx), fy)
+			dst.SetRGBA(x, y, color.RGBA{R: r, G: g, B: b, A: a})
+		}
+	}
+	return dst
+}
+
+// lerpByte 字节线性插值：c0 与 c1 按 t (0-1) 混合
+func lerpByte(c0, c1 byte, t float64) byte {
+	if t <= 0 {
+		return c0
+	}
+	if t >= 1 {
+		return c1
+	}
+	return byte(float64(c0) + (float64(c1)-float64(c0))*t + 0.5)
+}
 
 // defaultVisionProxyPrompt 默认视觉代理提示词
 const defaultVisionProxyPrompt = "请仔细查看这张图片，用简体中文详细描述图片中的全部内容。包括：1) 图片中的文字（OCR，逐字提取）；2) 图片中的物体、场景、人物；3) 图表、表格、代码等结构化内容请完整还原。描述要详尽准确，不要遗漏任何细节。"
@@ -931,6 +1144,7 @@ type visionImage struct {
 
 // visionCachePath 计算图片识别结果的缓存文件路径
 // 缓存键 = SHA256(图片base64 + 提示词)，命中缓存则直接复用识别结果，不重复调用代理模型
+// 注意：图片 base64 是压缩后的数据，不同质量档位压缩结果不同 → 缓存键天然区分档位
 func visionCachePath(img visionImage, prompt string) string {
 	sum := sha256.Sum256([]byte(img.Base64 + "\x00" + prompt))
 	return filepath.Join(visionCacheDir, hex.EncodeToString(sum[:])+".txt")
@@ -1160,13 +1374,21 @@ func applyVisionProxy(body []byte, modelID string) ([]byte, bool) {
 		}
 
 		// GIF 动图先转为 PNG 首帧（很多视觉模型/网关不接受 GIF，会报 invalid image input），
-		// 转换后再统一做缓存判断与识别，保证缓存键和识别数据一致。
+		// 再按图片质量配置统一压缩（转 JPEG + 可选缩放），转换后再统一做缓存判断与识别，
+		// 保证缓存键和识别数据一致；缓存键含压缩参数，切换质量档位不会命中旧缓存。
+		vq := getVisionQualitySetting(modelID)
 		for gi := range msgImages {
 			normalized, converted := normalizeVisionImage(msgImages[gi])
 			if converted {
 				fmt.Printf("🎞️ 视觉代理: 第 %d 张图片为 GIF 动图，已转换首帧为 PNG 再识别\n", gi+1)
 			}
 			msgImages[gi] = normalized
+			// 非原图档位才压缩；original 档位保留归一化后的结果（GIF 仍转 PNG 首帧）
+			if vq.Quality != visionQualityOriginal {
+				if compressed, done := compressVisionImage(msgImages[gi], vq); done {
+					msgImages[gi] = compressed
+				}
+			}
 		}
 
 		// 统一处理：每条含图片的消息都「缓存优先，未命中则识别」。
@@ -1301,10 +1523,11 @@ func getDefaultConfig() Config {
 		Capabilities:          []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
 		OpenAIBase:            "https://api.openai.com/v1",
 		OpenAIKey:             "",
-		ModelAlias:            map[string]string{},               // 模型别名：key=上游模型ID, value=显示名称
-		ModelDetailedSettings: map[string]ModelDetailedSetting{}, // 模型详细设置：key=上游模型ID, value={ContextLength, MaxOutputTokens, Capabilities}
-		RequestPromptReplace:  map[string]PromptReplaceRule{},    // 请求提示词替换规则
-		VisionProxyPrompt:     defaultVisionProxyPrompt,          // 全局默认视觉代理提示词
+		ModelAlias:            map[string]string{},                            // 模型别名：key=上游模型ID, value=显示名称
+		ModelDetailedSettings: map[string]ModelDetailedSetting{},              // 模型详细设置：key=上游模型ID, value={ContextLength, MaxOutputTokens, Capabilities}
+		RequestPromptReplace:  map[string]PromptReplaceRule{},                 // 请求提示词替换规则
+		VisionProxyPrompt:     defaultVisionProxyPrompt,                       // 全局默认视觉代理提示词
+		VisionImageQuality:    &VisionQuality{Quality: visionQualityBalanced}, // 全局图片质量配置（默认平衡）
 		ModelContextPrompt: ModelContextPrompt{
 			Enable:   false,
 			Position: ctxPosPrepend,
@@ -1331,16 +1554,23 @@ func printConfigHelp() {
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
 	fmt.Println(" ▼ ModelAlias      : 模型别名映射,仅影响模型名字显示 {上游模型ID: 显示名称, 上游模型ID: 显示名称, ...}")
 	fmt.Println(" ▼ ModelDetailedSettings : 模型详细设置,覆盖上游自动获取的值")
-	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出, Capabilities: [能力列表], VisionProxyModel: 视觉代理模型ID, VisionProxyPrompt: 视觉代理提示词}}")
+	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出, Capabilities: [能力列表], VisionProxyModel: 视觉代理模型ID, VisionProxyPrompt: 视觉代理提示词, VisionImageQuality: 图片质量配置}}")
 	fmt.Println("                     当 Capabilities 有定义时,优先使用此处的配置,否则使用全局 Capabilities")
 	fmt.Println("                     VisionProxyModel: 主模型不支持图片时,收到图片请求会先用此模型识别图片,")
 	fmt.Println("                       再把识别文本合并进主模型请求(图片本身不再转发给主模型)")
 	fmt.Println("                     VisionProxyPrompt: 视觉代理自定义提示词(留空=使用全局 VisionProxyPrompt)")
+	fmt.Println("                     VisionImageQuality: 本模型图片质量配置(留空=使用全局 VisionImageQuality)")
+	fmt.Println("                       格式: {Quality: 枚举, CustomPercent: 自定义质量百分比}")
 	fmt.Println("                     识别结果按图片内容+提示词哈希缓存到 vision_cache/ 目录,重复图片直接命中缓存,不浪费 token")
 	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384}}")
 	fmt.Println("                     示例: {\"deepseek-chat\": {\"VisionProxyModel\": \"gpt-4o\", \"VisionProxyPrompt\": \"请描述图片内容\"}}")
 	fmt.Println(" ▼ VisionProxyPrompt : 全局默认视觉代理提示词,模型未自定义提示词时使用(留空=内置默认提示词)")
 	fmt.Println("                     优先级: 模型自定义 VisionProxyPrompt > 全局 VisionProxyPrompt > 内置默认提示词")
+	fmt.Println(" ▼ VisionImageQuality: 视觉识别时图片的压缩策略(枚举: original=原图/high=高质量/balanced=平衡/eco=节省流量/custom=自定义)")
+	fmt.Println("                     优先级: 模型单独的 VisionImageQuality > 全局 VisionImageQuality")
+	fmt.Println("                     CustomPercent: 仅 Quality=custom 时生效,压缩质量百分比(1-100)")
+	fmt.Println("                     各档位: original=不压缩原样发送 · high=质量90% · balanced=质量70% · eco=质量40%+最长边1024 · custom=自定义质量")
+	fmt.Println("                     图片统一转 JPEG(透明底填充白色),识别缓存键包含压缩参数,切换质量档位不会命中旧缓存")
 	fmt.Println(" ▼ RequestPromptReplace: 请求提示词替换规则,自动替换请求中的指定文本")
 	fmt.Println("                     格式: {规则名称: {enable, role, index, prompt, replace}}")
 	fmt.Println("                     优先级:")
@@ -1529,6 +1759,14 @@ func loadConfig() {
 	}
 	if _, ok := rawMap["VisionProxyPrompt"]; !ok {
 		stored.VisionProxyPrompt = defaultCfg.VisionProxyPrompt
+		needSave = true
+	}
+	if _, ok := rawMap["VisionImageQuality"]; ok {
+		// 规范化图片质量枚举，非法值回退为 balanced
+		vq := normalizeVisionQuality(ptrOrZero(stored.VisionImageQuality))
+		stored.VisionImageQuality = &vq
+	} else {
+		stored.VisionImageQuality = defaultCfg.VisionImageQuality
 		needSave = true
 	}
 	if _, ok := rawMap["ModelContextPrompt"]; !ok {
@@ -1863,6 +2101,16 @@ func saveConfig(stored Config) error {
 //go:embed web/config.html
 var webConfigPageHTML string
 
+// faviconSVG 配置管理页面图标（透明底，与 config.html 内嵌 data URI 同款）
+const faviconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><text x="32" y="46" font-size="40" text-anchor="middle">🐭</text></svg>`
+
+// handleFavicon 返回配置管理页面图标，避免浏览器请求 /favicon.ico 返回 404 并刷日志
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write([]byte(faviconSVG))
+}
+
 // handleConfigPage 返回可视化配置管理页面
 func handleConfigPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -2089,6 +2337,18 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &rawCfg)
 	migrateRequestPromptReplace(&newCfg, rawCfg)
 
+	// 规范化图片质量配置（枚举 + 百分比范围）
+	vq := normalizeVisionQuality(ptrOrZero(newCfg.VisionImageQuality))
+	newCfg.VisionImageQuality = &vq
+	// 规范化模型详细设置里的图片质量配置
+	for m, s := range newCfg.ModelDetailedSettings {
+		if s.VisionImageQuality != nil {
+			svq := normalizeVisionQuality(*s.VisionImageQuality)
+			s.VisionImageQuality = &svq
+			newCfg.ModelDetailedSettings[m] = s
+		}
+	}
+
 	// 处理 WebConfigPassword：空=保持原加密值；明文=自动加密保存；已加密=校验后保存
 	pwChanged := false
 	if newCfg.WebConfigPassword != "" {
@@ -2149,6 +2409,9 @@ func applyConfigToRuntime(newCfg Config) {
 	cfg.ModelDetailedSettings = newCfg.ModelDetailedSettings
 	cfg.RequestPromptReplace = newCfg.RequestPromptReplace
 	cfg.VisionProxyPrompt = newCfg.VisionProxyPrompt
+	// 图片质量配置（指针类型，规范化后赋值）
+	vq := normalizeVisionQuality(ptrOrZero(newCfg.VisionImageQuality))
+	cfg.VisionImageQuality = &vq
 	// 规范化插入位置并应用
 	newCfg.ModelContextPrompt.Position = normalizeCtxPos(newCfg.ModelContextPrompt.Position)
 	cfg.ModelContextPrompt = newCfg.ModelContextPrompt
@@ -4929,6 +5192,7 @@ func main() {
 
 	// 注册本地配置管理页面
 	http.HandleFunc("/config", handleConfigPage)
+	http.HandleFunc("/favicon.ico", handleFavicon)
 	http.HandleFunc("/api/config", handleConfigAPI)
 	http.HandleFunc("/api/config/auth", apiConfigAuthStatus)
 	http.HandleFunc("/api/config/login", apiConfigLogin)

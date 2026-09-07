@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Remote Convert Ollama · 配置管理</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Ctext%20x='32'%20y='46'%20font-size='40'%20text-anchor='middle'%3E%F0%9F%90%AD%3C/text%3E%3C/svg%3E">
 <style>
 :root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--accent2:#1f6feb;--green:#3fb950;--yellow:#d29922;--red:#f85149;--radius:12px}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -48,6 +49,16 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .mode-opt:hover{border-color:var(--accent);color:var(--text)}
 .mode-opt input{accent-color:var(--accent2);cursor:pointer}
 .mode-opt:has(input:checked){border-color:var(--accent);background:rgba(88,166,255,.12);color:var(--accent);font-weight:500}
+/* 自定义压缩质量：滑块 + 数字输入框联动 */
+.vq-slider-row{display:flex;align-items:center;gap:12px}
+.vq-slider-row input[type=range]{flex:1;min-width:0;height:22px;accent-color:var(--accent2);cursor:pointer;background:transparent;padding:0}
+.vq-slider-row input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:4px;background:linear-gradient(90deg,var(--accent2),var(--accent))}
+.vq-slider-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#fff;border:2px solid var(--accent2);margin-top:-6px;box-shadow:0 2px 6px rgba(0,0,0,.4);transition:.15s}
+.vq-slider-row input[type=range]::-webkit-slider-thumb:hover{transform:scale(1.15)}
+.vq-slider-row input[type=range]::-moz-range-track{height:4px;border-radius:4px;background:linear-gradient(90deg,var(--accent2),var(--accent))}
+.vq-slider-row input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#fff;border:2px solid var(--accent2);box-shadow:0 2px 6px rgba(0,0,0,.4)}
+.vq-slider-row input[type=number]{width:88px;flex-shrink:0;text-align:center}
+.vq-percent-val{font-family:Consolas,monospace;font-size:12px;color:var(--accent);background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.25);padding:1px 8px;border-radius:12px;margin-left:auto;white-space:nowrap}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font-size:13px;font-weight:500;cursor:pointer;transition:.15s;font-family:inherit}
 .btn:hover{border-color:var(--accent);color:#fff}
 .btn.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
@@ -203,6 +214,26 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
             <div class="row"><label data-i18n="lblCaps">能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
           </div>
           <div class="row"><label data-i18n="lblVisionPrompt">全局视觉代理提示词 VisionProxyPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionPromptHint">模型未自定义提示词时使用；留空=内置默认提示词</span></label><textarea rows="3" id="VisionProxyPrompt" data-i18n-ph="visionPromptPh" placeholder="请仔细查看这张图片，用简体中文详细描述图片中的全部内容..."></textarea></div>
+          <div class="grid2">
+            <div class="row">
+              <label data-i18n="lblVisionQuality">全局图片质量 VisionImageQuality <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionQualityHint">模型单独的图片质量优先</span></label>
+              <select id="VisionImageQuality" onchange="toggleVisionQualityInputs()">
+                <option value="original" data-i18n="vqOriginal">原图 · 不压缩</option>
+                <option value="high" data-i18n="vqHigh">高质量 · JPEG 90%</option>
+                <option value="balanced" data-i18n="vqBalanced">平衡 · JPEG 70%（默认）</option>
+                <option value="eco" data-i18n="vqEco">节省流量 · JPEG 40% + 最长边 1024</option>
+                <option value="custom" data-i18n="vqCustom">自定义 · 压缩质量百分比</option>
+              </select>
+            </div>
+            <div class="row" id="rowVisionCustomPercent">
+              <label data-i18n="lblVisionCustomPercent">自定义压缩质量百分比 CustomPercent（1-100）</label>
+              <div class="vq-slider-row">
+                <input type="range" id="VisionCustomRange" min="1" max="100" value="70" oninput="syncVqPercent('VisionCustomRange','VisionCustomPercent','vqValGlobal')">
+                <input type="number" id="VisionCustomPercent" min="1" max="100" value="70" placeholder="70" oninput="syncVqPercent('VisionCustomPercent','VisionCustomRange','vqValGlobal')">
+                <span class="vq-percent-val" id="vqValGlobal">70%</span>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -297,6 +328,8 @@ var I18N = {
     lblStreamMode: '流式策略 StreamMode', smPreserve: 'preserve · 不覆写（默认）', smForceStream: 'force_stream · 强制流式', smForceClose: 'force_close · 强制关闭',
     lblCaps: '能力声明 Capabilities（逗号分隔）',
     lblVisionPrompt: '全局视觉代理提示词 VisionProxyPrompt', visionPromptHint: '模型未自定义提示词时使用；留空=内置默认提示词', visionPromptPh: '请仔细查看这张图片，用简体中文详细描述图片中的全部内容...',
+    lblVisionQuality: '全局图片质量 VisionImageQuality', visionQualityHint: '模型单独的图片质量优先；识别前统一压缩图片', vqOriginal: '原图 · 不压缩', vqHigh: '高质量 · JPEG 90%', vqBalanced: '平衡 · JPEG 70%（默认）', vqEco: '节省流量 · JPEG 40% + 最长边 1024', vqCustom: '自定义 · 压缩质量百分比',
+    lblVisionCustomPercent: '自定义压缩质量百分比 CustomPercent（1-100）',
     modelAlias: '🔖 模型别名 ModelAlias', modelAliasHint: '将上游模型 ID 显示为友好名称', btnAddAlias: '＋ 添加别名',
     modelDetail: '📐 模型详细设置 ModelDetailedSettings', modelDetailHint: '覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理', btnAddDetail: '＋ 添加模型设置',
     ctxTitle: '🧭 模型上下文信息注入 ModelContextPrompt', ctxHint: '在提示词中附加当前模型信息（模型ID/上下文长度/最大输出），帮助模型自我认知', ctxEnable: '启用：对话时自动注入当前位置模型信息',
@@ -310,6 +343,7 @@ var I18N = {
     lblModel: '模型', lblContextLength: '上下文长度 ContextLength', lblMaxOutput: '最大输出 MaxOutputTokens',
     lblCapsShort: '能力 Capabilities（逗号分隔）', lblVisionProxyModel: '视觉代理模型 VisionProxyModel（主模型不支持图片时，用此模型识别图片）',
     lblVisionProxyPrompt: '视觉代理提示词 VisionProxyPrompt（留空=默认提示词）', visionProxyPh: '请仔细查看这张图片，用简体中文详细描述图片中的全部内容...',
+    lblVqShort: '图片质量（留空=全局）', vqDefault: '跟随全局（默认）',
     lblEnable: '启用', lblRuleName: '规则名', ruleNamePh: '规则名称（唯一）',
     lblMode: '替换模式（互斥，只能选一种）', modeNormal: '📄 普通替换', modeWhole: '📝 匹配整段替换', modeForce: '⚡ 强制替换',
     lblRole: '目标角色 role（留空=任意）', optAny: '任意', lblIndex: '消息索引 index（0=第1条）', indexPh: '留空=按角色',
@@ -345,6 +379,8 @@ var I18N = {
     lblStreamMode: 'Stream mode StreamMode', smPreserve: 'preserve · no override (default)', smForceStream: 'force_stream · force streaming', smForceClose: 'force_close · force close',
     lblCaps: 'Capabilities (comma separated)',
     lblVisionPrompt: 'Global vision proxy prompt VisionProxyPrompt', visionPromptHint: 'Used when model has no custom prompt; empty = built-in default', visionPromptPh: 'Please look at this image carefully and describe all its contents in detail...',
+    lblVisionQuality: 'Global image quality VisionImageQuality', visionQualityHint: 'Per-model quality takes priority; images are compressed before recognition', vqOriginal: 'Original · no compression', vqHigh: 'High · JPEG 90%', vqBalanced: 'Balanced · JPEG 70% (default)', vqEco: 'Eco · JPEG 40% + max edge 1024', vqCustom: 'Custom · compression quality %',
+    lblVisionCustomPercent: 'Custom compression quality CustomPercent (1-100)',
     modelAlias: '🔖 Model Alias ModelAlias', modelAliasHint: 'Show friendly names for upstream model IDs', btnAddAlias: '＋ Add Alias',
     modelDetail: '📐 Model Detailed Settings ModelDetailedSettings', modelDetailHint: 'Override upstream values; VisionProxyModel sets a vision proxy for the main model', btnAddDetail: '＋ Add Model Setting',
     ctxTitle: '🧭 Model Context Injection ModelContextPrompt', ctxHint: 'Appends current model info (ID/context length/max output) to the prompt, helping the model understand itself', ctxEnable: 'Enable: inject current model info into prompts on every request',
@@ -357,6 +393,7 @@ var I18N = {
     lblModel: 'Model', lblContextLength: 'Context Length', lblMaxOutput: 'Max Output Tokens',
     lblCapsShort: 'Capabilities (comma separated)', lblVisionProxyModel: 'Vision proxy model VisionProxyModel (used to recognize images when main model lacks vision)',
     lblVisionProxyPrompt: 'Vision proxy prompt VisionProxyPrompt (empty = default)', visionProxyPh: 'Please look at this image carefully and describe all its contents in detail...',
+    lblVqShort: 'Image quality (empty = global)', vqDefault: 'Follow global (default)',
     lblEnable: 'Enable', lblRuleName: 'Rule name', ruleNamePh: 'Rule name (unique)',
     lblMode: 'Replace mode (mutually exclusive)', modeNormal: '📄 Normal replace', modeWhole: '📝 Whole-match replace', modeForce: '⚡ Force replace',
     lblRole: 'Target role (empty = any)', optAny: 'Any', lblIndex: 'Message index (0 = first)', indexPh: 'empty = by role',
@@ -571,6 +608,14 @@ async function loadCfg(notify){
     $('StreamMode').value = c.StreamMode || 'preserve';
     $('Capabilities').value = (c.Capabilities || []).join(', ');
     $('VisionProxyPrompt').value = c.VisionProxyPrompt || '';
+    // 全局图片质量（枚举 + 自定义百分比）
+    var vq = c.VisionImageQuality || {};
+    $('VisionImageQuality').value = vq.Quality || 'balanced';
+    var pct = vq.CustomPercent || 70;
+    $('VisionCustomPercent').value = pct;
+    $('VisionCustomRange').value = pct;
+    $('vqValGlobal').textContent = pct + '%';
+    toggleVisionQualityInputs();
 
     // 连接池设置（0 = 使用默认）
     var cp = c.ConnPool || {};
@@ -599,7 +644,7 @@ async function loadCfg(notify){
     if(c.ModelDetailedSettings){
       Object.keys(c.ModelDetailedSettings).forEach(function(k){
         var s = c.ModelDetailedSettings[k] || {};
-        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', '), vpm: s.VisionProxyModel || '', vpp: s.VisionProxyPrompt || '' });
+        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', '), vpm: s.VisionProxyModel || '', vpp: s.VisionProxyPrompt || '', vq: (s.VisionImageQuality || {}).Quality || '', vqp: (s.VisionImageQuality || {}).CustomPercent || '' });
       });
     }
     renderDetails();
@@ -657,7 +702,24 @@ function renderDetails(){
       '<div class="row"><label>' + t('lblCapsShort') + '</label><input type="text" value="' + esc(d.caps) + '" placeholder="tools, vision" oninput="state.details[' + i + '].caps=this.value"></div>' +
       '</div>' +
       '<div class="row"><label>' + t('lblVisionProxyModel') + '</label><input type="text" class="mono" value="' + esc(d.vpm) + '" placeholder="gpt-4o" oninput="state.details[' + i + '].vpm=this.value"></div>' +
-      '<div class="row"><label>' + t('lblVisionProxyPrompt') + '</label><textarea rows="2" placeholder="' + t('visionProxyPh') + '" oninput="state.details[' + i + '].vpp=this.value">' + esc(d.vpp) + '</textarea></div>';
+      '<div class="row"><label>' + t('lblVisionProxyPrompt') + '</label><textarea rows="2" placeholder="' + t('visionProxyPh') + '" oninput="state.details[' + i + '].vpp=this.value">' + esc(d.vpp) + '</textarea></div>' +
+      '<div class="grid2">' +
+      '<div class="row"><label>' + t('lblVqShort') + '</label>' +
+      '<select onchange="state.details[' + i + '].vq=this.value;syncVqInput(' + i + ')">' +
+      '<option value=""' + (d.vq === '' ? ' selected' : '') + '>' + t('vqDefault') + '</option>' +
+      '<option value="original"' + (d.vq === 'original' ? ' selected' : '') + '>' + t('vqOriginal') + '</option>' +
+      '<option value="high"' + (d.vq === 'high' ? ' selected' : '') + '>' + t('vqHigh') + '</option>' +
+      '<option value="balanced"' + (d.vq === 'balanced' ? ' selected' : '') + '>' + t('vqBalanced') + '</option>' +
+      '<option value="eco"' + (d.vq === 'eco' ? ' selected' : '') + '>' + t('vqEco') + '</option>' +
+      '<option value="custom"' + (d.vq === 'custom' ? ' selected' : '') + '>' + t('vqCustom') + '</option>' +
+      '</select></div>' +
+      '<div class="row" id="vqInput_' + i + '"' + (d.vq === 'custom' ? '' : ' style="display:none"') + '><label>' + t('lblVisionCustomPercent') + '</label>' +
+      '<div class="vq-slider-row">' +
+      '<input type="range" min="1" max="100" value="' + esc(d.vqp || 70) + '" oninput="state.details[' + i + '].vqp=this.value;syncVqPercent(\'vqRange_' + i + '\',\'vqNum_' + i + '\',\'vqBadge_' + i + '\')" id="vqRange_' + i + '">' +
+      '<input type="number" min="1" max="100" value="' + esc(d.vqp) + '" placeholder="70" id="vqNum_' + i + '" oninput="state.details[' + i + '].vqp=this.value;syncVqPercent(\'vqNum_' + i + '\',\'vqRange_' + i + '\',\'vqBadge_' + i + '\')">' +
+      '<span class="vq-percent-val" id="vqBadge_' + i + '">' + esc(d.vqp || 70) + '%</span>' +
+      '</div></div>' +
+      '</div>';
     box.appendChild(el);
   });
 }
@@ -697,9 +759,31 @@ function renderRules(){
 }
 
 function addAlias(){ state.aliases.push({ key: '', value: '' }); renderAliases(); }
-function addDetail(){ state.details.push({ model: '', cl: '', mot: '', caps: '', vpm: '', vpp: '' }); renderDetails(); }
+function addDetail(){ state.details.push({ model: '', cl: '', mot: '', caps: '', vpm: '', vpp: '', vq: '', vqp: '70' }); renderDetails(); }
 function addRule(){ state.rules.push({ name: '', enable: true, mode: 'normal', role: '', index: '', prompt: '', replace: '' }); renderRules(); }
 function removeAt(arr, i, render){ arr.splice(i, 1); render(); }
+
+// 全局图片质量：custom 档位时显示自定义百分比输入框
+function toggleVisionQualityInputs(){
+  var row = $('rowVisionCustomPercent');
+  if(row){ row.style.display = $('VisionImageQuality').value === 'custom' ? '' : 'none'; }
+}
+// 模型级图片质量：custom 档位时显示对应的自定义百分比输入框
+function syncVqInput(i){
+  var row = $('vqInput_' + i);
+  if(row){ row.style.display = state.details[i].vq === 'custom' ? '' : 'none'; }
+}
+// 自定义百分比联动：滑块 ↔ 数字输入框 ↔ 百分比徽章（双向同步，夹取到 1-100）
+function syncVqPercent(srcId, dstId, badgeId){
+  var v = parseInt($(srcId).value, 10);
+  if(isNaN(v)){ v = 70; }
+  if(v < 1){ v = 1; }
+  if(v > 100){ v = 100; }
+  $(dstId).value = v;
+  $(srcId).value = v;
+  var badge = $(badgeId);
+  if(badge){ badge.textContent = v + '%'; }
+}
 
 function collectCfg(){
   var aliases = {};
@@ -715,6 +799,17 @@ function collectCfg(){
     if(dc.length){ o.Capabilities = dc; }
     if(d.vpm && d.vpm.trim()){ o.VisionProxyModel = d.vpm.trim(); }
     if(d.vpp && d.vpp.trim()){ o.VisionProxyPrompt = d.vpp.trim(); }
+    // 模型级图片质量：留空=跟随全局；custom 档位带上自定义百分比（夹取 1-100）
+    if(d.vq && d.vq.trim()){
+      var vqo = { Quality: d.vq.trim() };
+      if(d.vq === 'custom'){
+        var p = parseInt(d.vqp, 10);
+        if(isNaN(p) || p < 1){ p = 1; }
+        if(p > 100){ p = 100; }
+        vqo.CustomPercent = p;
+      }
+      o.VisionImageQuality = vqo;
+    }
     details[d.model] = o;
   });
 
@@ -742,6 +837,10 @@ function collectCfg(){
     StreamMode: $('StreamMode').value,
     Capabilities: splitList($('Capabilities').value),
     VisionProxyPrompt: $('VisionProxyPrompt').value.trim(),
+    VisionImageQuality: {
+      Quality: $('VisionImageQuality').value,
+      CustomPercent: $('VisionImageQuality').value === 'custom' ? (parseInt($('VisionCustomPercent').value, 10) || 0) : 0
+    },
     ModelContextPrompt: {
       Enable: $('CtxEnable').checked,
       Position: $('CtxPos').value === 'append' ? 'append' : 'prepend',
