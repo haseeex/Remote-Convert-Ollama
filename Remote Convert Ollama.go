@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -26,6 +27,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -69,6 +71,77 @@ type ModelContextPrompt struct {
 	Enable   bool   `json:"Enable"`
 	Position string `json:"Position,omitempty"` // 插入位置：prepend（默认）/ append
 	Template string `json:"Template,omitempty"` // 模板，占位符 {model} {context_length} {max_output_tokens}
+}
+
+// DoomLoopProtection 配置：末日循环保护（上游内容重复检测 + 熔断 + 跨请求提醒 AI）
+// 上游（模型/中转网关）可能重复发送相同内容块或整个响应，导致客户端误判模型复读而
+// 陷入「重试 → 再收到重复 → 再重试」的死循环。本配置提供：
+//   - 相邻块去重：与上一块完全相同的 content 直接跳过（上游整块重复 bug）
+//   - 全文尾部去重：新内容与已发送全文尾部重复时截断（上游整个响应重发 bug）
+//   - 连续重复熔断：连续 MaxRepeat 次重复时强制收尾当前流（末日循环保护）
+//   - 跨请求提醒（C 方案）：熔断后下一轮请求自动注入 system 警告，让 AI 停止复读
+//   - 跨请求复读检测（RepeatCheck）：请求签名 + 回复全文与上一轮相同 → 判定复读并提醒
+//     （独立子开关，默认关闭：需记录每轮回复全文，且"相同请求+相同回复"可能误伤
+//     用户重复提问的正常场景）
+type DoomLoopProtection struct {
+	Enable      bool   `json:"Enable"`               // 总开关
+	Dedup       bool   `json:"Dedup"`                // 内容去重（相邻块 + 全文尾部）
+	RepeatCheck bool   `json:"RepeatCheck"`          // 跨请求复读检测（请求+回复与上一轮相同）
+	MaxRepeat   int    `json:"MaxRepeat,omitempty"`  // 连续重复熔断阈值（>=2 生效，默认 3）
+	WarnPrompt  string `json:"WarnPrompt,omitempty"` // 跨请求注入的警告提示词（留空=内置默认）
+}
+
+// defaultDoomLoopWarnPrompt 默认跨请求警告提示词
+const defaultDoomLoopWarnPrompt = "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"
+
+// normalizeDoomLoop 规范化配置：MaxRepeat 非法值回退为 3
+func normalizeDoomLoop(d DoomLoopProtection) DoomLoopProtection {
+	if d.MaxRepeat < 2 {
+		d.MaxRepeat = 3
+	}
+	return d
+}
+
+// 末日循环保护：跨请求提醒状态（C 方案）
+// key = 客户端地址 + 模型ID，标记该会话发生过重复熔断，下一轮请求注入警告后清除
+var repeatWarned = struct {
+	sync.Mutex
+	m map[string]bool
+}{m: make(map[string]bool)}
+
+// markRepeatWarning 标记某会话发生过重复熔断（下一轮请求注入警告）
+func markRepeatWarning(key string) {
+	if key == "" {
+		return
+	}
+	repeatWarned.Lock()
+	repeatWarned.m[key] = true
+	repeatWarned.Unlock()
+}
+
+// clientIP 提取客户端纯 IP（去掉端口），用于会话级 key。
+// 注意：不能用 r.RemoteAddr 直接做 key——客户端每次请求的源端口都不同，
+// 带端口会导致跨请求的警告标记永远匹配不上（C 方案失效）。
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// consumeRepeatWarning 消费警告标记：有则返回 true 并清除（只提醒一次）
+func consumeRepeatWarning(key string) bool {
+	if key == "" {
+		return false
+	}
+	repeatWarned.Lock()
+	defer repeatWarned.Unlock()
+	if repeatWarned.m[key] {
+		delete(repeatWarned.m, key)
+		return true
+	}
+	return false
 }
 
 // 模型上下文注入位置常量
@@ -198,6 +271,8 @@ type Config struct {
 	VisionImageQuality *VisionQuality `json:"VisionImageQuality,omitempty"`
 	// ModelContextPrompt 模型上下文信息注入：自动附加当前模型信息到提示词，帮助模型自我认知
 	ModelContextPrompt ModelContextPrompt `json:"ModelContextPrompt,omitempty"`
+	// DoomLoopProtection 末日循环保护：上游内容重复检测 + 熔断 + 跨请求提醒 AI
+	DoomLoopProtection DoomLoopProtection `json:"DoomLoopProtection,omitempty"`
 	// ConnPool 上游连接池设置（HTTP/2 + keep-alive），保存后立即生效，无需重启
 	ConnPool ConnPool `json:"ConnPool,omitempty"`
 }
@@ -1173,7 +1248,8 @@ func saveVisionCache(img visionImage, prompt string, result string) {
 
 // recognizeImageWithProxy 调用视觉代理模型识别单张图片，返回识别文本
 // 优先命中本地缓存；未命中则调用上游视觉模型，成功后写入缓存
-func recognizeImageWithProxy(img visionImage, proxyModel string, prompt string) (string, error) {
+// ctx 绑定客户端上下文：客户端断开时自动取消上游识别请求，避免继续烧 token
+func recognizeImageWithProxy(ctx context.Context, img visionImage, proxyModel string, prompt string) (string, error) {
 	// 1. 尝试命中本地缓存
 	if cached, ok := loadVisionCache(img, prompt); ok {
 		fmt.Println("💾 视觉代理: 命中本地缓存，跳过识别")
@@ -1202,7 +1278,7 @@ func recognizeImageWithProxy(img visionImage, proxyModel string, prompt string) 
 	}
 	b, _ := json.Marshal(payload)
 
-	httpReq, err := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
 	if err != nil {
 		return "", err
 	}
@@ -1286,11 +1362,12 @@ func getVisionProxySetting(modelID string) (string, string, bool) {
 // applyVisionProxy 视觉代理主入口：若请求包含图片且主模型配置了视觉代理，
 // 则用代理模型识别所有图片，将识别文本合并进请求（图片本身移除），返回处理后的请求体。
 // 返回 (新请求体, 是否发生了代理处理)
+// ctx 绑定客户端上下文：客户端断开时取消识别，避免继续烧 token
 //
 // 重要：识别结果只追加到「包含该图片的那条消息」中，不能全局合并后追加到所有含图片的消息。
 // 否则第二次对话时（客户端会携带历史消息），历史图片消息会被追加新图片的描述，
 // 导致 AI 混淆不同图片（例如把图片 B 误认为图片 A）。
-func applyVisionProxy(body []byte, modelID string) ([]byte, bool) {
+func applyVisionProxy(ctx context.Context, body []byte, modelID string) ([]byte, bool) {
 	proxyModel, prompt, ok := getVisionProxySetting(modelID)
 	if !ok {
 		return body, false
@@ -1420,7 +1497,7 @@ func applyVisionProxy(body []byte, modelID string) ([]byte, bool) {
 				go func(idx int, img visionImage) {
 					defer wg.Done()
 					defer func() { <-sem }()
-					desc, err := recognizeImageWithProxy(img, proxyModel, prompt)
+					desc, err := recognizeImageWithProxy(ctx, img, proxyModel, prompt)
 					if err != nil {
 						fmt.Printf("⚠️ 视觉代理: 第 %d 张图片识别失败: %v\n", idx+1, err)
 						return
@@ -1533,6 +1610,13 @@ func getDefaultConfig() Config {
 			Position: ctxPosPrepend,
 			Template: defaultModelContextTemplate,
 		},
+		DoomLoopProtection: DoomLoopProtection{
+			Enable:      false, // 默认全关：不改变任何转发行为，用户主动开启才生效
+			Dedup:       false,
+			RepeatCheck: false, // 跨请求复读检测默认关闭（需记录每轮回复全文，且可能误伤正常重复提问）
+			MaxRepeat:   3,
+			WarnPrompt:  defaultDoomLoopWarnPrompt,
+		},
 		ConnPool: defaultConnPool,
 	}
 }
@@ -1584,6 +1668,12 @@ func printConfigHelp() {
 	fmt.Println("                     模型信息来自上游 /v1/models 元数据与 ModelDetailedSettings 手动配置(手动优先);能力优先用模型 Capabilities,否则用全局")
 	fmt.Println("                     视觉说明自动判断:Capabilities含vision=原生支持;否则若配置 VisionProxyModel=由该代理模型识别;否则=不支持")
 	fmt.Println("                     示例: {\"Enable\": true, \"Position\": \"prepend\", \"Template\": \"你运行在{model}上,上下文{context_length},最大输出{max_output_tokens},能力{capabilities},{vision}\"}")
+	fmt.Println(" ▼ DoomLoopProtection : 末日循环保护,检测上游内容重复并熔断,防止客户端陷入重试死循环")
+	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词}")
+	fmt.Println("                     检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),")
+	fmt.Println("                     并在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)")
+	fmt.Println("                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭")
+	fmt.Println("                     示例: {\"Enable\": true, \"Dedup\": true, \"RepeatCheck\": false, \"MaxRepeat\": 3, \"WarnPrompt\": \"请勿重复输出\"}")
 	fmt.Println(" ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启")
 	fmt.Println("                     格式: {MaxIdleConns: 全局最大空闲连接数, MaxIdleConnsPerHost: 每上游主机最大空闲连接数, MaxConnsPerHost: 每上游主机最大并发连接数,")
 	fmt.Println("                           IdleConnTimeoutSec: 空闲连接回收秒数, TLSHandshakeTimeoutSec: TLS握手超时秒数, ForceHTTP2: 强制协商HTTP/2}")
@@ -1775,6 +1865,13 @@ func loadConfig() {
 	} else {
 		// 规范化插入位置
 		stored.ModelContextPrompt.Position = normalizeCtxPos(stored.ModelContextPrompt.Position)
+	}
+	if _, ok := rawMap["DoomLoopProtection"]; !ok {
+		stored.DoomLoopProtection = defaultCfg.DoomLoopProtection
+		needSave = true
+	} else {
+		// 规范化熔断阈值
+		stored.DoomLoopProtection = normalizeDoomLoop(stored.DoomLoopProtection)
 	}
 	if _, ok := rawMap["ConnPool"]; !ok {
 		stored.ConnPool = defaultCfg.ConnPool
@@ -2415,6 +2512,8 @@ func applyConfigToRuntime(newCfg Config) {
 	// 规范化插入位置并应用
 	newCfg.ModelContextPrompt.Position = normalizeCtxPos(newCfg.ModelContextPrompt.Position)
 	cfg.ModelContextPrompt = newCfg.ModelContextPrompt
+	// 末日循环保护：规范化熔断阈值并应用
+	cfg.DoomLoopProtection = normalizeDoomLoop(newCfg.DoomLoopProtection)
 	// 应用连接池配置（重建共享 Transport，立即生效）
 	cfg.ConnPool = normalizeConnPool(newCfg.ConnPool)
 	applyConnPoolConfig(cfg.ConnPool)
@@ -2502,6 +2601,200 @@ func truncateStr(s string, n int) string {
 		return s
 	}
 	return string(runes[:n]) + "..."
+}
+
+// ==================== 末日循环保护：流式内容去重 ====================
+// 上游（模型/中转网关）可能重复发送相同内容块或整个响应，导致客户端误判模型复读而
+// 陷入「重试 → 再收到重复 → 再重试」的死循环。以下辅助函数在三条流式路径
+// （Ollama / OpenAI / Anthropic）中统一使用：
+//   - 相邻块去重：与上一块完全相同的 content 直接跳过（上游整块重复 bug）
+//   - 全文尾部去重：新内容与已发送全文尾部重复时截断（上游整个响应重发 bug）
+//   - 连续重复熔断：连续 MaxRepeat 次重复时强制收尾当前流（末日循环保护）
+
+// dedupMinLen 全文尾部去重的最小内容长度阈值（低于此长度不参与尾部匹配，防误杀短文本）
+const dedupMinLen = 20
+
+// dedupStreamContent 对单个流式内容块做去重处理。
+// 两种模式（由 cfg.DoomLoopProtection.Dedup 控制）：
+//   - Dedup=true（去重模式）：跳过与上一块完全相同的块、截断与已发送全文尾部重复的片段，
+//     内容会被过滤，客户端只收到不重复的增量
+//   - Dedup=false（纯检测模式）：内容原样转发，完全不干扰输出；
+//     仅统计连续重复次数，达到 MaxRepeat 阈值时触发熔断（tripped=true）+ 跨请求警告
+//
+// 参数：
+//   - content: 上游新到的内容块
+//   - full: 已发送全文累积器（含本块之前的全部内容）
+//   - last: 上一块已发送的内容（相邻块去重用）
+//   - dupCount: 连续重复计数（相邻块相同时 +1，否则清零）
+//
+// 返回值：
+//   - out: 应转发的内容（空字符串 = 应跳过本块）
+//   - tripped: 是否触发了连续重复熔断（调用方应立即强制收尾）
+func dedupStreamContent(content string, full *strings.Builder, last *string, dupCount *int) (out string, tripped bool) {
+	if content == "" {
+		return "", false
+	}
+	// ① 相邻块检测：与上一块完全相同 → 重复计数（两种模式都检测）
+	if content == *last {
+		*dupCount++
+		if *dupCount >= cfg.DoomLoopProtection.MaxRepeat {
+			fmt.Printf("🚨 末日循环保护: 连续重复 %d 次, 强制收尾!\n", *dupCount)
+			return "", true
+		}
+		if cfg.DoomLoopProtection.Dedup {
+			// 去重模式：跳过重复块
+			fmt.Printf("⚠️ 末日循环保护: 跳过重复块 [%s]\n", truncateStr(content, 40))
+			return "", false
+		}
+		// 纯检测模式：不跳过，原样转发（last 不更新，继续累计重复计数）
+		return content, false
+	}
+	*dupCount = 0
+	// ② 全文尾部去重：仅去重模式生效（纯检测模式不截断内容）
+	if cfg.DoomLoopProtection.Dedup && full.Len() >= dedupMinLen && len(content) >= dedupMinLen {
+		fullStr := full.String()
+		if strings.HasSuffix(fullStr, content) {
+			fmt.Printf("⚠️ 末日循环保护: 检测到全文重复, 截断 [%s]\n", truncateStr(content, 40))
+			return "", false
+		}
+	}
+	// ③ 正常内容：更新上一块并返回
+	*last = content
+	return content, false
+}
+
+// ==================== 末日循环保护：非流式重复检测 ====================
+// 非流式响应无法中途熔断，检测两种重复形态：
+//   ① 响应内部重复：content 后半段与前半段相同，或由重复单元构成（如 "ABCABCABC"）
+//   ② 跨请求复读：请求签名（最后一条 user 消息）与回复都与上一轮相同（Agent 死循环特征）
+// 处理：纯检测模式原样透传 + 标记跨请求警告；去重模式额外截断为前半段
+
+// 非流式跨请求复读记录：key → 上一轮 (请求签名, 回复)
+var lastReplies = struct {
+	sync.Mutex
+	m map[string]lastReplyEntry
+}{m: make(map[string]lastReplyEntry)}
+
+type lastReplyEntry struct {
+	reqSig string
+	reply  string
+}
+
+// reqSignature 生成请求签名：取最后一条 user 消息内容（用于跨请求复读对比）
+func reqSignature(body []byte) string {
+	var req map[string]interface{}
+	if json.Unmarshal(body, &req) != nil {
+		return ""
+	}
+	msgs, ok := req["messages"].([]interface{})
+	if !ok {
+		return ""
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m, ok := msgs[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := m["role"].(string); role == "user" {
+			if c, ok := m["content"].(string); ok {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+// detectInternalRepeat 检测 content 内部大段重复（长度 >= 40 才检测，防误杀短文本）
+func detectInternalRepeat(content string) bool {
+	if len(content) < 40 {
+		return false
+	}
+	// 后半段与前半段相同
+	half := len(content) / 2
+	if content[:half] == content[half:2*half] {
+		return true
+	}
+	// 由重复单元构成：前 1/4 作为单元出现 >= 3 次
+	unit := content[:len(content)/4]
+	if strings.Count(content, unit) >= 3 {
+		return true
+	}
+	return false
+}
+
+// truncateHalf 按字符（rune）截断为前半段，避免按字节切碎 UTF-8 多字节字符
+func truncateHalf(s string) string {
+	runes := []rune(s)
+	if len(runes) <= 1 {
+		return s
+	}
+	return string(runes[:len(runes)/2])
+}
+
+// dedupNonStreamContent 非流式响应重复检测与处理。
+// 返回处理后的 content（去重模式截断）和是否触发了警告标记。
+func dedupNonStreamContent(content, reqSig, key string) (string, bool) {
+	if content == "" || !cfg.DoomLoopProtection.Enable {
+		return content, false
+	}
+	warned := false
+
+	// ① 响应内部重复
+	if detectInternalRepeat(content) {
+		fmt.Printf("🚨 末日循环保护: 检测到响应内部重复 [%s]\n", truncateStr(content, 40))
+		markRepeatWarning(key)
+		warned = true
+		if cfg.DoomLoopProtection.Dedup {
+			content = truncateHalf(content)
+			fmt.Printf("⚠️ 末日循环保护: 已截断重复内容\n")
+		}
+	}
+
+	// ② 跨请求复读：请求签名 + 回复都与上一轮相同（独立子开关 RepeatCheck 控制）
+	if cfg.DoomLoopProtection.RepeatCheck {
+		lastReplies.Lock()
+		prev := lastReplies.m[key]
+		lastReplies.Unlock()
+		if reqSig != "" && prev.reqSig == reqSig && prev.reply != "" && prev.reply == content {
+			fmt.Printf("🚨 末日循环保护: 检测到跨请求复读 (请求与回复均与上一轮相同)\n")
+			markRepeatWarning(key)
+			warned = true
+			if cfg.DoomLoopProtection.Dedup {
+				content = truncateHalf(content)
+				fmt.Printf("⚠️ 末日循环保护: 已截断复读内容\n")
+			}
+		}
+	}
+
+	// 更新记录（记录处理后的内容，客户端实际收到的）
+	lastReplies.Lock()
+	lastReplies.m[key] = lastReplyEntry{reqSig: reqSig, reply: content}
+	lastReplies.Unlock()
+
+	return content, warned
+}
+
+// checkStreamRepeat 流式收尾时调用：跨请求复读检测（流式版）。
+// 流式内容已发出无法截断，因此只做检测 + 标记下一轮警告（C 方案），
+// 并记录本轮全文供下一轮对比。与 dedupNonStreamContent 共用 lastReplies 记录。
+// 返回是否检测到复读。
+func checkStreamRepeat(fullText, reqSig, key string) bool {
+	if !cfg.DoomLoopProtection.Enable || !cfg.DoomLoopProtection.RepeatCheck || fullText == "" {
+		return false
+	}
+	lastReplies.Lock()
+	prev := lastReplies.m[key]
+	lastReplies.Unlock()
+	repeated := reqSig != "" && prev.reqSig == reqSig && prev.reply != "" && prev.reply == fullText
+	if repeated {
+		fmt.Printf("🚨 末日循环保护: 检测到跨请求复读 (流式, 请求与回复均与上一轮相同)\n")
+		markRepeatWarning(key)
+	}
+	// 更新记录（记录本轮全文，供下一轮对比）
+	lastReplies.Lock()
+	lastReplies.m[key] = lastReplyEntry{reqSig: reqSig, reply: fullText}
+	lastReplies.Unlock()
+	return repeated
 }
 
 // upstreamModelMeta 上游模型元数据
@@ -2741,20 +3034,20 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	requestedStream, _ := req["stream"].(bool)
 	switch normalizeStreamMode(cfg.StreamMode) {
 	case streamModeForceStream:
-		ollamaChatStream(w, payload)
+		ollamaChatStream(w, r, payload)
 		return
 	case streamModeForceClose:
 		// 强制关闭流式，直接走非流式分支
 	default:
 		if requestedStream {
-			ollamaChatStream(w, payload)
+			ollamaChatStream(w, r, payload)
 			return
 		}
 	}
 
 	b, _ := json.Marshal(payload)
 
-	httpReq, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
+	httpReq, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
@@ -2804,6 +3097,14 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 末日循环保护：非流式重复检测（响应内部重复 + 跨请求复读）
+	if cfg.DoomLoopProtection.Enable && content != "" {
+		newC, _ := dedupNonStreamContent(content, reqSignature(b), clientIP(r)+"|"+model)
+		if newC != content {
+			content = newC
+		}
+	}
+
 	// 保存 reasoning_content，供后续请求自动注入
 	if reasoningContent != "" {
 		setLastReasoningContent(reasoningContent)
@@ -2848,11 +3149,11 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(out)
 }
 
-func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
+func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string]interface{}) {
 	payload["stream"] = true
 	b, _ := json.Marshal(payload)
 
-	httpReq, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
+	httpReq, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(b))
 	httpReq.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	httpReq.Header.Set("Content-Type", "application/json")
 
@@ -2899,6 +3200,11 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	var reasoningContent strings.Builder // 累积 reasoning_content（思考模式）
 	lastThinkingLen := 0                 // 已发送的 thinking 长度（用于增量发送）
 	contentStarted := false              // 正文是否已开始输出（之后不再发送 thinking 块，避免思考/正文交错显示混乱）
+	// 末日循环保护：去重状态（相邻块 + 全文尾部 + 连续重复熔断）
+	dlpEnabled := cfg.DoomLoopProtection.Enable
+	lastContent := ""
+	dupCount := 0
+	dlpTripped := false // 连续重复熔断已触发（强制收尾后不再转发任何内容）
 	reader := bufio.NewReader(resp.Body)
 
 	// 流式 tool_calls 累积器
@@ -3069,12 +3375,25 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 		// 提取普通文本内容
 		content := choice.Delta.Content
 		if content != "" {
-			fullContent.WriteString(content)
-			if cfg.Log_Responses {
-				fmt.Print(content)
+			// 末日循环保护：内容去重 + 连续重复熔断
+			if dlpEnabled && !dlpTripped {
+				var tripped bool
+				content, tripped = dedupStreamContent(content, &fullContent, &lastContent, &dupCount)
+				if tripped {
+					dlpTripped = true
+					// 标记跨请求提醒（C 方案）：下一轮请求注入警告，让 AI 停止复读
+					markRepeatWarning(clientIP(r) + "|" + model)
+					break // 强制收尾，不再等待上游
+				}
 			}
-			contentStarted = true
-			sendOllamaChunk(content, false, 0, nil, reasoningContent.String())
+			if content != "" {
+				fullContent.WriteString(content)
+				if cfg.Log_Responses {
+					fmt.Print(content)
+				}
+				contentStarted = true
+				sendOllamaChunk(content, false, 0, nil, reasoningContent.String())
+			}
 		}
 	}
 
@@ -3147,6 +3466,11 @@ func ollamaChatStream(w http.ResponseWriter, payload map[string]interface{}) {
 	if rc := reasoningContent.String(); rc != "" {
 		setLastReasoningContent(rc)
 	}
+
+	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
+	if dlpEnabled && fullContent.Len() > 0 {
+		checkStreamRepeat(fullContent.String(), reqSignature(b), clientIP(r)+"|"+model)
+	}
 }
 
 // -------------------- OpenAI API: /v1/chat/completions --------------------
@@ -3164,7 +3488,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(body))
+	req, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(body))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -3178,6 +3502,31 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Println("UPSTREAM:", string(raw))
+
+	// 末日循环保护：非流式重复检测（响应内部重复 + 跨请求复读）
+	if cfg.DoomLoopProtection.Enable {
+		var dlpModel struct {
+			Model string `json:"model"`
+		}
+		json.Unmarshal(body, &dlpModel)
+		dlpKey := clientIP(r) + "|" + dlpModel.Model
+		var upstreamResp map[string]interface{}
+		if err := json.Unmarshal(raw, &upstreamResp); err == nil {
+			if choices, ok := upstreamResp["choices"].([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if msg, ok := choice["message"].(map[string]interface{}); ok {
+						if c, ok := msg["content"].(string); ok && c != "" {
+							newC, _ := dedupNonStreamContent(c, reqSignature(body), dlpKey)
+							if newC != c {
+								msg["content"] = newC
+								raw, _ = json.Marshal(upstreamResp)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 
 	// 保存 reasoning_content（DeepSeek 思考模式）并注入 reasoning_text（VS Code 兼容）
 	var upstreamResp map[string]interface{}
@@ -3237,7 +3586,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 
 // 流式响应处理
 func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
-	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(body))
+	req, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(body))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -3286,6 +3635,11 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	reader := bufio.NewReader(resp.Body)
 	loggedContent := strings.Builder{}
 	thinkingDone := false // 标记 thinking 是否已结束（收到 content 后关闭 reasoning_text 注入）
+	// 末日循环保护：去重状态（相邻块 + 全文尾部 + 连续重复熔断）
+	dlpEnabled := cfg.DoomLoopProtection.Enable
+	lastContent := ""
+	dupCount := 0
+	dlpTripped := false // 连续重复熔断已触发（强制收尾后不再转发任何内容）
 	// usage 追踪：上游流式可能只在末尾发 usage-only chunk，也可能完全不发，
 	// 需要记录并转发/兜底，保证 VS Code 上下文窗口占用显示不为 0
 	hasUpstreamUsage := false
@@ -3384,11 +3738,48 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 					delta = deltaMap
 					// 检查是否已有 content → 标记 thinking 结束
 					if c, ok := deltaMap["content"].(string); ok && c != "" {
-						loggedContent.WriteString(c)
-						if cfg.Log_Responses {
-							fmt.Print(c)
+						// 末日循环保护：内容去重 + 连续重复熔断
+						if dlpEnabled && !dlpTripped {
+							var tripped bool
+							c, tripped = dedupStreamContent(c, &loggedContent, &lastContent, &dupCount)
+							if tripped {
+								dlpTripped = true
+								// 标记跨请求提醒（C 方案）：下一轮请求注入警告，让 AI 停止复读
+								markRepeatWarning(clientIP(r) + "|" + rawChunk.Model)
+								// 强制收尾：发送 [DONE] 并结束，不再等待上游
+								fmt.Fprintf(w, "data: [DONE]\n\n")
+								flusher.Flush()
+								if !hasUpstreamUsage {
+									inputTokens := estimatePromptTokens(requestMessages)
+									outputTokens := estimateTokens(loggedContent.String())
+									out(map[string]interface{}{
+										"id":      "",
+										"object":  "chat.completion.chunk",
+										"created": time.Now().Unix(),
+										"model":   "",
+										"choices": []interface{}{},
+										"usage": map[string]interface{}{
+											"prompt_tokens":     inputTokens,
+											"completion_tokens": outputTokens,
+											"total_tokens":      inputTokens + outputTokens,
+										},
+									})
+									fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
+								}
+								return
+							}
 						}
-						thinkingDone = true
+						if c != "" {
+							loggedContent.WriteString(c)
+							if cfg.Log_Responses {
+								fmt.Print(c)
+							}
+							thinkingDone = true
+							delta["content"] = c
+						} else {
+							// 内容被去重跳过：从 delta 中移除 content，其余字段（tool_calls 等）照常转发
+							delete(delta, "content")
+						}
 					}
 					// VS Code 兼容：将 reasoning_content 映射为 reasoning_text
 					// 只在 thinking 阶段注入，content 开始后停止（避免 VS Code 内部追踪断链）
@@ -3450,6 +3841,15 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 		fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
 	}
 
+	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
+	if dlpEnabled && loggedContent.Len() > 0 {
+		var dlpModel struct {
+			Model string `json:"model"`
+		}
+		json.Unmarshal(body, &dlpModel)
+		checkStreamRepeat(loggedContent.String(), reqSignature(body), clientIP(r)+"|"+dlpModel.Model)
+	}
+
 	if cfg.Log_Responses && loggedContent.Len() > 0 {
 		fmt.Println("UPSTREAM STREAM:", loggedContent.String())
 	}
@@ -3482,7 +3882,7 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. 转发到上游
-	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(openaiBody))
+	req, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(openaiBody))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -3512,6 +3912,30 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(raw)
 		return
+	}
+
+	// 末日循环保护：非流式重复检测（响应内部重复 + 跨请求复读）
+	if cfg.DoomLoopProtection.Enable {
+		var oaiResp map[string]interface{}
+		if err := json.Unmarshal(raw, &oaiResp); err == nil {
+			if choices, ok := oaiResp["choices"].([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if msg, ok := choice["message"].(map[string]interface{}); ok {
+						if c, ok := msg["content"].(string); ok && c != "" {
+							newC, _ := dedupNonStreamContent(c, reqSignature(openaiBody), clientIP(r)+"|"+areq.Model)
+							if newC != c {
+								msg["content"] = newC
+								raw, _ = json.Marshal(oaiResp)
+								// 重新转换（内容已截断）
+								if newBody, err2 := convertOpenAIToAnthropic(raw, areq.Model, openaiBody); err2 == nil {
+									anthropicBody = newBody
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
 	fmt.Printf("UPSTREAM Anthropic: %s\n", anthropicBody)
@@ -3546,7 +3970,7 @@ func anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 	upstreamPayload["stream"] = false
 	upstreamBody, _ := json.Marshal(upstreamPayload)
 
-	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(upstreamBody))
+	req, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(upstreamBody))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -3603,7 +4027,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 		}
 	}
 
-	req, _ := http.NewRequest("POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(openaiBody))
+	req, _ := http.NewRequestWithContext(r.Context(), "POST", cfg.OpenAIBase+"/chat/completions", bytes.NewBuffer(openaiBody))
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 	req.Header.Set("Content-Type", "application/json")
 
@@ -3646,6 +4070,11 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	msgStarted := false
 	streamClosed := false        // 是否已发送 message_stop（防止重复收尾）
 	var fullText strings.Builder // 累积输出文本，用于上游未返回 usage 时的输出估算
+	// 末日循环保护：去重状态（相邻块 + 全文尾部 + 连续重复熔断）
+	dlpEnabled := cfg.DoomLoopProtection.Enable
+	lastContent := ""
+	dupCount := 0
+	dlpTripped := false // 连续重复熔断已触发（强制收尾后不再转发任何内容）
 	// 获取输出 token：上游未返回时本地估算兜底（保证客户端上下文窗口占用显示不为 0）
 	getOutputTokens := func() int {
 		if outputTokens > 0 {
@@ -3808,6 +4237,20 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 
 		// 文本内容 delta
 		if deltaContent != "" {
+			// 末日循环保护：内容去重 + 连续重复熔断
+			if dlpEnabled && !dlpTripped {
+				var tripped bool
+				deltaContent, tripped = dedupStreamContent(deltaContent, &fullText, &lastContent, &dupCount)
+				if tripped {
+					dlpTripped = true
+					// 标记跨请求提醒（C 方案）：下一轮请求注入警告，让 AI 停止复读
+					markRepeatWarning(clientIP(r) + "|" + areq.Model)
+					break // 强制收尾，不再等待上游
+				}
+			}
+			if deltaContent == "" {
+				continue // 内容被去重跳过，本块不再发任何内容事件
+			}
 			fullText.WriteString(deltaContent)
 			// 检查当前是否需要新开一个 text block
 			if len(blocks) == 0 || blocks[len(blocks)-1].blockType != "text" {
@@ -4025,6 +4468,11 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			"type": "message_stop",
 		})
 		fmt.Println("⚠️ Anthropic 流式：上游零 chunk 响应，已补发空消息")
+	}
+
+	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
+	if dlpEnabled && fullText.Len() > 0 {
+		checkStreamRepeat(fullText.String(), reqSignature(openaiBody), clientIP(r)+"|"+areq.Model)
 	}
 
 	flusher.Flush()
@@ -4819,6 +5267,125 @@ func stripModelPrefixSuffix(body []byte) []byte {
 // 让 AI 模型了解自身运行环境，更合理地规划思考和输出长度。
 // Position 支持 prepend（插入到首条 system 消息开头，无 system 则新建）/ append（追加到末尾）。
 // 支持 OpenAI / Ollama chat 的 messages 数组格式。
+// injectDoomLoopWarning 跨请求注入末日循环警告（C 方案）：
+// 上一轮流式响应发生连续重复熔断后，下一轮请求自动注入 system 警告，
+// 让 AI 停止复读。只提醒一次（consumeRepeatWarning 消费后清除）。
+// clientKey 用于定位会话（如 r.RemoteAddr），与 markRepeatWarning 的 key 保持一致。
+// detectAssistantLoop 检测请求内 assistant 消息重复（Agent 自问自答循环特征）：
+// Agent 循环时，客户端会把模型上一轮的 assistant 消息（含 tool_calls）原样塞回
+// messages 再请求，循环中会出现多条签名相同的 assistant 消息。
+// 签名 = content + tool_calls(name+arguments)，达到 2 条相同即判定循环。
+// 只检测 role=assistant 的消息，不碰 user/tool，正常对话零误伤。
+func detectAssistantLoop(body []byte) bool {
+	var req map[string]interface{}
+	if json.Unmarshal(body, &req) != nil {
+		return false
+	}
+	msgs, ok := req["messages"].([]interface{})
+	if !ok {
+		return false
+	}
+	seen := make(map[string]int)
+	for _, rawMsg := range msgs {
+		m, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := m["role"].(string); role != "assistant" {
+			continue
+		}
+		// 生成 assistant 消息签名：content + tool_calls
+		var sb strings.Builder
+		if c, ok := m["content"].(string); ok {
+			sb.WriteString("C:" + c)
+		}
+		if tcs, ok := m["tool_calls"].([]interface{}); ok {
+			for _, tc := range tcs {
+				if tcm, ok := tc.(map[string]interface{}); ok {
+					if fn, ok := tcm["function"].(map[string]interface{}); ok {
+						name, _ := fn["name"].(string)
+						args, _ := fn["arguments"].(string)
+						sb.WriteString("|T:" + name + ":" + args)
+					}
+				}
+			}
+		}
+		sig := sb.String()
+		if sig == "" {
+			continue
+		}
+		seen[sig]++
+		if seen[sig] >= 2 {
+			fmt.Printf("🚨 末日循环保护: 检测到请求内 assistant 消息重复 (Agent 自问自答循环)\n")
+			return true
+		}
+	}
+	return false
+}
+
+func injectDoomLoopWarning(body []byte, model, clientKey string) []byte {
+	if !cfg.DoomLoopProtection.Enable || model == "" || len(body) == 0 {
+		return body
+	}
+	key := clientKey + "|" + model
+	// 触发条件：① 上一轮熔断/复读标记（consumeRepeatWarning，跨轮次）
+	//           ② 请求内 assistant 消息重复（detectAssistantLoop，Agent 自问自答循环，随 RepeatCheck 开关）
+	triggered := consumeRepeatWarning(key)
+	if !triggered && cfg.DoomLoopProtection.RepeatCheck {
+		triggered = detectAssistantLoop(body)
+	}
+	if !triggered {
+		return body
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	rawMessages, ok := req["messages"].([]interface{})
+	if !ok {
+		// 非 messages 格式（如 Ollama 单条 prompt 或其它协议）不注入
+		return body
+	}
+
+	warn := strings.TrimSpace(cfg.DoomLoopProtection.WarnPrompt)
+	if warn == "" {
+		warn = defaultDoomLoopWarnPrompt
+	}
+
+	// 插入到首条 system 消息内容开头；无 system 则在最前面新建一条
+	inserted := false
+	for _, rawMsg := range rawMessages {
+		msg, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role == "system" {
+			if content, ok := msg["content"].(string); ok {
+				msg["content"] = warn + "\n\n" + content
+				inserted = true
+				break
+			}
+		}
+	}
+	if !inserted {
+		newMsg := []interface{}{map[string]interface{}{
+			"role":    "system",
+			"content": warn,
+		}}
+		rawMessages = append(newMsg, rawMessages...)
+	}
+
+	req["messages"] = rawMessages
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	fmt.Printf("🚨 末日循环保护: 已向 [%s] 注入复读警告\n", model)
+	return newBody
+}
+
 func injectModelContextPrompt(body []byte, model string) []byte {
 	if !cfg.ModelContextPrompt.Enable || model == "" || len(body) == 0 {
 		return body
@@ -5061,6 +5628,11 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		body = injectModelContextPrompt(body, curModel.Model)
 	}
 
+	// 末日循环保护（C 方案）：上一轮流式发生连续重复熔断时，本轮注入复读警告
+	if curModel.Model != "" {
+		body = injectDoomLoopWarning(body, curModel.Model, clientIP(r))
+	}
+
 	// 视觉代理：主模型不支持图片但配置了 VisionProxyModel 时，
 	// 先用代理模型识别图片，再把识别文本合并进请求（图片本身不再转发给主模型）
 	if hasImage {
@@ -5070,7 +5642,7 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		}
 		json.Unmarshal(body, &reqMeta)
 		if reqMeta.Model != "" {
-			if newBody, proxied := applyVisionProxy(body, reqMeta.Model); proxied {
+			if newBody, proxied := applyVisionProxy(r.Context(), body, reqMeta.Model); proxied {
 				body = newBody
 			}
 		}
