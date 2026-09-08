@@ -5184,6 +5184,73 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ollamaPS 处理 Ollama GET /api/ps（List Running Models）
+// 返回当前所有模型的信息（来自上游模型列表 + 手动配置），模拟"已加载到内存"状态
+func ollamaPS(w http.ResponseWriter, r *http.Request) {
+	// 获取所有模型元数据（含 ModelDetailedSettings 手动配置，缓存惰性刷新）
+	modelMeta := getModelMetaCache()
+
+	const DefaultModelSize = 100 * 1024 * 1024
+
+	var models []map[string]interface{}
+	for modelID, meta := range modelMeta {
+		ctxLen := meta.ContextLength
+		maxOut := meta.MaxOutputTokens
+		if ctxLen <= 0 {
+			ctxLen = DefaultContextLength
+		}
+		if maxOut <= 0 {
+			maxOut = DefaultMaxOutputTokens
+		}
+
+		// 显示名称：优先使用 ModelAlias 中的别名，否则用上游 ID，再套上前后缀
+		displayName := modelID
+		if alias, ok := cfg.ModelAlias[modelID]; ok && alias != "" {
+			displayName = alias
+		}
+		displayName = cfg.OpenAIPrefix + displayName + cfg.OpenAISuffix
+
+		// 能力列表：优先使用 ModelDetailedSettings 中的 Capabilities，否则使用全局 Capabilities
+		modelCaps := cfg.Capabilities
+		if setting, ok := cfg.ModelDetailedSettings[modelID]; ok && len(setting.Capabilities) > 0 {
+			modelCaps = setting.Capabilities
+		}
+		hasVision := hasCapability(modelCaps, "vision")
+		hasTools := hasCapability(modelCaps, "tools")
+
+		models = append(models, map[string]interface{}{
+			"name":   displayName, // 显示名（可别名）
+			"model":  modelID,     // 实际请求用的模型 ID
+			"size":   DefaultModelSize,
+			"digest": "sha256:fake",
+			"details": map[string]interface{}{
+				"format":             "gguf",
+				"family":             modelID,
+				"parameter_size":     "1M",
+				"quantization_level": "none",
+				"families":           []string{modelID},
+			},
+			"expires_at":                      time.Now().Add(5 * time.Minute).Format(time.RFC3339),
+			"size_vram":                       DefaultModelSize,
+			"context_length":                  ctxLen,
+			"max_output_tokens":               maxOut,
+			"capabilities":                    modelCaps,
+			"capabilities.supports.vision":    hasVision,
+			"capabilities.supports.reasoning": true,
+			"capabilities.supports.tools":     hasTools,
+		})
+	}
+
+	out := map[string]interface{}{"models": models}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+
+	if cfg.Log_Responses {
+		fmt.Println("响应内容:", out)
+	}
+}
+
 // hasImageInBody 检测请求体中是否包含图片
 // 支持 Ollama images 数组、Ollama content image 块、Anthropic image 块、OpenAI image_url 四种格式
 func hasImageInBody(body []byte) bool {
@@ -5665,6 +5732,8 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		ollamaTags(w, r)
 	case r.URL.Path == "/api/show":
 		ollamaShow(w, r)
+	case r.URL.Path == "/api/ps":
+		ollamaPS(w, r)
 	case r.URL.Path == "/v1/chat/completions":
 		openaiChat(w, r)
 	case r.URL.Path == "/v1/messages/count_tokens":
