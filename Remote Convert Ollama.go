@@ -3060,7 +3060,7 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
-	fmt.Println("UPSTREAM:", string(raw))
+	fmt.Printf("UPSTREAM [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
 
 	// 解析上游响应
 	var upstreamResp map[string]interface{}
@@ -3131,7 +3131,7 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		outputTokens = int64(estimateTokens(content) + estimateTokens(reasoningContent))
 		usageSource = "估算"
 	}
-	fmt.Printf("🔢 Token [%s] 输入:%d 输出:%d (finish=%s)\n", usageSource, inputTokens, outputTokens, finishReason)
+	fmt.Printf("🔢 [%s] Token [%s] 输入:%d 输出:%d (finish=%s)\n", time.Now().Format("15:04:05"), usageSource, inputTokens, outputTokens, finishReason)
 
 	out := map[string]interface{}{
 		"model":             model,
@@ -3403,7 +3403,7 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 		} else {
 			fmt.Println("")
 		}
-		fmt.Println("UPSTREAM STREAM:", fullContent.String())
+		fmt.Printf("UPSTREAM STREAM [%s]: %s\n", time.Now().Format("15:04:05"), fullContent.String())
 	}
 
 	// 上游未返回 usage（很多中转流式不返回）时本地估算兜底，
@@ -3419,7 +3419,7 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 		outputTokens = estimateTokens(fullContent.String()) + estimateTokens(reasoningContent.String())
 		usageSource = "估算"
 	}
-	fmt.Printf("🔢 Token[%s] 输入:%d 输出:%d (finish=%s, tool_calls=%v)\n", usageSource, inputTokens, outputTokens, upstreamFinishReason, hasToolCalls)
+	fmt.Printf("🔢 [%s] Token[%s] 输入:%d 输出:%d (finish=%s, tool_calls=%v)\n", time.Now().Format("15:04:05"), usageSource, inputTokens, outputTokens, upstreamFinishReason, hasToolCalls)
 
 	// 构建最终消息
 	// 注意：不再要求 finish_reason == "tool_calls" 才下发 tool_calls。
@@ -3501,7 +3501,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
-	fmt.Println("UPSTREAM:", string(raw))
+	fmt.Printf("UPSTREAM [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
 
 	// 末日循环保护：非流式重复检测（响应内部重复 + 跨请求复读）
 	if cfg.DoomLoopProtection.Enable {
@@ -3572,7 +3572,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 				"completion_tokens": outputTokens,
 				"total_tokens":      inputTokens + outputTokens,
 			}
-			fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
+			fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, outputTokens)
 		}
 		// 重新序列化（因为可能修改了 message / usage）
 		if modified, _ := json.Marshal(upstreamResp); modified != nil {
@@ -3669,7 +3669,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 		}
 		if !strings.HasPrefix(line, "data: ") {
 			if cfg.Log_Responses {
-				fmt.Println("UPSTREAM SSE:", line)
+				fmt.Printf("UPSTREAM SSE [%s]: %s\n", time.Now().Format("15:04:05"), line)
 			}
 			continue
 		}
@@ -3682,7 +3682,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 		}
 
 		if cfg.Log_Responses {
-			fmt.Println("UPSTREAM SSE:", line)
+			fmt.Printf("UPSTREAM SSE [%s]: %s\n", time.Now().Format("15:04:05"), line)
 		}
 
 		// 用 RawMessage 解析完整 chunk，保留所有字段（包括 tool_calls）
@@ -3764,7 +3764,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 											"total_tokens":      inputTokens + outputTokens,
 										},
 									})
-									fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
+									fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, outputTokens)
 								}
 								return
 							}
@@ -3838,7 +3838,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 				"total_tokens":      inputTokens + outputTokens,
 			},
 		})
-		fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
+		fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, outputTokens)
 	}
 
 	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
@@ -3851,7 +3851,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 
 	if cfg.Log_Responses && loggedContent.Len() > 0 {
-		fmt.Println("UPSTREAM STREAM:", loggedContent.String())
+		fmt.Printf("UPSTREAM STREAM [%s]: %s\n", time.Now().Format("15:04:05"), loggedContent.String())
 	}
 }
 
@@ -3938,7 +3938,7 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	fmt.Printf("UPSTREAM Anthropic: %s\n", anthropicBody)
+	fmt.Printf("UPSTREAM Anthropic [%s]: %s\n", time.Now().Format("15:04:05"), anthropicBody)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(anthropicBody)
@@ -4081,7 +4081,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			return outputTokens
 		}
 		est := estimateTokens(fullText.String())
-		fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, est)
+		fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, est)
 		return est
 	}
 
@@ -4850,7 +4850,7 @@ func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte,
 		if outputTokens <= 0 {
 			outputTokens = estimateTokens(textContent)
 		}
-		fmt.Printf("🔢 Token[估算] 输入:%d 输出:%d\n", inputTokens, outputTokens)
+		fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, outputTokens)
 	}
 
 	id := "msg_" + generateMsgID()
@@ -4920,7 +4920,7 @@ func openaiModels(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
-	fmt.Println("UPSTREAM MODELS:", string(raw))
+	fmt.Printf("UPSTREAM MODELS [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
@@ -4950,7 +4950,7 @@ func openaiModelsLegacy(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
-	fmt.Println("UPSTREAM LEGACY MODELS:", string(raw))
+	fmt.Printf("UPSTREAM LEGACY MODELS [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
@@ -5662,12 +5662,28 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 
 	body, _ := io.ReadAll(r.Body)
 
+	// 提取会话标识（Ollama 请求格式支持 session_id，OpenAI 格式支持 user 字段）
+	var reqSession struct {
+		SessionID string `json:"session_id"`
+		User      string `json:"user"`
+	}
+	json.Unmarshal(body, &reqSession)
+	sessionID := reqSession.SessionID
+	if sessionID == "" {
+		sessionID = reqSession.User
+	}
+	if sessionID == "" {
+		sessionID = "-"
+	}
+
+	ts := time.Now().Format("2006-01-02 15:04:05")
 	hasImage := hasImageInBody(body)
 	if hasImage {
-		fmt.Println("🖼️ ===== 客户端 请求 (含图片) =====")
+		fmt.Printf("🖼️ [%s] ===== 客户端 请求 (含图片) =====\n", ts)
 	} else {
-		fmt.Println("📤 ========= 客户端 请求 ==========")
+		fmt.Printf("📤 [%s] ========= 客户端 请求 ==========\n", ts)
 	}
+	fmt.Printf("📡 客户端: %s | 会话: %s\n", clientIP(r), sessionID)
 	fmt.Println("方法:", r.Method)
 	fmt.Println("路径:", r.URL.Path)
 	fmt.Println("查询:", r.URL.RawQuery)
