@@ -60,6 +60,7 @@
 | `GET /api/version`               | → 返回版本信息                        | VS Code 探测 Ollama 服务                    |
 | `GET /api/tags`                  | →`GET /v1/models` (上游)            | 获取模型列表，支持别名、前后缀、上下文信息  |
 | `POST /api/show`                 | → 返回增强模型信息                    | 包含上下文窗口、能力声明、Token 限制等      |
+| `GET /api/ps`                   | → 返回全部模型信息（本地生成）        | 模拟"已加载到内存"状态，Ollama 客户端探活/显示运行模型 |
 | `POST /api/chat`                 | →`POST /v1/chat/completions` (上游) | Ollama 聊天补全 → OpenAI 格式              |
 | `POST /v1/chat/completions`      | →`POST /v1/chat/completions` (上游) | 标准 OpenAI 流式/非流式透传                 |
 | `POST /v1/messages`              | →`POST /v1/chat/completions` (上游) | **Anthropic 格式 → OpenAI 格式转换** |
@@ -117,6 +118,7 @@
 - **视觉代理模型**：`VisionProxyModel` 为主模型指定视觉代理，图片请求自动识别后合并文本，识别结果本地缓存防重复消耗 token
 - **请求提示词替换**：`RequestPromptReplace` 支持自动替换请求消息中的指定文本，实现 Copilot 自有提示词篡改等高级玩法
 - **模型上下文注入**：`ModelContextPrompt` 在对话时自动把当前模型信息（模型ID/上下文长度/最大输出/能力/视觉说明）注入提示词，让 AI 自我认知，更合理地规划思考与输出长度
+- **末日循环保护**：`DoomLoopProtection` 检测上游内容重复（相邻块/全文尾部/跨请求复读）并熔断，防止客户端陷入重试死循环
 - **连接池设置**：`ConnPool` 可配置上游 HTTP/2 + keep-alive 连接池（空闲连接数/超时/并发上限），保存后立即生效，无需重启
 
 ---
@@ -208,6 +210,13 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
         "IdleConnTimeoutSec": 90,
         "TLSHandshakeTimeoutSec": 10,
         "ForceHTTP2": true
+    },
+    "DoomLoopProtection": {
+        "Enable": false,
+        "Dedup": false,
+        "RepeatCheck": false,
+        "MaxRepeat": 3,
+        "WarnPrompt": ""
     }
 }
 ```
@@ -232,6 +241,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `RequestPromptReplace`  | 请求提示词替换规则`{规则名: {enable, mode, role, index, prompt, replace}}`   | `{}`                                 |
 | `ModelContextPrompt`   | 模型上下文信息注入`{Enable, Position, Template}`                         | `{Enable:false, Position:"prepend", Template:内置默认}` |
 | `ConnPool`            | 上游连接池设置`{MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}` | 内置默认（见下表） |
+| `DoomLoopProtection`  | 末日循环保护`{Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt}`         | `{Enable:false, Dedup:false, RepeatCheck:false, MaxRepeat:3, WarnPrompt:""}` |
 
 **`StreamMode` 说明**：
 
@@ -316,6 +326,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            || 🔌**连接池设置**     | 可视化调整`ConnPool`（HTTP/2 + keep-alive 连接复用），**保存后立即生效，无需重启** || 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
 | 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                         |
 | 🧭**模型上下文注入** | 可视化配置`ModelContextPrompt`（开关、插入位置、模板）                            |
+| 🚨**末日循环保护** | 可视化配置`DoomLoopProtection`（总开关 + 去重/复读检测/熔断阈值/警告提示词，分级置灰联动） |
 | 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                      |
 | 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力、视觉代理模型与提示词）                  |
 | ✂️**提示词替换规则** | 可视化增删`RequestPromptReplace` 规则                                            |
@@ -431,6 +442,11 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
                      格式: {Enable, Position(prepend/append), Template}
                      模板占位符: {model} {context_length} {max_output_tokens} {capabilities} {vision}
                      {vision} 自动判断: 配置了视觉代理→"图片由代理模型识别"; 否则Capabilities含vision→"原生支持"; 否则→"不支持"
+ ▼ DoomLoopProtection : 末日循环保护,检测上游内容重复并熔断,防止客户端陷入重试死循环
+                     格式: {Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt}
+                     检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),
+                     并在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)
+                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭
  ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启
                      格式: {MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}
                      0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true
@@ -500,6 +516,41 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 ```
 
 > 💡 **视觉说明自动判断**：只要该模型配置了 `VisionProxyModel`，即使 `Capabilities` 里声明了 `vision`，也会如实标注"图片由代理模型识别"——因为实际视觉处理确实走的是代理。
+
+### 🚨 末日循环保护
+
+通过 `DoomLoopProtection` 你可以防止客户端陷入「重试 → 再收到重复 → 再重试」的死循环。上游（模型/中转网关）可能重复发送相同内容块或整个响应，导致客户端误判模型复读而反复重试，白白烧掉 token。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `Enable` | bool | 总开关（默认 `false`，透明转发不改变任何行为，主动开启才生效） |
+| `Dedup` | bool | 内容去重：相邻块去重 + 全文尾部去重（≥20 字符才参与尾部匹配，防误杀短文本） |
+| `RepeatCheck` | bool | 跨请求复读检测：请求签名 + 回复全文与上一轮相同 → 判定复读（默认关闭，需记录每轮回复全文，且可能误伤正常重复提问） |
+| `MaxRepeat` | int | 连续重复熔断阈值（≥2 生效，默认 3） |
+| `WarnPrompt` | string | 跨请求注入的警告提示词（留空=内置默认） |
+
+**工作原理**：
+
+- **相邻块去重**：与上一块完全相同的 content 直接跳过（上游整块重复 bug）
+- **全文尾部去重**：新内容与已发送全文尾部重复时截断（上游整个响应重发 bug）
+- **连续重复熔断（D 方案）**：连续重复达 `MaxRepeat` 次 → 强制收尾当前流，客户端不挂起
+- **跨请求提醒（C 方案）**：熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）
+- **assistant 循环检测**：请求内出现 ≥2 条签名相同的 assistant 消息（Agent 自问自答循环特征）→ 注入警告，正常对话零误伤
+- 去重只影响 `content` 字段，`tool_calls` / `usage` / `finish_reason` / SSE 事件顺序全部保持原样
+
+示例配置：
+
+```json
+"DoomLoopProtection": {
+    "Enable": true,
+    "Dedup": true,
+    "RepeatCheck": false,
+    "MaxRepeat": 3,
+    "WarnPrompt": "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"
+}
+```
+
+> 💡 **提示**：三条流式路径（Ollama / OpenAI / Anthropic）与非流式响应均接入检测；客户端断开时自动取消上游请求，不再继续烧 token。
 
 ### ✂️ 请求提示词替换
 
