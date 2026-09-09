@@ -80,6 +80,7 @@ type ModelContextPrompt struct {
 //   - 全文尾部去重：新内容与已发送全文尾部重复时截断（上游整个响应重发 bug）
 //   - 连续重复熔断：连续 MaxRepeat 次重复时强制收尾当前流（末日循环保护）
 //   - 跨请求提醒（C 方案）：熔断后下一轮请求自动注入 system 警告，让 AI 停止复读
+//     （独立子开关 Warn，默认关闭）
 //   - 跨请求复读检测（RepeatCheck）：请求签名 + 回复全文与上一轮相同 → 判定复读并提醒
 //     （独立子开关，默认关闭：需记录每轮回复全文，且"相同请求+相同回复"可能误伤
 //     用户重复提问的正常场景）
@@ -87,6 +88,7 @@ type DoomLoopProtection struct {
 	Enable      bool   `json:"Enable"`               // 总开关
 	Dedup       bool   `json:"Dedup"`                // 内容去重（相邻块 + 全文尾部）
 	RepeatCheck bool   `json:"RepeatCheck"`          // 跨请求复读检测（请求+回复与上一轮相同）
+	Warn        bool   `json:"Warn"`                 // 跨请求警告注入（C 方案）：熔断/复读后下一轮注入 system 警告
 	MaxRepeat   int    `json:"MaxRepeat,omitempty"`  // 连续重复熔断阈值（>=2 生效，默认 3）
 	WarnPrompt  string `json:"WarnPrompt,omitempty"` // 跨请求注入的警告提示词（留空=内置默认）
 }
@@ -1614,6 +1616,7 @@ func getDefaultConfig() Config {
 			Enable:      false, // 默认全关：不改变任何转发行为，用户主动开启才生效
 			Dedup:       false,
 			RepeatCheck: false, // 跨请求复读检测默认关闭（需记录每轮回复全文，且可能误伤正常重复提问）
+			Warn:        false, // 跨请求警告注入默认关闭
 			MaxRepeat:   3,
 			WarnPrompt:  defaultDoomLoopWarnPrompt,
 		},
@@ -1669,11 +1672,11 @@ func printConfigHelp() {
 	fmt.Println("                     视觉说明自动判断:Capabilities含vision=原生支持;否则若配置 VisionProxyModel=由该代理模型识别;否则=不支持")
 	fmt.Println("                     示例: {\"Enable\": true, \"Position\": \"prepend\", \"Template\": \"你运行在{model}上,上下文{context_length},最大输出{max_output_tokens},能力{capabilities},{vision}\"}")
 	fmt.Println(" ▼ DoomLoopProtection : 末日循环保护,检测上游内容重复并熔断,防止客户端陷入重试死循环")
-	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词}")
+	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), Warn: 跨请求警告注入(熔断/复读后下一轮注入system警告), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词}")
 	fmt.Println("                     检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),")
-	fmt.Println("                     并在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)")
+	fmt.Println("                     Warn 开启时在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)")
 	fmt.Println("                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭")
-	fmt.Println("                     示例: {\"Enable\": true, \"Dedup\": true, \"RepeatCheck\": false, \"MaxRepeat\": 3, \"WarnPrompt\": \"请勿重复输出\"}")
+	fmt.Println("                     示例: {\"Enable\": true, \"Dedup\": true, \"RepeatCheck\": false, \"Warn\": true, \"MaxRepeat\": 3, \"WarnPrompt\": \"请勿重复输出\"}")
 	fmt.Println(" ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启")
 	fmt.Println("                     格式: {MaxIdleConns: 全局最大空闲连接数, MaxIdleConnsPerHost: 每上游主机最大空闲连接数, MaxConnsPerHost: 每上游主机最大并发连接数,")
 	fmt.Println("                           IdleConnTimeoutSec: 空闲连接回收秒数, TLSHandshakeTimeoutSec: TLS握手超时秒数, ForceHTTP2: 强制协商HTTP/2}")
@@ -5391,7 +5394,7 @@ func detectAssistantLoop(body []byte) bool {
 }
 
 func injectDoomLoopWarning(body []byte, model, clientKey string) []byte {
-	if !cfg.DoomLoopProtection.Enable || model == "" || len(body) == 0 {
+	if !cfg.DoomLoopProtection.Enable || !cfg.DoomLoopProtection.Warn || model == "" || len(body) == 0 {
 		return body
 	}
 	key := clientKey + "|" + model

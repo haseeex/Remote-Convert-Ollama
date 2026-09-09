@@ -261,6 +261,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
           <div class="row"><label class="switch"><input type="checkbox" id="DlpEnable" onchange="toggleDlpInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpEnable">启用：检测上游重复内容并熔断</span></label></div>
           <div class="row sub-row" id="rowDlpDedup"><label class="switch"><input type="checkbox" id="DlpDedup"><span class="track"></span><span class="lbl" data-i18n="dlpDedup">内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段</span></label></div>
           <div class="row sub-row" id="rowDlpRepeatCheck"><label class="switch"><input type="checkbox" id="DlpRepeatCheck"><span class="track"></span><span class="lbl" data-i18n="dlpRepeatCheck">跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）</span></label></div>
+          <div class="row sub-row" id="rowDlpWarn"><label class="switch"><input type="checkbox" id="DlpWarn"><span class="track"></span><span class="lbl" data-i18n="dlpWarn">跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label></div>
           <div class="row sub-row" id="rowDlpMaxRepeat"><label data-i18n="dlpMaxRepeat">连续重复熔断阈值 MaxRepeat（≥2，默认 3）</label><input type="number" id="DlpMaxRepeat" min="2" max="20" value="3" placeholder="3"></div>
           <div class="row sub-row" id="rowDlpWarnPrompt"><label data-i18n="dlpWarnPrompt">跨请求警告提示词 WarnPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="dlpWarnHint">熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label><textarea rows="3" id="DlpWarnPrompt" data-i18n-ph="dlpWarnPh" placeholder="【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"></textarea></div>
         </div>
@@ -353,6 +354,7 @@ var I18N = {
     dlpTitle: '🚨 末日循环保护 DoomLoopProtection', dlpHint: '检测上游内容重复并熔断，防止客户端陷入重试死循环', dlpEnable: '启用：检测上游重复内容并熔断',
     dlpDedup: '内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段',
     dlpRepeatCheck: '跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）',
+    dlpWarn: '跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）',
     dlpMaxRepeat: '连续重复熔断阈值 MaxRepeat（≥2，默认 3）',
     dlpWarnPrompt: '跨请求警告提示词 WarnPrompt', dlpWarnHint: '熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）', dlpWarnPh: '【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。',
     rulesTitle: '✂️ 请求提示词替换 RequestPromptReplace', rulesHint: '自动替换请求中的指定文本', btnAddRule: '＋ 添加替换规则',
@@ -409,6 +411,7 @@ var I18N = {
     dlpTitle: '🚨 Doom Loop Protection DoomLoopProtection', dlpHint: 'Detects duplicate upstream content and trips the circuit, preventing client retry loops', dlpEnable: 'Enable: detect duplicate upstream content and trip',
     dlpDedup: 'Content dedup (within a single response): skip blocks identical to the previous one, truncate fragments repeating the already-sent text',
     dlpRepeatCheck: 'Cross-request repeat check (across turns): flag as repetition when request and reply both match the previous round (stores each round reply)',
+    dlpWarn: 'Cross-request warning injection: after tripping/repetition, inject a system warning into the next request so the AI stops repeating (once only)',
     dlpMaxRepeat: 'Consecutive repeat trip threshold MaxRepeat (≥2, default 3)',
     dlpWarnPrompt: 'Cross-request warning prompt WarnPrompt', dlpWarnHint: 'After tripping, inject a system warning into the next request so the AI stops repeating (once only)', dlpWarnPh: '[System warning] Your previous reply contained duplicated content (possible loop). Stop repeating immediately and give the final answer directly. Do not repeat any already-output text.',
     rulesTitle: '✂️ Request Prompt Replace RequestPromptReplace', rulesHint: 'Automatically replace specified text in requests', btnAddRule: '＋ Add Rule',
@@ -662,6 +665,7 @@ async function loadCfg(notify){
     $('DlpEnable').checked = !!dlp.Enable;
     $('DlpDedup').checked = !!dlp.Dedup;
     $('DlpRepeatCheck').checked = !!dlp.RepeatCheck;
+    $('DlpWarn').checked = !!dlp.Warn;
     $('DlpMaxRepeat').value = dlp.MaxRepeat || 3;
     $('DlpWarnPrompt').value = dlp.WarnPrompt || '';
     toggleDlpInputs();
@@ -800,7 +804,7 @@ function removeAt(arr, i, render){ arr.splice(i, 1); render(); }
 // 末日循环保护：总开关关闭时子选项置灰禁用（分级联动）
 function toggleDlpInputs(){
   var on = $('DlpEnable').checked;
-  ['rowDlpDedup','rowDlpRepeatCheck','rowDlpMaxRepeat','rowDlpWarnPrompt'].forEach(function(id){
+  ['rowDlpDedup','rowDlpRepeatCheck','rowDlpWarn','rowDlpMaxRepeat','rowDlpWarnPrompt'].forEach(function(id){
     var row = $(id);
     if(row){ row.classList.toggle('disabled-row', !on); }
   });
@@ -893,6 +897,7 @@ function collectCfg(){
       Enable: $('DlpEnable').checked,
       RepeatCheck: $('DlpRepeatCheck').checked,
       Dedup: $('DlpDedup').checked,
+      Warn: $('DlpWarn').checked,
       MaxRepeat: parseInt($('DlpMaxRepeat').value, 10) || 3,
       WarnPrompt: $('DlpWarnPrompt').value.trim()
     },
