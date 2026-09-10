@@ -1258,7 +1258,7 @@ func saveVisionCache(img visionImage, prompt string, result string) {
 func recognizeImageWithProxy(ctx context.Context, img visionImage, proxyModel string, prompt string) (string, error) {
 	// 1. 尝试命中本地缓存
 	if cached, ok := loadVisionCache(img, prompt); ok {
-		fmt.Println("💾 视觉代理: 命中本地缓存，跳过识别")
+		fmt.Println("💾 视觉代理: 命中本地缓存，跳过识别 (命中缓存)")
 		return cached, nil
 	}
 
@@ -1480,12 +1480,17 @@ func applyVisionProxy(ctx context.Context, body []byte, modelID string) ([]byte,
 		// 历史图片命中缓存时直接复用（毫秒级），未命中才调用代理模型。
 		var descriptions []string
 		var pending []visionImage
+		cachedCount := 0
 		for _, img := range msgImages {
 			if desc, ok := loadVisionCache(img, prompt); ok {
 				descriptions = append(descriptions, desc)
+				cachedCount++
 			} else {
 				pending = append(pending, img)
 			}
+		}
+		if cachedCount > 0 {
+			fmt.Printf("💾 视觉代理: 本条消息 %d 张图片中 %d 张命中缓存，直接复用 (命中缓存)\n", len(msgImages), cachedCount)
 		}
 		if len(pending) > 0 {
 			fmt.Printf("🖼️ 视觉代理: 本条消息 %d 张图片中 %d 张未命中缓存，并发识别中...\n", len(msgImages), len(pending))
@@ -3076,6 +3081,10 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		fmt.Printf("❌ 上游请求失败: %v\n", err)
+		if r.Context().Err() != nil {
+			return // 客户端已断开，无需返回错误
+		}
 		http.Error(w, "upstream error", 500)
 		return
 	}
@@ -3193,6 +3202,10 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		fmt.Printf("❌ 上游请求失败: %v\n", err)
+		if r.Context().Err() != nil {
+			return // 客户端已断开，无需返回错误
+		}
 		http.Error(w, "upstream error", 500)
 		return
 	}
@@ -3537,6 +3550,10 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("❌ 上游请求失败: %v\n", err)
+		if r.Context().Err() != nil {
+			return // 客户端已断开，无需返回错误
+		}
 		http.Error(w, "upstream error", 500)
 		return
 	}
@@ -3658,6 +3675,10 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("❌ 上游请求失败: %v\n", err)
+		if r.Context().Err() != nil {
+			return // 客户端已断开，无需返回错误
+		}
 		http.Error(w, "upstream error", 500)
 		return
 	}
@@ -3665,6 +3686,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
+		fmt.Printf("⚠️ 上游返回 HTTP %d: %s\n", resp.StatusCode, truncateStr(string(raw), 300))
 		contentType := resp.Header.Get("Content-Type")
 		if contentType == "" {
 			contentType = "application/json"
@@ -3978,6 +4000,10 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("❌ 上游请求失败: %v\n", err)
+		if r.Context().Err() != nil {
+			return // 客户端已断开，无需返回错误
+		}
 		http.Error(w, `{"error":{"type":"api_error","message":"upstream error"}}`, 500)
 		return
 	}
@@ -4123,6 +4149,10 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	client := &http.Client{Transport: getSharedTransport()}
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("❌ 上游请求失败: %v\n", err)
+		if r.Context().Err() != nil {
+			return // 客户端已断开，无需返回错误
+		}
 		http.Error(w, `{"error":{"type":"api_error","message":"upstream error"}}`, 500)
 		return
 	}
@@ -5853,8 +5883,14 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		}
 		json.Unmarshal(body, &reqMeta)
 		if reqMeta.Model != "" {
-			if newBody, proxied := applyVisionProxy(r.Context(), body, reqMeta.Model); proxied {
+			// 视觉代理识别用独立 context：识别结果会写入本地缓存复用，
+			// 客户端断开不应中断已开始的识别（避免浪费已消耗的识别请求）
+			if newBody, proxied := applyVisionProxy(context.Background(), body, reqMeta.Model); proxied {
 				body = newBody
+				// 客户端已断开：识别结果已缓存，直接返回，不再转发主请求
+				if r.Context().Err() != nil {
+					return
+				}
 			}
 		}
 	}
