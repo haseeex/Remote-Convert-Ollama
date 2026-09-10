@@ -588,6 +588,10 @@ type OpenAIChunk struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
 		TotalTokens      int `json:"total_tokens"`
+		// 缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
+		PromptTokensDetails *struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details,omitempty"`
 	} `json:"usage,omitempty"`
 }
 
@@ -2934,6 +2938,21 @@ func hasCapability(caps []string, capability string) bool {
 	return false
 }
 
+// cachePct 计算缓存占输入 token 的比例字符串（如 " (99.97%)"），pt<=0 时返回空串
+// 保留 2 位小数：99.97% 不会被四舍五入成 100.0%，避免"缓存占比 100%"的误导
+func cachePct(pt, cached int) string {
+	if pt <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%.2f%%)", float64(cached)*100/float64(pt))
+}
+
+// logTokenUsage 打印 token 明细日志（统一格式：输入/输出/缓存/缓存占比）
+// source: 上游 / 估算
+func logTokenUsage(source string, pt, ct, cached int) {
+	fmt.Printf("🔢 [%s] Token[%s] 输入:%d 输出:%d 缓存:%d%s\n", time.Now().Format("15:04:05"), source, pt, ct, cached, cachePct(pt, cached))
+}
+
 // estimateTokens 估算文本的 token 数（粗略估计：ASCII 约 4 字符=1 token，中文等非 ASCII 约 1 字=1 token）
 // 用途：上游不返回 usage 时本地估算，保证 VS Code 上下文占用显示不为 0
 func estimateTokens(text string) int {
@@ -3116,12 +3135,19 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	// 提取上游 usage（真实 token 计数）
 	inputTokens := int64(0)
 	outputTokens := int64(0)
+	cachedTokens := int64(0)
 	if usage, ok := upstreamResp["usage"].(map[string]interface{}); ok {
 		if pt, ok := usage["prompt_tokens"].(float64); ok && pt > 0 {
 			inputTokens = int64(pt)
 		}
 		if ct, ok := usage["completion_tokens"].(float64); ok && ct > 0 {
 			outputTokens = int64(ct)
+		}
+		// 提取缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
+		if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+			if cct, ok := details["cached_tokens"].(float64); ok && cct > 0 {
+				cachedTokens = int64(cct)
+			}
 		}
 	}
 	// 上游未返回 usage 时本地估算，保证 VS Code 上下文占用显示不为 0
@@ -3134,7 +3160,7 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		outputTokens = int64(estimateTokens(content) + estimateTokens(reasoningContent))
 		usageSource = "估算"
 	}
-	fmt.Printf("🔢 [%s] Token [%s] 输入:%d 输出:%d (finish=%s)\n", time.Now().Format("15:04:05"), usageSource, inputTokens, outputTokens, finishReason)
+	fmt.Printf("🔢 [%s] Token[%s] 输入:%d 输出:%d 缓存:%d%s (finish=%s)\n", time.Now().Format("15:04:05"), usageSource, inputTokens, outputTokens, cachedTokens, cachePct(int(inputTokens), int(cachedTokens)), finishReason)
 
 	out := map[string]interface{}{
 		"model":             model,
@@ -3146,6 +3172,10 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		"load_duration":     1,
 		"prompt_eval_count": inputTokens,
 		"eval_count":        outputTokens,
+	}
+	// Ollama 规范：prompt_eval_cached_count 为缓存命中 token 数（未命中时省略）
+	if cachedTokens > 0 {
+		out["prompt_eval_cached_count"] = cachedTokens
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3199,6 +3229,7 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 	model, _ := payload["model"].(string)
 	inputTokens := 0
 	outputTokens := 0
+	cachedTokens := 0 // 缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
 	var fullContent strings.Builder
 	var reasoningContent strings.Builder // 累积 reasoning_content（思考模式）
 	lastThinkingLen := 0                 // 已发送的 thinking 长度（用于增量发送）
@@ -3245,6 +3276,10 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 				out["eval_count"] = outputTokens
 			} else {
 				out["eval_count"] = tokens
+			}
+			// Ollama 规范：prompt_eval_cached_count 为缓存命中 token 数（未命中时省略）
+			if cachedTokens > 0 {
+				out["prompt_eval_cached_count"] = cachedTokens
 			}
 		}
 		if err := json.NewEncoder(w).Encode(out); err == nil {
@@ -3304,6 +3339,10 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 			}
 			if chunk.Usage.CompletionTokens > 0 {
 				outputTokens = chunk.Usage.CompletionTokens
+			}
+			// 提取缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
+			if chunk.Usage.PromptTokensDetails != nil && chunk.Usage.PromptTokensDetails.CachedTokens > 0 {
+				cachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
 			}
 		}
 
@@ -3422,7 +3461,7 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 		outputTokens = estimateTokens(fullContent.String()) + estimateTokens(reasoningContent.String())
 		usageSource = "估算"
 	}
-	fmt.Printf("🔢 [%s] Token[%s] 输入:%d 输出:%d (finish=%s, tool_calls=%v)\n", time.Now().Format("15:04:05"), usageSource, inputTokens, outputTokens, upstreamFinishReason, hasToolCalls)
+	fmt.Printf("🔢 [%s] Token[%s] 输入:%d 输出:%d 缓存:%d%s (finish=%s, tool_calls=%v)\n", time.Now().Format("15:04:05"), usageSource, inputTokens, outputTokens, cachedTokens, cachePct(inputTokens, cachedTokens), upstreamFinishReason, hasToolCalls)
 
 	// 构建最终消息
 	// 注意：不再要求 finish_reason == "tool_calls" 才下发 tool_calls。
@@ -3574,8 +3613,30 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 				"prompt_tokens":     inputTokens,
 				"completion_tokens": outputTokens,
 				"total_tokens":      inputTokens + outputTokens,
+				// OpenAI 规范：缓存命中数（估算时无缓存信息，显式补 0）
+				"prompt_tokens_details": map[string]interface{}{
+					"cached_tokens": 0,
+				},
 			}
-			fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, outputTokens)
+			logTokenUsage("估算", inputTokens, outputTokens, 0)
+		} else {
+			// 上游返回了 usage：打印完整 token 明细（含缓存命中数）
+			pt := 0
+			ct := 0
+			cached := 0
+			if v, ok := usage["prompt_tokens"].(float64); ok {
+				pt = int(v)
+			}
+			if v, ok := usage["completion_tokens"].(float64); ok {
+				ct = int(v)
+			}
+			// OpenAI 规范：usage.prompt_tokens_details.cached_tokens
+			if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+				if cct, ok := details["cached_tokens"].(float64); ok {
+					cached = int(cct)
+				}
+			}
+			logTokenUsage("上游", pt, ct, cached)
 		}
 		// 重新序列化（因为可能修改了 message / usage）
 		if modified, _ := json.Marshal(upstreamResp); modified != nil {
@@ -3718,6 +3779,23 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 		// VS Code Copilot 依赖流末尾的 usage chunk 更新上下文窗口占用，
 		// 跳过会导致上下文占用一直显示 0。
 		if len(rawChunk.Choices) == 0 && len(chunkUsage) > 0 {
+			// 打印完整 token 明细（含缓存命中数）
+			pt := 0
+			ct := 0
+			cached := 0
+			if v, ok := chunkUsage["prompt_tokens"].(float64); ok {
+				pt = int(v)
+			}
+			if v, ok := chunkUsage["completion_tokens"].(float64); ok {
+				ct = int(v)
+			}
+			// OpenAI 规范：usage.prompt_tokens_details.cached_tokens
+			if details, ok := chunkUsage["prompt_tokens_details"].(map[string]interface{}); ok {
+				if cct, ok := details["cached_tokens"].(float64); ok {
+					cached = int(cct)
+				}
+			}
+			logTokenUsage("上游", pt, ct, cached)
 			payload := map[string]interface{}{
 				"id":      rawChunk.ID,
 				"object":  rawChunk.Object,
@@ -3765,9 +3843,13 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 											"prompt_tokens":     inputTokens,
 											"completion_tokens": outputTokens,
 											"total_tokens":      inputTokens + outputTokens,
+											// OpenAI 规范：缓存命中数（估算时无缓存信息，显式补 0）
+											"prompt_tokens_details": map[string]interface{}{
+												"cached_tokens": 0,
+											},
 										},
 									})
-									fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, outputTokens)
+									logTokenUsage("估算", inputTokens, outputTokens, 0)
 								}
 								return
 							}
@@ -3839,9 +3921,13 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 				"prompt_tokens":     inputTokens,
 				"completion_tokens": outputTokens,
 				"total_tokens":      inputTokens + outputTokens,
+				// OpenAI 规范：缓存命中数（估算时无缓存信息，显式补 0）
+				"prompt_tokens_details": map[string]interface{}{
+					"cached_tokens": 0,
+				},
 			},
 		})
-		fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, outputTokens)
+		logTokenUsage("估算", inputTokens, outputTokens, 0)
 	}
 
 	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
@@ -4070,6 +4156,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	// 先以估算值兜底：上游返回 usage 后会被真实值覆盖
 	inputTokens := estimatedInputTokens
 	outputTokens := 0
+	cachedTokens := 0 // 缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
 	msgStarted := false
 	streamClosed := false        // 是否已发送 message_stop（防止重复收尾）
 	var fullText strings.Builder // 累积输出文本，用于上游未返回 usage 时的输出估算
@@ -4084,8 +4171,18 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			return outputTokens
 		}
 		est := estimateTokens(fullText.String())
-		fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, est)
+		logTokenUsage("估算", inputTokens, est, cachedTokens)
 		return est
+	}
+	// 构造 message_delta 的 usage（Anthropic 规范：cache_read_input_tokens 未命中时省略）
+	deltaUsage := func() map[string]interface{} {
+		u := map[string]interface{}{
+			"output_tokens": getOutputTokens(),
+		}
+		if cachedTokens > 0 {
+			u["cache_read_input_tokens"] = cachedTokens
+		}
+		return u
 	}
 
 	// 内容块跟踪：0=text, 1=tool_use...
@@ -4140,6 +4237,10 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				PromptTokens     int `json:"prompt_tokens"`
 				CompletionTokens int `json:"completion_tokens"`
 				TotalTokens      int `json:"total_tokens"`
+				// 缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
+				PromptTokensDetails *struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details,omitempty"`
 			} `json:"usage,omitempty"`
 		}
 		if err := json.Unmarshal([]byte(dataStr), &rawDelta); err != nil {
@@ -4154,6 +4255,11 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			if rawDelta.Usage.CompletionTokens > 0 {
 				outputTokens = rawDelta.Usage.CompletionTokens
 			}
+			// 提取缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
+			if rawDelta.Usage.PromptTokensDetails != nil && rawDelta.Usage.PromptTokensDetails.CachedTokens > 0 {
+				cachedTokens = rawDelta.Usage.PromptTokensDetails.CachedTokens
+			}
+			logTokenUsage("上游", inputTokens, outputTokens, cachedTokens)
 		}
 
 		if len(rawDelta.Choices) == 0 {
@@ -4183,6 +4289,14 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 		// --- 发送 message_start（首次） ---
 		if !msgStarted {
 			msgStarted = true
+			startUsage := map[string]interface{}{
+				"input_tokens":  inputTokens,
+				"output_tokens": 0,
+			}
+			// Anthropic 规范：usage.cache_read_input_tokens 为缓存命中 token 数（未命中时省略）
+			if cachedTokens > 0 {
+				startUsage["cache_read_input_tokens"] = cachedTokens
+			}
 			sendSSEEvent(w, flusher, "message_start", map[string]interface{}{
 				"type": "message_start",
 				"message": map[string]interface{}{
@@ -4193,10 +4307,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 					"model":         areq.Model,
 					"stop_reason":   nil,
 					"stop_sequence": nil,
-					"usage": map[string]interface{}{
-						"input_tokens":  inputTokens,
-						"output_tokens": 0,
-					},
+					"usage":         startUsage,
 				},
 			})
 		}
@@ -4393,9 +4504,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 					"stop_reason":   stopReason,
 					"stop_sequence": nil,
 				},
-				"usage": map[string]interface{}{
-					"output_tokens": getOutputTokens(),
-				},
+				"usage": deltaUsage(),
 			})
 			sendSSEEvent(w, flusher, "message_stop", map[string]interface{}{
 				"type": "message_stop",
@@ -4429,9 +4538,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				"stop_reason":   stopReason,
 				"stop_sequence": nil,
 			},
-			"usage": map[string]interface{}{
-				"output_tokens": getOutputTokens(),
-			},
+			"usage": deltaUsage(),
 		})
 		sendSSEEvent(w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
@@ -4441,6 +4548,14 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	// 零 chunk 兜底：上游返回 200 但一个 delta 都没发（空响应/网关异常），
 	// 若什么都不发客户端会挂起并重试 → 死循环。补发一个完整的空消息。
 	if !msgStarted {
+		startUsage := map[string]interface{}{
+			"input_tokens":  inputTokens,
+			"output_tokens": 0,
+		}
+		// Anthropic 规范：usage.cache_read_input_tokens 为缓存命中 token 数（未命中时省略）
+		if cachedTokens > 0 {
+			startUsage["cache_read_input_tokens"] = cachedTokens
+		}
 		sendSSEEvent(w, flusher, "message_start", map[string]interface{}{
 			"type": "message_start",
 			"message": map[string]interface{}{
@@ -4451,10 +4566,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				"model":         areq.Model,
 				"stop_reason":   "end_turn",
 				"stop_sequence": nil,
-				"usage": map[string]interface{}{
-					"input_tokens":  inputTokens,
-					"output_tokens": 0,
-				},
+				"usage":         startUsage,
 			},
 		})
 		sendSSEEvent(w, flusher, "message_delta", map[string]interface{}{
@@ -4463,9 +4575,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				"stop_reason":   "end_turn",
 				"stop_sequence": nil,
 			},
-			"usage": map[string]interface{}{
-				"output_tokens": 0,
-			},
+			"usage": deltaUsage(),
 		})
 		sendSSEEvent(w, flusher, "message_stop", map[string]interface{}{
 			"type": "message_stop",
@@ -4831,6 +4941,7 @@ func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte,
 	}
 
 	// 提取 usage
+	cachedTokens := 0
 	if usage, ok := upstreamResp["usage"].(map[string]interface{}); ok {
 		if pt, ok := usage["prompt_tokens"].(float64); ok {
 			inputTokens = int(pt)
@@ -4838,6 +4949,14 @@ func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte,
 		if ct, ok := usage["completion_tokens"].(float64); ok {
 			outputTokens = int(ct)
 		}
+		// 提取缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
+		if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+			if cct, ok := details["cached_tokens"].(float64); ok && cct > 0 {
+				cachedTokens = int(cct)
+			}
+		}
+		// 上游返回了 usage：打印完整 token 明细（含缓存命中数）
+		logTokenUsage("上游", inputTokens, outputTokens, cachedTokens)
 	}
 
 	// 上游未返回 usage（部分中转不返回）时本地估算兜底，
@@ -4853,7 +4972,7 @@ func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte,
 		if outputTokens <= 0 {
 			outputTokens = estimateTokens(textContent)
 		}
-		fmt.Printf("🔢 [%s] Token[估算] 输入:%d 输出:%d\n", time.Now().Format("15:04:05"), inputTokens, outputTokens)
+		logTokenUsage("估算", inputTokens, outputTokens, cachedTokens)
 	}
 
 	id := "msg_" + generateMsgID()
@@ -4888,6 +5007,10 @@ func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte,
 			"input_tokens":  inputTokens,
 			"output_tokens": outputTokens,
 		},
+	}
+	// Anthropic 规范：usage.cache_read_input_tokens 为缓存命中 token 数（未命中时省略）
+	if cachedTokens > 0 {
+		ar["usage"].(map[string]interface{})["cache_read_input_tokens"] = cachedTokens
 	}
 
 	return json.Marshal(ar)
@@ -5681,6 +5804,8 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	hasImage := hasImageInBody(body)
+	// 每轮请求前空一行，方便区分不同轮次的日志
+	fmt.Println("")
 	if hasImage {
 		fmt.Printf("🖼️ [%s] ===== 客户端 请求 (含图片) =====\n", ts)
 	} else {
