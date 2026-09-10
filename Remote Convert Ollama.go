@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -33,6 +34,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -271,6 +273,10 @@ type Config struct {
 	// VisionImageQuality 全局图片质量配置：视觉识别时图片的压缩策略。
 	// 模型单独的 VisionImageQuality 优先；Quality 枚举：original=原图 / high=高质量 / balanced=平衡 / eco=节省流量 / custom=自定义
 	VisionImageQuality *VisionQuality `json:"VisionImageQuality,omitempty"`
+	// VisionProxyMemCacheSize 视觉代理图片内存缓存大小：视觉代理识别成功保存本地后同时放入内存，
+	// 再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命。
+	// 0=禁用内存缓存（仅磁盘缓存）；启动时按修改时间预加载最近的 N 条到内存。
+	VisionProxyMemCacheSize int `json:"VisionProxyMemCacheSize,omitempty"`
 	// ModelContextPrompt 模型上下文信息注入：自动附加当前模型信息到提示词，帮助模型自我认知
 	ModelContextPrompt ModelContextPrompt `json:"ModelContextPrompt,omitempty"`
 	// DoomLoopProtection 末日循环保护：上游内容重复检测 + 熔断 + 跨请求提醒 AI
@@ -1223,6 +1229,137 @@ type visionImage struct {
 	MIME   string
 }
 
+// ==================== 视觉代理识别结果内存缓存（LRU） ====================
+// 视觉代理识别成功保存本地后同时放入内存，再次遇到相同图片直接命中内存（毫秒级），
+// 减少磁盘读取、延长固态寿命。容量由 Config.VisionProxyMemCacheSize 控制（0=禁用），
+// 启动时按修改时间预加载最近的 N 条到内存。
+
+// visionMemCache 内存 LRU 缓存：key=缓存文件路径（含哈希），value=识别结果
+var visionMemCache = struct {
+	sync.Mutex
+	cap   int
+	items map[string]*list.Element
+	lru   *list.List // 队首=最近使用，队尾=最久未使用
+}{
+	items: make(map[string]*list.Element),
+	lru:   list.New(),
+}
+
+// visionMemCacheEntry LRU 链表节点值
+type visionMemCacheEntry struct {
+	key   string
+	value string
+}
+
+// setVisionMemCacheCap 设置内存缓存容量（0=禁用），并裁剪超出部分
+func setVisionMemCacheCap(cap int) {
+	if cap < 0 {
+		cap = 0
+	}
+	visionMemCache.Lock()
+	defer visionMemCache.Unlock()
+	visionMemCache.cap = cap
+	// 裁剪超出容量的最久未使用项
+	for visionMemCache.cap > 0 && visionMemCache.lru.Len() > visionMemCache.cap {
+		back := visionMemCache.lru.Back()
+		if back == nil {
+			break
+		}
+		visionMemCache.lru.Remove(back)
+		delete(visionMemCache.items, back.Value.(*visionMemCacheEntry).key)
+	}
+}
+
+// visionMemCacheGet 从内存缓存读取，命中返回 true 和内容（并标记为最近使用）
+func visionMemCacheGet(key string) (string, bool) {
+	visionMemCache.Lock()
+	defer visionMemCache.Unlock()
+	if visionMemCache.cap <= 0 {
+		return "", false
+	}
+	el, ok := visionMemCache.items[key]
+	if !ok {
+		return "", false
+	}
+	visionMemCache.lru.MoveToFront(el)
+	return el.Value.(*visionMemCacheEntry).value, true
+}
+
+// visionMemCachePut 写入内存缓存（容量 0 时直接忽略）
+func visionMemCachePut(key string, value string) {
+	visionMemCache.Lock()
+	defer visionMemCache.Unlock()
+	if visionMemCache.cap <= 0 {
+		return
+	}
+	if el, ok := visionMemCache.items[key]; ok {
+		// 已存在：更新值并移到队首
+		el.Value.(*visionMemCacheEntry).value = value
+		visionMemCache.lru.MoveToFront(el)
+		return
+	}
+	el := visionMemCache.lru.PushFront(&visionMemCacheEntry{key: key, value: value})
+	visionMemCache.items[key] = el
+	// 超出容量：淘汰最久未使用项
+	for visionMemCache.lru.Len() > visionMemCache.cap {
+		back := visionMemCache.lru.Back()
+		if back == nil {
+			break
+		}
+		visionMemCache.lru.Remove(back)
+		delete(visionMemCache.items, back.Value.(*visionMemCacheEntry).key)
+	}
+}
+
+// preloadVisionMemCache 启动时预加载：扫描 vision_cache/ 目录，
+// 按修改时间取最近的 cap 条识别结果加载进内存（跳过损坏/空文件）
+func preloadVisionMemCache(cap int) {
+	if cap <= 0 {
+		fmt.Println("💾 视觉代理: 内存缓存已禁用 (VisionProxyMemCacheSize=0)，仅使用磁盘缓存")
+		return
+	}
+	entries, err := os.ReadDir(visionCacheDir)
+	if err != nil {
+		fmt.Println("💾 视觉代理: 内存缓存预加载跳过 (vision_cache/ 目录不存在或不可读)")
+		return // 目录不存在或不可读，跳过预加载
+	}
+	type fileInfo struct {
+		path string
+		mod  time.Time
+	}
+	var files []fileInfo
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".txt") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, fileInfo{path: filepath.Join(visionCacheDir, name), mod: info.ModTime()})
+	}
+	// 按修改时间倒序（最新在前）
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
+	total := len(files)
+	if len(files) > cap {
+		files = files[:cap]
+	}
+	loaded := 0
+	for _, f := range files {
+		data, err := os.ReadFile(f.path)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		visionMemCachePut(f.path, string(data))
+		loaded++
+	}
+	fmt.Printf("💾 视觉代理: 内存缓存预加载完成: 实际读取 %d 条 (磁盘缓存共 %d 条, 最大支持 %d 条)\n", loaded, total, cap)
+}
+
 // visionCachePath 计算图片识别结果的缓存文件路径
 // 缓存键 = SHA256(图片base64 + 提示词)，命中缓存则直接复用识别结果，不重复调用代理模型
 // 注意：图片 base64 是压缩后的数据，不同质量档位压缩结果不同 → 缓存键天然区分档位
@@ -1232,24 +1369,38 @@ func visionCachePath(img visionImage, prompt string) string {
 }
 
 // loadVisionCache 读取视觉识别缓存，命中返回 true 和缓存内容
-func loadVisionCache(img visionImage, prompt string) (string, bool) {
+// 优先命中内存缓存（毫秒级，不读磁盘），未命中再读本地文件
+// 返回 (内容, 是否命中, 来源) 来源: "内存" / "磁盘"
+func loadVisionCache(img visionImage, prompt string) (string, bool, string) {
+	path := visionCachePath(img, prompt)
+	// 1. 内存缓存优先
+	if data, ok := visionMemCacheGet(path); ok {
+		return data, true, "内存"
+	}
+	// 2. 磁盘缓存兜底
 	visionCacheMutex.Lock()
 	defer visionCacheMutex.Unlock()
-	data, err := os.ReadFile(visionCachePath(img, prompt))
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", false
+		return "", false, ""
 	}
-	return string(data), true
+	// 3. 磁盘命中 → 同步进内存，下次直接命中内存
+	visionMemCachePut(path, string(data))
+	return string(data), true, "磁盘"
 }
 
-// saveVisionCache 保存视觉识别结果到本地缓存
+// saveVisionCache 保存视觉识别结果到本地缓存（同时写入内存缓存）
 func saveVisionCache(img visionImage, prompt string, result string) {
+	path := visionCachePath(img, prompt)
 	visionCacheMutex.Lock()
-	defer visionCacheMutex.Unlock()
 	if err := os.MkdirAll(visionCacheDir, 0755); err != nil {
+		visionCacheMutex.Unlock()
 		return
 	}
-	_ = os.WriteFile(visionCachePath(img, prompt), []byte(result), 0644)
+	_ = os.WriteFile(path, []byte(result), 0644)
+	visionCacheMutex.Unlock()
+	// 写入内存缓存（容量 0 时自动忽略）
+	visionMemCachePut(path, result)
 }
 
 // recognizeImageWithProxy 调用视觉代理模型识别单张图片，返回识别文本
@@ -1257,8 +1408,8 @@ func saveVisionCache(img visionImage, prompt string, result string) {
 // ctx 绑定客户端上下文：客户端断开时自动取消上游识别请求，避免继续烧 token
 func recognizeImageWithProxy(ctx context.Context, img visionImage, proxyModel string, prompt string) (string, error) {
 	// 1. 尝试命中本地缓存
-	if cached, ok := loadVisionCache(img, prompt); ok {
-		fmt.Println("💾 视觉代理: 命中本地缓存，跳过识别 (命中缓存)")
+	if cached, ok, src := loadVisionCache(img, prompt); ok {
+		fmt.Printf("💾 视觉代理: 命中%s缓存，跳过识别 (命中缓存)\n", src)
 		return cached, nil
 	}
 
@@ -1481,16 +1632,23 @@ func applyVisionProxy(ctx context.Context, body []byte, modelID string) ([]byte,
 		var descriptions []string
 		var pending []visionImage
 		cachedCount := 0
+		memCount := 0
+		diskCount := 0
 		for _, img := range msgImages {
-			if desc, ok := loadVisionCache(img, prompt); ok {
+			if desc, ok, src := loadVisionCache(img, prompt); ok {
 				descriptions = append(descriptions, desc)
 				cachedCount++
+				if src == "内存" {
+					memCount++
+				} else {
+					diskCount++
+				}
 			} else {
 				pending = append(pending, img)
 			}
 		}
 		if cachedCount > 0 {
-			fmt.Printf("💾 视觉代理: 本条消息 %d 张图片中 %d 张命中缓存，直接复用 (命中缓存)\n", len(msgImages), cachedCount)
+			fmt.Printf("💾 视觉代理: 本条消息 %d 张图片中 %d 张命中缓存，直接复用 (内存 %d 张 + 磁盘 %d 张)\n", len(msgImages), cachedCount, memCount, diskCount)
 		}
 		if len(pending) > 0 {
 			fmt.Printf("🖼️ 视觉代理: 本条消息 %d 张图片中 %d 张未命中缓存，并发识别中...\n", len(msgImages), len(pending))
@@ -1599,23 +1757,24 @@ func makeOllamaMessage(role string, content string, toolCalls []OllamaToolCall, 
 
 func getDefaultConfig() Config {
 	return Config{
-		IP:                    "0.0.0.0",
-		PORT:                  "11434",
-		Log_Limit:             100,
-		Log_Responses:         true,
-		Log_Headers:           true,
-		Log_Body:              true,
-		OpenAIPrefix:          "[VC反代] ",
-		OpenAISuffix:          "",
-		StreamMode:            streamModePreserve,
-		Capabilities:          []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
-		OpenAIBase:            "https://api.openai.com/v1",
-		OpenAIKey:             "",
-		ModelAlias:            map[string]string{},                            // 模型别名：key=上游模型ID, value=显示名称
-		ModelDetailedSettings: map[string]ModelDetailedSetting{},              // 模型详细设置：key=上游模型ID, value={ContextLength, MaxOutputTokens, Capabilities}
-		RequestPromptReplace:  map[string]PromptReplaceRule{},                 // 请求提示词替换规则
-		VisionProxyPrompt:     defaultVisionProxyPrompt,                       // 全局默认视觉代理提示词
-		VisionImageQuality:    &VisionQuality{Quality: visionQualityBalanced}, // 全局图片质量配置（默认平衡）
+		IP:                      "0.0.0.0",
+		PORT:                    "11434",
+		Log_Limit:               100,
+		Log_Responses:           true,
+		Log_Headers:             true,
+		Log_Body:                true,
+		OpenAIPrefix:            "[VC反代] ",
+		OpenAISuffix:            "",
+		StreamMode:              streamModePreserve,
+		Capabilities:            []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
+		OpenAIBase:              "https://api.openai.com/v1",
+		OpenAIKey:               "",
+		ModelAlias:              map[string]string{},                            // 模型别名：key=上游模型ID, value=显示名称
+		ModelDetailedSettings:   map[string]ModelDetailedSetting{},              // 模型详细设置：key=上游模型ID, value={ContextLength, MaxOutputTokens, Capabilities}
+		RequestPromptReplace:    map[string]PromptReplaceRule{},                 // 请求提示词替换规则
+		VisionProxyPrompt:       defaultVisionProxyPrompt,                       // 全局默认视觉代理提示词
+		VisionImageQuality:      &VisionQuality{Quality: visionQualityBalanced}, // 全局图片质量配置（默认平衡）
+		VisionProxyMemCacheSize: 200,                                            // 视觉代理图片内存缓存大小（默认 200，0=禁用）
 		ModelContextPrompt: ModelContextPrompt{
 			Enable:   false,
 			Position: ctxPosPrepend,
@@ -1667,6 +1826,9 @@ func printConfigHelp() {
 	fmt.Println("                     CustomPercent: 仅 Quality=custom 时生效,压缩质量百分比(1-100)")
 	fmt.Println("                     各档位: original=不压缩原样发送 · high=质量90% · balanced=质量70% · eco=质量40%+最长边1024 · custom=自定义质量")
 	fmt.Println("                     图片统一转 JPEG(透明底填充白色),识别缓存键包含压缩参数,切换质量档位不会命中旧缓存")
+	fmt.Println(" ▼ VisionProxyMemCacheSize : 视觉代理图片内存缓存大小(0=禁用,默认200)")
+	fmt.Println("                     识别成功保存本地后同时放入内存,再次遇到相同图片直接命中内存(毫秒级),")
+	fmt.Println("                     减少磁盘读取、延长固态寿命;启动时按修改时间预加载最近的 N 条到内存")
 	fmt.Println(" ▼ RequestPromptReplace: 请求提示词替换规则,自动替换请求中的指定文本")
 	fmt.Println("                     格式: {规则名称: {enable, role, index, prompt, replace}}")
 	fmt.Println("                     优先级:")
@@ -1871,6 +2033,14 @@ func loadConfig() {
 		stored.VisionImageQuality = defaultCfg.VisionImageQuality
 		needSave = true
 	}
+	// 视觉代理图片内存缓存大小（0=禁用）
+	if _, ok := rawMap["VisionProxyMemCacheSize"]; !ok {
+		stored.VisionProxyMemCacheSize = defaultCfg.VisionProxyMemCacheSize
+		needSave = true
+	} else if stored.VisionProxyMemCacheSize < 0 {
+		stored.VisionProxyMemCacheSize = 0
+		needSave = true
+	}
 	if _, ok := rawMap["ModelContextPrompt"]; !ok {
 		stored.ModelContextPrompt = defaultCfg.ModelContextPrompt
 		needSave = true
@@ -1985,6 +2155,10 @@ func loadConfig() {
 
 	// 应用连接池配置（构建共享 Transport）
 	applyConnPoolConfig(stored.ConnPool)
+
+	// 应用视觉代理图片内存缓存大小，并预加载最近的识别结果到内存
+	setVisionMemCacheCap(stored.VisionProxyMemCacheSize)
+	preloadVisionMemCache(stored.VisionProxyMemCacheSize)
 }
 
 func pauseAndExit() {
@@ -2449,6 +2623,10 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	// 规范化图片质量配置（枚举 + 百分比范围）
 	vq := normalizeVisionQuality(ptrOrZero(newCfg.VisionImageQuality))
 	newCfg.VisionImageQuality = &vq
+	// 规范化视觉代理图片内存缓存大小（负数视为 0=禁用）
+	if newCfg.VisionProxyMemCacheSize < 0 {
+		newCfg.VisionProxyMemCacheSize = 0
+	}
 	// 规范化模型详细设置里的图片质量配置
 	for m, s := range newCfg.ModelDetailedSettings {
 		if s.VisionImageQuality != nil {
@@ -2521,6 +2699,12 @@ func applyConfigToRuntime(newCfg Config) {
 	// 图片质量配置（指针类型，规范化后赋值）
 	vq := normalizeVisionQuality(ptrOrZero(newCfg.VisionImageQuality))
 	cfg.VisionImageQuality = &vq
+	// 视觉代理图片内存缓存大小（0=禁用；容量变化时裁剪/扩容，无需重启）
+	if newCfg.VisionProxyMemCacheSize < 0 {
+		newCfg.VisionProxyMemCacheSize = 0
+	}
+	cfg.VisionProxyMemCacheSize = newCfg.VisionProxyMemCacheSize
+	setVisionMemCacheCap(newCfg.VisionProxyMemCacheSize)
 	// 规范化插入位置并应用
 	newCfg.ModelContextPrompt.Position = normalizeCtxPos(newCfg.ModelContextPrompt.Position)
 	cfg.ModelContextPrompt = newCfg.ModelContextPrompt
