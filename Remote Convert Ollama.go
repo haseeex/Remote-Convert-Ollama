@@ -86,6 +86,13 @@ type ModelContextPrompt struct {
 //   - 跨请求复读检测（RepeatCheck）：请求签名 + 回复全文与上一轮相同 → 判定复读并提醒
 //     （独立子开关，默认关闭：需记录每轮回复全文，且"相同请求+相同回复"可能误伤
 //     用户重复提问的正常场景）
+//   - 思考标签消毒（ThinkTag）：ollama cloud 死循环根因防护（ollama/ollama#17617）——
+//     deepseek 系思考模型在长上下文退化时会把字面 </thinking> 标签泄漏进 text 正文通道，
+//     客户端把含裸 </thinking> 的 assistant 消息回放给上游后，上游 prompt 渲染器会在裸
+//     </thinking> 处截断该消息历史 → 模型丢上下文 → 复现垃圾输出 → 死循环。
+//     本开关在转发边界把裸标签替换为 [THINK-START]/[THINK-END]：响应侧防脏历史进入客户端，
+//     请求侧防上游截断历史。只处理"裸"标签（计数不配对），配对的教学示例不误伤。
+//     （独立于 Enable 生效，默认开启：正常对话零影响，只替换异常泄漏）
 type DoomLoopProtection struct {
 	Enable      bool   `json:"Enable"`               // 总开关
 	Dedup       bool   `json:"Dedup"`                // 内容去重（相邻块 + 全文尾部）
@@ -93,6 +100,9 @@ type DoomLoopProtection struct {
 	Warn        bool   `json:"Warn"`                 // 跨请求警告注入（C 方案）：熔断/复读后下一轮注入 system 警告
 	MaxRepeat   int    `json:"MaxRepeat,omitempty"`  // 连续重复熔断阈值（>=2 生效，默认 3）
 	WarnPrompt  string `json:"WarnPrompt,omitempty"` // 跨请求注入的警告提示词（留空=内置默认）
+	// ThinkTag 思考标签消毒：裸 <thinking>/</thinking> 泄漏替换为 [THINK-START]/[THINK-END]
+	// （ollama cloud 死循环防护，独立于 Enable 生效，默认开启）
+	ThinkTag bool `json:"ThinkTag,omitempty"`
 }
 
 // defaultDoomLoopWarnPrompt 默认跨请求警告提示词
@@ -1787,6 +1797,9 @@ func getDefaultConfig() Config {
 			Warn:        false, // 跨请求警告注入默认关闭
 			MaxRepeat:   3,
 			WarnPrompt:  defaultDoomLoopWarnPrompt,
+			// 思考标签消毒默认开启（独立于 Enable 生效）：ollama cloud 死循环根因防护，
+			// 只替换异常泄漏的裸标签，正常对话零影响
+			ThinkTag: true,
 		},
 		ConnPool: defaultConnPool,
 	}
@@ -1843,10 +1856,15 @@ func printConfigHelp() {
 	fmt.Println("                     视觉说明自动判断:Capabilities含vision=原生支持;否则若配置 VisionProxyModel=由该代理模型识别;否则=不支持")
 	fmt.Println("                     示例: {\"Enable\": true, \"Position\": \"prepend\", \"Template\": \"你运行在{model}上,上下文{context_length},最大输出{max_output_tokens},能力{capabilities},{vision}\"}")
 	fmt.Println(" ▼ DoomLoopProtection : 末日循环保护,检测上游内容重复并熔断,防止客户端陷入重试死循环")
-	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), Warn: 跨请求警告注入(熔断/复读后下一轮注入system警告), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词}")
+	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), Warn: 跨请求警告注入(熔断/复读后下一轮注入system警告), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词, ThinkTag: 思考标签消毒}")
 	fmt.Println("                     检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),")
 	fmt.Println("                     Warn 开启时在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)")
 	fmt.Println("                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭")
+	fmt.Println("                     ThinkTag 思考标签消毒(独立于 Enable 生效,默认开启): ollama cloud 死循环根因防护——")
+	fmt.Println("                       deepseek 系思考模型长上下文退化时会把字面 </thinking> 泄漏进正文,客户端回放该历史后")
+	fmt.Println("                       上游渲染器会在裸 </thinking> 处截断消息历史导致死循环(ollama/ollama#17617)。")
+	fmt.Println("                       本开关在转发边界把裸标签替换为 [THINK-START]/[THINK-END]: 响应侧防脏历史进入客户端,")
+	fmt.Println("                       请求侧防上游截断历史; 只处理计数不配对的裸标签,教学示例等配对标签原样保留")
 	fmt.Println("                     示例: {\"Enable\": true, \"Dedup\": true, \"RepeatCheck\": false, \"Warn\": true, \"MaxRepeat\": 3, \"WarnPrompt\": \"请勿重复输出\"}")
 	fmt.Println(" ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启")
 	fmt.Println("                     格式: {MaxIdleConns: 全局最大空闲连接数, MaxIdleConnsPerHost: 每上游主机最大空闲连接数, MaxConnsPerHost: 每上游主机最大并发连接数,")
@@ -2054,6 +2072,14 @@ func loadConfig() {
 	} else {
 		// 规范化熔断阈值
 		stored.DoomLoopProtection = normalizeDoomLoop(stored.DoomLoopProtection)
+		// 旧配置升级：DoomLoopProtection 存在但未声明 ThinkTag（旧字段缺失）时补默认开启，
+		// 避免旧配置升级后丢失 ollama cloud 死循环防护
+		if rawDlp, ok := rawMap["DoomLoopProtection"].(map[string]interface{}); ok {
+			if _, hasThinkTag := rawDlp["ThinkTag"]; !hasThinkTag {
+				stored.DoomLoopProtection.ThinkTag = defaultCfg.DoomLoopProtection.ThinkTag
+				needSave = true
+			}
+		}
 	}
 	if _, ok := rawMap["ConnPool"]; !ok {
 		stored.ConnPool = defaultCfg.ConnPool
@@ -2620,6 +2646,13 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &rawCfg)
 	migrateRequestPromptReplace(&newCfg, rawCfg)
 
+	// 思考标签消毒：旧版配置页未携带 ThinkTag 字段时保持当前运行值（防误关防护）
+	if rawDlp, ok := rawCfg["DoomLoopProtection"].(map[string]interface{}); ok {
+		if _, hasThinkTag := rawDlp["ThinkTag"]; !hasThinkTag {
+			newCfg.DoomLoopProtection.ThinkTag = cfg.DoomLoopProtection.ThinkTag
+		}
+	}
+
 	// 规范化图片质量配置（枚举 + 百分比范围）
 	vq := normalizeVisionQuality(ptrOrZero(newCfg.VisionImageQuality))
 	newCfg.VisionImageQuality = &vq
@@ -2809,6 +2842,166 @@ func truncateStr(s string, n int) string {
 
 // dedupMinLen 全文尾部去重的最小内容长度阈值（低于此长度不参与尾部匹配，防误杀短文本）
 const dedupMinLen = 20
+
+// ==================== 末日循环保护：思考标签消毒 ====================
+// ollama cloud 死循环根因防护（ollama/ollama#17617）：
+// deepseek 系思考模型（尤其 ollama cloud）在长上下文退化时，会把字面 </thinking> 标签泄漏进
+// text 正文通道；客户端把含裸 </thinking> 的 assistant 消息回放给上游后，上游 prompt 渲染器
+// 会在裸 </thinking> 处截断该消息历史（deepseek3.go: SplitN(content, "</thinking>", 2) 丢弃
+// 前半段）→ 模型失去上下文 → 复现同样垃圾输出 → 死循环（193 次相同 tool_call，烧 31M tokens）。
+// 官方仅修复本地渲染路径（PR #18260），cloud 端至今未修，本网关在转发边界做消毒兜底：
+//   - 响应侧：上游泄漏的裸标签在发给客户端前替换，防止脏历史进入客户端会话
+//   - 请求侧：客户端历史里已污染的裸标签在转发上游前替换，防止上游渲染器截断历史
+// 只替换"裸"标签（计数不配对的多余标签），配对的 <thinking>...</thinking> 原样保留
+// （可能是教学示例，不误伤）。
+
+// 思考标签常量：原始标签与安全替代文本
+const (
+	thinkTagOpen      = "<thinking>"
+	thinkTagClose     = "</thinking>"
+	thinkTagSafeOpen  = "[THINK-START]"
+	thinkTagSafeClose = "[THINK-END]"
+)
+
+// thinkTagState 思考标签跨片段配对状态：
+// 流式输出时配对的 <thinking>...</thinking> 可能被拆到多个 chunk（开标签在前块、
+// 闭标签在后块），逐块独立统计会把配对标签误判成裸标签。本状态记录尚未配对的
+// 开标签数，实现跨块精确配对。每个流式请求维护一个独立状态（一轮流结束即弃）。
+type thinkTagState struct {
+	openBalance int // 尚未配对的 <thinking> 数（跨块累积）
+}
+
+// sanitizeThinkTagsInc 增量思考标签消毒：
+// 从左到右扫描片段，维护跨片段配对状态 st，只替换"裸"标签（无配对的）：
+//
+//	裸 </thinking>    → [THINK-END]
+//	（裸 <thinking> 由非流式入口在收尾时统一处理）
+//
+// 配对完整的 <thinking>...</thinking> 原样保留（可能是教学示例，不误伤）。
+// 返回 (处理后的片段, 是否发生了替换)。
+func sanitizeThinkTagsInc(st *thinkTagState, s string) (string, bool) {
+	if strings.Index(s, thinkTagOpen) < 0 && strings.Index(s, thinkTagClose) < 0 {
+		return s, false
+	}
+	var sb strings.Builder
+	modified := false
+	rest := s
+	for len(rest) > 0 {
+		oi := strings.Index(rest, thinkTagOpen)
+		ci := strings.Index(rest, thinkTagClose)
+		if oi < 0 && ci < 0 {
+			sb.WriteString(rest)
+			break
+		}
+		if oi >= 0 && (ci < 0 || oi < ci) {
+			// 开标签先到：原样保留，登记待配对
+			sb.WriteString(rest[:oi])
+			sb.WriteString(rest[oi : oi+len(thinkTagOpen)])
+			st.openBalance++
+			rest = rest[oi+len(thinkTagOpen):]
+		} else {
+			// 闭标签先到
+			sb.WriteString(rest[:ci])
+			if st.openBalance > 0 {
+				// 有未配对的开标签：配对，原样保留
+				st.openBalance--
+				sb.WriteString(rest[ci : ci+len(thinkTagClose)])
+			} else {
+				// 裸闭标签（泄漏特征）：替换为安全文本
+				sb.WriteString(thinkTagSafeClose)
+				modified = true
+			}
+			rest = rest[ci+len(thinkTagClose):]
+		}
+	}
+	return sb.String(), modified
+}
+
+// sanitizeThinkTags 非流式思考标签消毒（一次性处理完整文本）：
+// 先按配对状态机处理，收尾时把仍未配对的 <thinking>（反向泄漏，如教学示例
+// "<thinking>xxx" 无闭标签）从右往左替换为 [THINK-START]。
+// 返回 (处理后的文本, 是否发生了替换)。
+func sanitizeThinkTags(s string) (string, bool) {
+	st := &thinkTagState{}
+	out, modified := sanitizeThinkTagsInc(st, s)
+	// 反向泄漏：结尾有未配对的 <thinking>，从右往左替换最后的 openBalance 个
+	for st.openBalance > 0 {
+		idx := strings.LastIndex(out, thinkTagOpen)
+		if idx < 0 {
+			break
+		}
+		out = out[:idx] + thinkTagSafeOpen + out[idx+len(thinkTagOpen):]
+		st.openBalance--
+		modified = true
+	}
+	return out, modified
+}
+
+// sanitizeContentField 对消息的 content/system 字段做思考标签消毒：
+// string 直接处理；数组块（OpenAI/Anthropic 多模态格式）遍历 text 块处理。
+// 返回是否发生了修改。
+func sanitizeContentField(msg map[string]interface{}, field string) bool {
+	modified := false
+	switch c := msg[field].(type) {
+	case string:
+		if s, ok := sanitizeThinkTags(c); ok {
+			msg[field] = s
+			modified = true
+		}
+	case []interface{}:
+		for _, block := range c {
+			bm, ok := block.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if t, _ := bm["type"].(string); t == "text" {
+				if text, ok := bm["text"].(string); ok {
+					if s, ok := sanitizeThinkTags(text); ok {
+						bm["text"] = s
+						modified = true
+					}
+				}
+			}
+		}
+	}
+	return modified
+}
+
+// sanitizeMessagesThinkTags 对请求体做思考标签消毒（请求侧防护）：
+// 遍历 messages 数组（OpenAI/Ollama/Anthropic 三种格式通用）与 Anthropic 顶层 system 字段，
+// 把客户端历史里已污染的裸 </thinking> 替换为安全文本，防止上游 prompt 渲染器截断
+// assistant 历史导致死循环。返回处理后的请求体（未修改时原样返回）。
+func sanitizeMessagesThinkTags(body []byte) []byte {
+	var req map[string]interface{}
+	if json.Unmarshal(body, &req) != nil {
+		return body
+	}
+	modified := false
+	if msgs, ok := req["messages"].([]interface{}); ok {
+		for _, rawMsg := range msgs {
+			msg, ok := rawMsg.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if sanitizeContentField(msg, "content") {
+				modified = true
+			}
+		}
+	}
+	// Anthropic 顶层 system 字段（string 或数组块）
+	if sanitizeContentField(req, "system") {
+		modified = true
+	}
+	if !modified {
+		return body
+	}
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	fmt.Println("🛡️ 思考标签消毒: 请求历史含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])")
+	return newBody
+}
 
 // dedupStreamContent 对单个流式内容块做去重处理。
 // 两种模式（由 cfg.DoomLoopProtection.Dedup 控制）：
@@ -3312,6 +3505,16 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
+	// 上游泄漏的裸 <thinking>/</thinking> 标签在发给客户端前替换为安全文本，
+	// 防止脏标签进入客户端历史后回放给上游导致渲染器截断历史
+	if cfg.DoomLoopProtection.ThinkTag && content != "" {
+		if s, ok := sanitizeThinkTags(content); ok {
+			fmt.Printf("🛡️ 思考标签消毒: 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
+			content = s
+		}
+	}
+
 	// 末日循环保护：非流式重复检测（响应内部重复 + 跨请求复读）
 	if cfg.DoomLoopProtection.Enable && content != "" {
 		newC, _ := dedupNonStreamContent(content, reqSignature(b), clientIP(r)+"|"+model)
@@ -3436,6 +3639,10 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 	lastContent := ""
 	dupCount := 0
 	dlpTripped := false // 连续重复熔断已触发（强制收尾后不再转发任何内容）
+	// 末日循环保护：思考标签消毒跨块配对状态（配对的 <thinking>...</thinking> 可能
+	// 被拆到多个块，逐块独立统计会误伤；用状态机跨块精确配对，只替换裸标签）
+	ttState := &thinkTagState{}
+	ttCleaned := false // 本轮流式是否替换过裸标签（收尾时汇总为一条日志）
 	reader := bufio.NewReader(resp.Body)
 
 	// 流式 tool_calls 累积器
@@ -3614,6 +3821,15 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 		// 提取普通文本内容
 		content := choice.Delta.Content
 		if content != "" {
+			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
+			// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
+			// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
+			if cfg.DoomLoopProtection.ThinkTag {
+				if s, ok := sanitizeThinkTagsInc(ttState, content); ok {
+					content = s
+					ttCleaned = true
+				}
+			}
 			// 末日循环保护：内容去重 + 连续重复熔断
 			if dlpEnabled && !dlpTripped {
 				var tripped bool
@@ -3706,6 +3922,11 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 		setLastReasoningContent(rc)
 	}
 
+	// 末日循环保护：思考标签消毒汇总（每轮一条日志，避免逐块刷屏）
+	if ttCleaned {
+		fmt.Printf("🛡️ 思考标签消毒: 本轮流式响应已替换裸思考标签为安全文本 ([THINK-START]/[THINK-END])\n")
+	}
+
 	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
 	if dlpEnabled && fullContent.Len() > 0 {
 		checkStreamRepeat(fullContent.String(), reqSignature(b), clientIP(r)+"|"+model)
@@ -3745,6 +3966,28 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Printf("UPSTREAM [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
+
+	// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
+	// 上游泄漏的裸 <thinking>/</thinking> 标签在发给客户端前替换为安全文本，
+	// 防止脏标签进入客户端历史后回放给上游导致渲染器截断历史
+	if cfg.DoomLoopProtection.ThinkTag {
+		var ttResp map[string]interface{}
+		if err := json.Unmarshal(raw, &ttResp); err == nil {
+			if choices, ok := ttResp["choices"].([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if msg, ok := choice["message"].(map[string]interface{}); ok {
+						if c, ok := msg["content"].(string); ok && c != "" {
+							if s, ok2 := sanitizeThinkTags(c); ok2 {
+								fmt.Printf("🛡️ 思考标签消毒: 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
+								msg["content"] = s
+								raw, _ = json.Marshal(ttResp)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 
 	// 末日循环保护：非流式重复检测（响应内部重复 + 跨请求复读）
 	if cfg.DoomLoopProtection.Enable {
@@ -3910,6 +4153,10 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	lastContent := ""
 	dupCount := 0
 	dlpTripped := false // 连续重复熔断已触发（强制收尾后不再转发任何内容）
+	// 末日循环保护：思考标签消毒跨块配对状态（配对的 <thinking>...</thinking> 可能
+	// 被拆到多个块，逐块独立统计会误伤；用状态机跨块精确配对，只替换裸标签）
+	ttState := &thinkTagState{}
+	ttCleaned := false // 本轮流式是否替换过裸标签（收尾时汇总为一条日志）
 	// usage 追踪：上游流式可能只在末尾发 usage-only chunk，也可能完全不发，
 	// 需要记录并转发/兜底，保证 VS Code 上下文窗口占用显示不为 0
 	hasUpstreamUsage := false
@@ -4025,6 +4272,15 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 					delta = deltaMap
 					// 检查是否已有 content → 标记 thinking 结束
 					if c, ok := deltaMap["content"].(string); ok && c != "" {
+						// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
+						// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
+						// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
+						if cfg.DoomLoopProtection.ThinkTag {
+							if s, ok2 := sanitizeThinkTagsInc(ttState, c); ok2 {
+								c = s
+								ttCleaned = true
+							}
+						}
 						// 末日循环保护：内容去重 + 连续重复熔断
 						if dlpEnabled && !dlpTripped {
 							var tripped bool
@@ -4134,6 +4390,11 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 			},
 		})
 		logTokenUsage("估算", inputTokens, outputTokens, 0)
+	}
+
+	// 末日循环保护：思考标签消毒汇总（每轮一条日志，避免逐块刷屏）
+	if ttCleaned {
+		fmt.Printf("🛡️ 思考标签消毒: 本轮流式响应已替换裸思考标签为安全文本 ([THINK-START]/[THINK-END])\n")
 	}
 
 	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
@@ -4379,6 +4640,10 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 	lastContent := ""
 	dupCount := 0
 	dlpTripped := false // 连续重复熔断已触发（强制收尾后不再转发任何内容）
+	// 末日循环保护：思考标签消毒跨块配对状态（配对的 <thinking>...</thinking> 可能
+	// 被拆到多个块，逐块独立统计会误伤；用状态机跨块精确配对，只替换裸标签）
+	ttState := &thinkTagState{}
+	ttCleaned := false // 本轮流式是否替换过裸标签（收尾时汇总为一条日志）
 	// 获取输出 token：上游未返回时本地估算兜底（保证客户端上下文窗口占用显示不为 0）
 	getOutputTokens := func() int {
 		if outputTokens > 0 {
@@ -4565,6 +4830,15 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 
 		// 文本内容 delta
 		if deltaContent != "" {
+			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
+			// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
+			// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
+			if cfg.DoomLoopProtection.ThinkTag {
+				if s, ok := sanitizeThinkTagsInc(ttState, deltaContent); ok {
+					deltaContent = s
+					ttCleaned = true
+				}
+			}
 			// 末日循环保护：内容去重 + 连续重复熔断
 			if dlpEnabled && !dlpTripped {
 				var tripped bool
@@ -4795,6 +5069,11 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			"type": "message_stop",
 		})
 		fmt.Println("⚠️ Anthropic 流式：上游零 chunk 响应，已补发空消息")
+	}
+
+	// 末日循环保护：思考标签消毒汇总（每轮一条日志，避免逐块刷屏）
+	if ttCleaned {
+		fmt.Printf("🛡️ 思考标签消毒: 本轮流式响应已替换裸思考标签为安全文本 ([THINK-START]/[THINK-END])\n")
 	}
 
 	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
@@ -5103,6 +5382,15 @@ func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte,
 			// 提取文本内容
 			if c, ok := msg["content"].(string); ok {
 				textContent = c
+			}
+
+			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
+			// 上游泄漏的裸思考标签在 Anthropic 转换前替换为安全文本
+			if cfg.DoomLoopProtection.ThinkTag && textContent != "" {
+				if s, ok := sanitizeThinkTags(textContent); ok {
+					fmt.Printf("🛡️ 思考标签消毒: Anthropic 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
+					textContent = s
+				}
 			}
 
 			// 提取 tool_calls → 转为 Anthropic tool_use 内容块
@@ -6040,6 +6328,13 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	// 剥离模型名前缀/后缀：客户端会用显示名（含 OpenAI_Prefix/OpenAI_Suffix）发起请求，
 	// 必须还原为上游真实模型 ID，否则上游报 model_not_found
 	body = stripModelPrefixSuffix(body)
+
+	// 末日循环保护：思考标签消毒（请求侧，ollama cloud 死循环根因防护）
+	// 客户端历史里已污染的裸 <thinking>/</thinking> 标签在转发上游前替换为安全文本，
+	// 防止上游 prompt 渲染器在裸 </thinking> 处截断 assistant 历史导致死循环
+	if cfg.DoomLoopProtection.ThinkTag {
+		body = sanitizeMessagesThinkTags(body)
+	}
 
 	// 应用请求提示词替换（先执行，避免后加的模型信息被替换规则的 force/whole 整段覆盖）
 	body = applyRequestPromptReplace(body)
