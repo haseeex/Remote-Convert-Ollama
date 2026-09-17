@@ -102,7 +102,10 @@ type DoomLoopProtection struct {
 	WarnPrompt  string `json:"WarnPrompt,omitempty"` // 跨请求注入的警告提示词（留空=内置默认）
 	// ThinkTag 思考标签消毒：裸 <thinking>/</thinking> 泄漏替换为 [THINK-START]/[THINK-END]
 	// （ollama cloud 死循环防护，独立于 Enable 生效，默认开启）
-	ThinkTag bool `json:"ThinkTag,omitempty"`
+	// ⚠️ 不能用 omitempty：bool 零值 false 会被省略 → 用户关闭后保存，
+	// config.json 里没有该字段 → 前端重新加载拿到 undefined 被 "!== false" 误判为开启
+	// （开关"关不掉"），且重启时"旧配置升级"逻辑还会把缺失字段补回默认开启
+	ThinkTag bool `json:"ThinkTag"`
 }
 
 // defaultDoomLoopWarnPrompt 默认跨请求警告提示词
