@@ -33,8 +33,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,6 +147,24 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// clientSessionKey 生成会话级 key：客户端 IP + User-Agent 指纹。
+// 为什么不用纯 IP：同一台机器上多个客户端（VS Code / VS2026 / Cherry Studio 等）
+// 共享同一个出口 IP，纯 IP 会让它们的跨请求保护状态互相污染：
+//   - A 熔断后的警告可能被 B 的下一轮"偷走"（B 收到莫名警告、A 丢失警告）
+//   - A 触发 assistant-loop 警告后，B 在冷却期内得不到提醒
+//
+// 加入 UA 指纹后，不同客户端互相隔离；同一客户端多窗口仍共享（同一"用户"，可接受）。
+// UA 为空时退化为纯 IP（保持向后兼容）。
+func clientSessionKey(r *http.Request) string {
+	ip := clientIP(r)
+	ua := strings.TrimSpace(r.Header.Get("User-Agent"))
+	if ua == "" {
+		return ip
+	}
+	sum := sha256.Sum256([]byte(ua))
+	return ip + "|" + hex.EncodeToString(sum[:8])
 }
 
 // consumeRepeatWarning 消费警告标记：有则返回 true 并清除（只提醒一次）
@@ -296,6 +316,36 @@ type Config struct {
 	DoomLoopProtection DoomLoopProtection `json:"DoomLoopProtection,omitempty"`
 	// ConnPool 上游连接池设置（HTTP/2 + keep-alive），保存后立即生效，无需重启
 	ConnPool ConnPool `json:"ConnPool,omitempty"`
+	// RealtimeLog 实时请求查看：内存记录最近的请求与响应，供配置页面实时查看
+	RealtimeLog RealtimeLog `json:"RealtimeLog,omitempty"`
+}
+
+// RealtimeLog 实时请求查看：内存记录最近的请求与响应（含请求体/响应体，按 MaxBodyLen 截断），
+// 供配置管理页面「实时请求」标签页实时查看。只存内存、不写磁盘，程序退出即清空。
+type RealtimeLog struct {
+	Enable     bool `json:"Enable"`     // 总开关
+	MaxEntries int  `json:"MaxEntries"` // 保留条数（0 回退默认 100，上限 1000）
+	MaxBodyLen int  `json:"MaxBodyLen"` // 请求/响应体截断长度（0 回退默认 8000 字符）
+}
+
+// defaultRealtimeLog 实时请求查看默认配置
+var defaultRealtimeLog = RealtimeLog{Enable: true, MaxEntries: 100, MaxBodyLen: 8000}
+
+// normalizeRealtimeLog 规范化实时请求查看配置（非法值回退默认，限制上下界）
+func normalizeRealtimeLog(rl RealtimeLog) RealtimeLog {
+	if rl.MaxEntries <= 0 {
+		rl.MaxEntries = defaultRealtimeLog.MaxEntries
+	}
+	if rl.MaxEntries > 1000 {
+		rl.MaxEntries = 1000
+	}
+	if rl.MaxBodyLen <= 0 {
+		rl.MaxBodyLen = defaultRealtimeLog.MaxBodyLen
+	}
+	if rl.MaxBodyLen > 100000 {
+		rl.MaxBodyLen = 100000
+	}
+	return rl
 }
 
 // ConnPool 上游连接池设置（HTTP/2 + keep-alive 连接复用）
@@ -1804,7 +1854,8 @@ func getDefaultConfig() Config {
 			// 只替换异常泄漏的裸标签，正常对话零影响
 			ThinkTag: true,
 		},
-		ConnPool: defaultConnPool,
+		ConnPool:    defaultConnPool,
+		RealtimeLog: defaultRealtimeLog,
 	}
 }
 
@@ -1873,6 +1924,9 @@ func printConfigHelp() {
 	fmt.Println("                     格式: {MaxIdleConns: 全局最大空闲连接数, MaxIdleConnsPerHost: 每上游主机最大空闲连接数, MaxConnsPerHost: 每上游主机最大并发连接数,")
 	fmt.Println("                           IdleConnTimeoutSec: 空闲连接回收秒数, TLSHandshakeTimeoutSec: TLS握手超时秒数, ForceHTTP2: 强制协商HTTP/2}")
 	fmt.Println("                     0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true")
+	fmt.Println(" ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)")
+	fmt.Println("                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,默认8000)}")
+	fmt.Println("                     记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量")
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════════════════════════════════")
 	fmt.Println("")
 }
@@ -2089,6 +2143,12 @@ func loadConfig() {
 		needSave = true
 	} else {
 		stored.ConnPool = normalizeConnPool(stored.ConnPool)
+	}
+	if _, ok := rawMap["RealtimeLog"]; !ok {
+		stored.RealtimeLog = defaultCfg.RealtimeLog
+		needSave = true
+	} else {
+		stored.RealtimeLog = normalizeRealtimeLog(stored.RealtimeLog)
 	}
 	// 迁移旧版替换规则：force / replaceWhole 布尔字段 → mode 枚举
 	if migrateRequestPromptReplace(&stored, rawMap) {
@@ -2408,6 +2468,503 @@ func saveConfig(stored Config) error {
 	return os.WriteFile("config.json", data, 0644)
 }
 
+// ==================== 实时请求查看（Realtime Log） ====================
+// 在内存中记录最近的请求与响应（客户端原始请求体 / 转发上游请求体 / 响应体 / 耗时 / token 用量），
+// 供配置管理页面「实时请求」标签页实时查看（SSE 推送 + 手动刷新）。
+// 只存内存、不写磁盘；条数由 RealtimeLog.MaxEntries 控制，体量由 MaxBodyLen 截断。
+
+type realtimeEntry struct {
+	// mu 保护字段并发读写：请求线程在 addProtection/finish 中写入，
+	// SSE/API 线程通过 clone() 读取（clone 产生独立副本供序列化，避免数据竞争）
+	mu sync.Mutex `json:"-"`
+
+	ID           int64  `json:"ID"`
+	Time         string `json:"Time"`     // HH:MM:SS
+	TimeFull     string `json:"TimeFull"` // 完整时间（含日期）
+	Client       string `json:"Client"`
+	Method       string `json:"Method"`
+	Path         string `json:"Path"`
+	Model        string `json:"Model"`
+	Stream       bool   `json:"Stream"`
+	Status       int    `json:"Status"`
+	DurationMs   int64  `json:"DurationMs"`
+	ReqBody      string `json:"ReqBody"`  // 客户端原始请求体（截断）
+	UpBody       string `json:"UpBody"`   // 注入链处理后的转发上游请求体（截断）
+	RespBody     string `json:"RespBody"` // 响应体（截断；流式为 SSE 原文）
+	ReqTrunc     bool   `json:"ReqTrunc"`
+	UpTrunc      bool   `json:"UpTrunc"`
+	RespTrunc    bool   `json:"RespTrunc"`
+	InTokens     int    `json:"InTokens"`
+	OutTokens    int    `json:"OutTokens"`
+	CachedTokens int    `json:"CachedTokens"`
+	// Protections 本次请求触发的末日循环保护/处理链标记（如思考标签消毒、去重熔断、视觉代理等）
+	Protections []string `json:"Protections,omitempty"`
+}
+
+// clone 生成条目的独立副本（锁内字段快照），供 SSE/API 序列化使用；
+// 避免订阅者 Marshal 时与请求线程的写入发生数据竞争（不拷贝 mu）
+func (e *realtimeEntry) clone() *realtimeEntry {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	c := &realtimeEntry{
+		ID:           e.ID,
+		Time:         e.Time,
+		TimeFull:     e.TimeFull,
+		Client:       e.Client,
+		Method:       e.Method,
+		Path:         e.Path,
+		Model:        e.Model,
+		Stream:       e.Stream,
+		Status:       e.Status,
+		DurationMs:   e.DurationMs,
+		ReqBody:      e.ReqBody,
+		UpBody:       e.UpBody,
+		RespBody:     e.RespBody,
+		ReqTrunc:     e.ReqTrunc,
+		UpTrunc:      e.UpTrunc,
+		RespTrunc:    e.RespTrunc,
+		InTokens:     e.InTokens,
+		OutTokens:    e.OutTokens,
+		CachedTokens: e.CachedTokens,
+	}
+	if len(e.Protections) > 0 {
+		c.Protections = append([]string(nil), e.Protections...)
+	}
+	return c
+}
+
+// 实时记录中的保护/处理标记键（前端按这些键做名称与颜色映射）
+const (
+	rtProtThinkTagReq   = "think-tag-req"   // 请求侧思考标签消毒
+	rtProtThinkTagResp  = "think-tag-resp"  // 响应侧思考标签消毒
+	rtProtDedupSkip     = "dedup-skip"      // 流式相邻块去重（跳过重复块）
+	rtProtDedupTail     = "dedup-tail"      // 流式全文尾部去重（截断重复片段）
+	rtProtDedupTrip     = "dedup-trip"      // 连续重复熔断（强制收尾）
+	rtProtRepeatInner   = "repeat-internal" // 非流式响应内部重复
+	rtProtRepeatCross   = "repeat-cross"    // 跨请求复读
+	rtProtWarnInject    = "warn-inject"     // 跨请求警告注入
+	rtProtAssistantLoop = "assistant-loop"  // assistant 消息重复（自问自答循环）
+	rtProtVisionProxy   = "vision-proxy"    // 视觉代理识别
+	rtProtCtxInject     = "ctx-inject"      // 模型上下文注入
+	rtProtPromptReplace = "prompt-replace"  // 提示词替换
+	rtProtModelAlias    = "model-alias"     // 模型名还原
+)
+
+// realtimeLogStore 实时请求记录环形缓冲 + SSE 订阅者
+var realtimeLogStore = struct {
+	sync.Mutex
+	entries []*realtimeEntry
+	nextID  int64
+	subs    map[chan *realtimeEntry]struct{}
+}{subs: make(map[chan *realtimeEntry]struct{})}
+
+// realtimeTailWindow 响应尾部窗口大小：流式 usage 通常在末尾，
+// 单独保留尾部窗口用于 token 解析（不受展示截断影响）
+const realtimeTailWindow = 8192
+
+// realtimeTrimLocked 裁剪缓冲到配置容量（调用方需持锁）
+func realtimeTrimLocked() {
+	max := normalizeRealtimeLog(cfg.RealtimeLog).MaxEntries
+	if len(realtimeLogStore.entries) > max {
+		// 复制尾部，避免切片持续引用旧底层数组导致内存不释放
+		tail := make([]*realtimeEntry, max)
+		copy(tail, realtimeLogStore.entries[len(realtimeLogStore.entries)-max:])
+		realtimeLogStore.entries = tail
+	}
+}
+
+// realtimeSubsLocked 取订阅者快照（调用方需持锁）
+func realtimeSubsLocked() []chan *realtimeEntry {
+	subs := make([]chan *realtimeEntry, 0, len(realtimeLogStore.subs))
+	for ch := range realtimeLogStore.subs {
+		subs = append(subs, ch)
+	}
+	return subs
+}
+
+// realtimeBroadcast 广播条目（非阻塞：慢订阅者丢弃本条，绝不阻塞请求路径）。
+// 发送 clone 快照：订阅者序列化时不会与请求线程的字段写入竞争
+func realtimeBroadcast(subs []chan *realtimeEntry, e *realtimeEntry) {
+	snap := e.clone()
+	for _, ch := range subs {
+		select {
+		case ch <- snap:
+		default:
+		}
+	}
+}
+
+// realtimeAdd 记录一条请求（环形缓冲，超出容量丢弃最旧；广播给 SSE 订阅者）
+func realtimeAdd(e *realtimeEntry) {
+	if e == nil {
+		return
+	}
+	realtimeLogStore.Lock()
+	realtimeLogStore.nextID++
+	e.ID = realtimeLogStore.nextID
+	realtimeLogStore.entries = append(realtimeLogStore.entries, e)
+	realtimeTrimLocked()
+	subs := realtimeSubsLocked()
+	realtimeLogStore.Unlock()
+
+	realtimeBroadcast(subs, e)
+}
+
+// realtimeUpdate 更新已记录条目并广播（请求完成时调用；
+// 条目已被挤出缓冲时重新追加，保证前端能收到最终结果）
+func realtimeUpdate(e *realtimeEntry) {
+	if e == nil {
+		return
+	}
+	realtimeLogStore.Lock()
+	found := false
+	for _, it := range realtimeLogStore.entries {
+		if it == e {
+			found = true
+			break
+		}
+	}
+	if !found {
+		realtimeLogStore.entries = append(realtimeLogStore.entries, e)
+		realtimeTrimLocked()
+	}
+	subs := realtimeSubsLocked()
+	realtimeLogStore.Unlock()
+
+	realtimeBroadcast(subs, e)
+}
+
+// realtimeSnapshot 返回 ID 大于 after 的所有条目副本（after<=0 时返回全部，从旧到新）
+func realtimeSnapshot(after int64) []*realtimeEntry {
+	realtimeLogStore.Lock()
+	defer realtimeLogStore.Unlock()
+	out := make([]*realtimeEntry, 0, len(realtimeLogStore.entries))
+	for _, e := range realtimeLogStore.entries {
+		if e.ID > after {
+			out = append(out, e.clone())
+		}
+	}
+	return out
+}
+
+// realtimeClearAll 清空所有记录
+func realtimeClearAll() {
+	realtimeLogStore.Lock()
+	realtimeLogStore.entries = nil
+	realtimeLogStore.Unlock()
+}
+
+// realtimeSubscribe 订阅新条目（带缓冲通道，满时丢弃）
+func realtimeSubscribe(ch chan *realtimeEntry) {
+	realtimeLogStore.Lock()
+	realtimeLogStore.subs[ch] = struct{}{}
+	realtimeLogStore.Unlock()
+}
+
+// realtimeUnsubscribe 取消订阅
+func realtimeUnsubscribe(ch chan *realtimeEntry) {
+	realtimeLogStore.Lock()
+	delete(realtimeLogStore.subs, ch)
+	realtimeLogStore.Unlock()
+}
+
+// realtimeCaptureWriter 响应捕获写入器：捕获状态码与响应体（head 用于展示，tail 用于 token 解析）
+type realtimeCaptureWriter struct {
+	http.ResponseWriter
+	head      []byte // 展示用：最多 limit 字节
+	tail      []byte // 尾部滚动窗口：最近 realtimeTailWindow 字节
+	limit     int
+	truncated bool
+	status    int
+	wrote     bool
+}
+
+func (c *realtimeCaptureWriter) WriteHeader(code int) {
+	if !c.wrote {
+		c.status = code
+		c.wrote = true
+	}
+	c.ResponseWriter.WriteHeader(code)
+}
+
+func (c *realtimeCaptureWriter) Write(p []byte) (int, error) {
+	if !c.wrote {
+		c.status = http.StatusOK
+		c.wrote = true
+	}
+	// head 累积（超出 limit 后标记截断，不再累积）
+	if !c.truncated && len(c.head) < c.limit {
+		remain := c.limit - len(c.head)
+		if len(p) <= remain {
+			c.head = append(c.head, p...)
+		} else {
+			c.head = append(c.head, p[:remain]...)
+			c.truncated = true
+		}
+	} else if len(c.head) >= c.limit {
+		c.truncated = true
+	}
+	// tail 滚动窗口（token 解析用，不受展示截断影响）
+	if len(p) >= realtimeTailWindow {
+		c.tail = append(c.tail[:0], p[len(p)-realtimeTailWindow:]...)
+	} else {
+		c.tail = append(c.tail, p...)
+		if len(c.tail) > realtimeTailWindow {
+			copy(c.tail, c.tail[len(c.tail)-realtimeTailWindow:])
+			c.tail = c.tail[:realtimeTailWindow]
+		}
+	}
+	return c.ResponseWriter.Write(p)
+}
+
+// realtimeFlushWriter 带 Flush 透传的捕获写入器（底层支持 Flusher 时使用，
+// 保证 handler 的 w.(http.Flusher) 断言行为与未包装时一致）
+type realtimeFlushWriter struct {
+	*realtimeCaptureWriter
+}
+
+func (f *realtimeFlushWriter) Flush() {
+	if fl, ok := f.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+// realtimeRecorder 一次请求的记录器
+type realtimeRecorder struct {
+	entry *realtimeEntry
+	cap   *realtimeCaptureWriter
+	start time.Time
+}
+
+// realtimeRecorderCtxKey 请求 context 中实时记录器的键：
+// logAllRequests 把记录器放入 context，handler 内部即可用 markProtection 标记触发的保护
+type realtimeRecorderCtxKey struct{}
+
+// markProtection 在实时记录上标记一次保护/处理触发（无记录器或未启用时静默忽略）。
+// name 取值见 rtProt* 常量；同一请求内同名标记自动去重。
+func markProtection(r *http.Request, name string) {
+	if r == nil || name == "" {
+		return
+	}
+	if rec, ok := r.Context().Value(realtimeRecorderCtxKey{}).(*realtimeRecorder); ok && rec != nil {
+		rec.addProtection(name)
+	}
+}
+
+// addProtection 线程安全地追加保护标记（去重）
+func (rec *realtimeRecorder) addProtection(name string) {
+	if rec == nil || name == "" {
+		return
+	}
+	e := rec.entry
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, p := range e.Protections {
+		if p == name {
+			return
+		}
+	}
+	e.Protections = append(e.Protections, name)
+}
+
+// newRealtimeRecorder 创建记录器并包装响应写入器（返回包装后的 w 与记录器），
+// 同时立即登记一条「进行中」记录（Status=0），请求结束时由 finish() 更新并再广播一次
+func newRealtimeRecorder(w http.ResponseWriter, r *http.Request, rawBody []byte) (http.ResponseWriter, *realtimeRecorder) {
+	rl := normalizeRealtimeLog(cfg.RealtimeLog)
+	// 解析模型与流式标记
+	var meta struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	_ = json.Unmarshal(rawBody, &meta)
+
+	e := &realtimeEntry{
+		Time:     time.Now().Format("15:04:05"),
+		TimeFull: time.Now().Format("2006-01-02 15:04:05"),
+		Client:   clientIP(r),
+		Method:   r.Method,
+		Path:     r.URL.Path,
+		Model:    meta.Model,
+		Stream:   meta.Stream,
+		Status:   0,
+	}
+	// 客户端原始请求体（截断）
+	e.ReqBody, e.ReqTrunc = truncateBytes(string(rawBody), rl.MaxBodyLen)
+
+	cap := &realtimeCaptureWriter{ResponseWriter: w, limit: rl.MaxBodyLen}
+	var wrapped http.ResponseWriter
+	if _, ok := w.(http.Flusher); ok {
+		wrapped = &realtimeFlushWriter{realtimeCaptureWriter: cap}
+	} else {
+		wrapped = cap
+	}
+	realtimeAdd(e) // 立即登记：前端可实时看到「进行中」的请求
+	return wrapped, &realtimeRecorder{entry: e, cap: cap, start: time.Now()}
+}
+
+// setUpstreamBody 记录注入链处理后的转发上游请求体（截断）
+func (rec *realtimeRecorder) setUpstreamBody(body []byte) {
+	if rec == nil {
+		return
+	}
+	up, trunc := truncateBytes(string(body), normalizeRealtimeLog(cfg.RealtimeLog).MaxBodyLen)
+	e := rec.entry
+	e.mu.Lock()
+	e.UpBody, e.UpTrunc = up, trunc
+	e.mu.Unlock()
+}
+
+// finish 收尾：填入状态码/耗时/响应体/token 用量，并推入环形缓冲
+func (rec *realtimeRecorder) finish() {
+	if rec == nil {
+		return
+	}
+	e := rec.entry
+	durationMs := time.Since(rec.start).Milliseconds()
+	status := -1 // handler 未写任何内容（客户端断开/提前 return）→ -1 表示无响应
+	if rec.cap.wrote {
+		status = rec.cap.status
+	}
+	respBody := string(rec.cap.head)
+	respTrunc := rec.cap.truncated
+	// token 用量：优先从尾部窗口解析（流式 usage 在末尾）
+	tailStr := string(rec.cap.tail)
+	inTokens := lastMatchInt(rePromptEvalCount, tailStr)
+	if inTokens == 0 {
+		inTokens = lastMatchInt(rePromptTokens, tailStr)
+	}
+	outTokens := lastMatchInt(reEvalCount, tailStr)
+	if outTokens == 0 {
+		outTokens = lastMatchInt(reCompletionTokens, tailStr)
+	}
+	cachedTokens := lastMatchInt(rePromptEvalCached, tailStr)
+	if cachedTokens == 0 {
+		cachedTokens = lastMatchInt(reCachedTokens, tailStr)
+	}
+
+	e.mu.Lock()
+	e.DurationMs = durationMs
+	e.Status = status
+	e.RespBody = respBody
+	e.RespTrunc = respTrunc
+	e.InTokens = inTokens
+	e.OutTokens = outTokens
+	e.CachedTokens = cachedTokens
+	e.mu.Unlock()
+
+	realtimeUpdate(e) // 更新为最终状态（含响应体/耗时/token），并广播
+}
+
+// token 提取正则（Ollama / OpenAI 两种规范字段）
+var (
+	rePromptEvalCount  = regexp.MustCompile(`"prompt_eval_count"\s*:\s*(\d+)`)
+	reEvalCount        = regexp.MustCompile(`"eval_count"\s*:\s*(\d+)`)
+	rePromptEvalCached = regexp.MustCompile(`"prompt_eval_cached_count"\s*:\s*(\d+)`)
+	rePromptTokens     = regexp.MustCompile(`"prompt_tokens"\s*:\s*(\d+)`)
+	reCompletionTokens = regexp.MustCompile(`"completion_tokens"\s*:\s*(\d+)`)
+	reCachedTokens     = regexp.MustCompile(`"cached_tokens"\s*:\s*(\d+)`)
+)
+
+// lastMatchInt 取正则最后一次匹配的数值（流式末尾 usage 才是最终值）
+func lastMatchInt(re *regexp.Regexp, s string) int {
+	ms := re.FindAllStringSubmatch(s, -1)
+	if len(ms) == 0 {
+		return 0
+	}
+	v, _ := strconv.Atoi(ms[len(ms)-1][1])
+	return v
+}
+
+// truncateBytes 按字符截断字符串到 n 个字符（按 rune，避免切断中文多字节字符），
+// 返回 (截断后文本, 是否发生了截断)
+func truncateBytes(s string, n int) (string, bool) {
+	if n <= 0 || len(s) <= n {
+		return s, false
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s, false
+	}
+	return string(runes[:n]), true
+}
+
+// handleRealtimeAPI GET /api/realtime?after=<id> 返回记录列表；DELETE 清空
+func handleRealtimeAPI(w http.ResponseWriter, r *http.Request) {
+	if !requireConfigAuth(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+		entries := realtimeSnapshot(after)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"entries": entries,
+			"enabled": cfg.RealtimeLog.Enable,
+			"total":   len(entries),
+		})
+	case http.MethodDelete:
+		realtimeClearAll()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "message": "已清空实时请求记录"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleRealtimeEvents GET /api/realtime/events?after=<id> SSE 实时推送新条目
+func handleRealtimeEvents(w http.ResponseWriter, r *http.Request) {
+	if !requireConfigAuth(w, r) {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", 500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	// 先补发 after 之后的现有条目（页面刷新/重连不丢数据）
+	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	for _, e := range realtimeSnapshot(after) {
+		if b, err := json.Marshal(e); err == nil {
+			fmt.Fprintf(w, "data: %s\n\n", b)
+		}
+	}
+	flusher.Flush()
+
+	ch := make(chan *realtimeEntry, 64)
+	realtimeSubscribe(ch)
+	defer realtimeUnsubscribe(ch)
+
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case e := <-ch:
+			b, err := json.Marshal(e)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
 // ==================== 本地配置管理网页 ====================
 
 //go:embed web/config.html
@@ -2447,7 +3004,8 @@ func handleConfigAPI(w http.ResponseWriter, r *http.Request) {
 
 // requireConfigAuth 校验配置管理接口的访问权限。
 // 未启用密码（WebConfigPassword 为空）时直接放行；
-// 启用后要求请求头 X-Config-Token 携带有效的服务端会话令牌。
+// 启用后要求请求头 X-Config-Token 携带有效的服务端会话令牌
+// （SSE 等无法自定义请求头的场景可改用 ?token= 查询参数）。
 // 令牌由登录接口签发、存于服务端内存 —— 服务端重启后全部会话失效，
 // 已登录用户必须重新登录，杜绝"重启后仍可免登录修改"的漏洞。
 func requireConfigAuth(w http.ResponseWriter, r *http.Request) bool {
@@ -2455,6 +3013,10 @@ func requireConfigAuth(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	if validConfigSession(r.Header.Get("X-Config-Token")) {
+		return true
+	}
+	// SSE（EventSource）无法自定义请求头 → 支持查询参数传递令牌
+	if validConfigSession(r.URL.Query().Get("token")) {
 		return true
 	}
 	http.Error(w, "未授权：会话已失效，请重新解锁", http.StatusUnauthorized)
@@ -2663,6 +3225,8 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	if newCfg.VisionProxyMemCacheSize < 0 {
 		newCfg.VisionProxyMemCacheSize = 0
 	}
+	// 规范化实时请求查看配置（条数/截断长度上下界）
+	newCfg.RealtimeLog = normalizeRealtimeLog(newCfg.RealtimeLog)
 	// 规范化模型详细设置里的图片质量配置
 	for m, s := range newCfg.ModelDetailedSettings {
 		if s.VisionImageQuality != nil {
@@ -2749,6 +3313,8 @@ func applyConfigToRuntime(newCfg Config) {
 	// 应用连接池配置（重建共享 Transport，立即生效）
 	cfg.ConnPool = normalizeConnPool(newCfg.ConnPool)
 	applyConnPoolConfig(cfg.ConnPool)
+	// 应用实时请求查看配置（记录条数/截断长度，立即生效）
+	cfg.RealtimeLog = normalizeRealtimeLog(newCfg.RealtimeLog)
 }
 
 // apiTestConfig 测试上游 API 连通性并返回模型列表
@@ -2973,11 +3539,11 @@ func sanitizeContentField(msg map[string]interface{}, field string) bool {
 // sanitizeMessagesThinkTags 对请求体做思考标签消毒（请求侧防护）：
 // 遍历 messages 数组（OpenAI/Ollama/Anthropic 三种格式通用）与 Anthropic 顶层 system 字段，
 // 把客户端历史里已污染的裸 </thinking> 替换为安全文本，防止上游 prompt 渲染器截断
-// assistant 历史导致死循环。返回处理后的请求体（未修改时原样返回）。
-func sanitizeMessagesThinkTags(body []byte) []byte {
+// assistant 历史导致死循环。返回 (处理后的请求体, 是否发生了替换)。
+func sanitizeMessagesThinkTags(body []byte) ([]byte, bool) {
 	var req map[string]interface{}
 	if json.Unmarshal(body, &req) != nil {
-		return body
+		return body, false
 	}
 	modified := false
 	if msgs, ok := req["messages"].([]interface{}); ok {
@@ -2996,14 +3562,14 @@ func sanitizeMessagesThinkTags(body []byte) []byte {
 		modified = true
 	}
 	if !modified {
-		return body
+		return body, false
 	}
 	newBody, err := json.Marshal(req)
 	if err != nil {
-		return body
+		return body, false
 	}
 	fmt.Println("🛡️ 思考标签消毒: 请求历史含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])")
-	return newBody
+	return newBody, true
 }
 
 // dedupStreamContent 对单个流式内容块做去重处理。
@@ -3022,24 +3588,25 @@ func sanitizeMessagesThinkTags(body []byte) []byte {
 // 返回值：
 //   - out: 应转发的内容（空字符串 = 应跳过本块）
 //   - tripped: 是否触发了连续重复熔断（调用方应立即强制收尾）
-func dedupStreamContent(content string, full *strings.Builder, last *string, dupCount *int) (out string, tripped bool) {
+//   - reason: 触发原因（供实时记录标记）："adjacent"=相邻块去重 / "tail"=全文尾部去重 / "trip"=连续重复熔断 / ""=未触发
+func dedupStreamContent(content string, full *strings.Builder, last *string, dupCount *int) (out string, tripped bool, reason string) {
 	if content == "" {
-		return "", false
+		return "", false, ""
 	}
 	// ① 相邻块检测：与上一块完全相同 → 重复计数（两种模式都检测）
 	if content == *last {
 		*dupCount++
 		if *dupCount >= cfg.DoomLoopProtection.MaxRepeat {
 			fmt.Printf("🚨 末日循环保护: 连续重复 %d 次, 强制收尾!\n", *dupCount)
-			return "", true
+			return "", true, "trip"
 		}
 		if cfg.DoomLoopProtection.Dedup {
 			// 去重模式：跳过重复块
 			fmt.Printf("⚠️ 末日循环保护: 跳过重复块 [%s]\n", truncateStr(content, 40))
-			return "", false
+			return "", false, "adjacent"
 		}
 		// 纯检测模式：不跳过，原样转发（last 不更新，继续累计重复计数）
-		return content, false
+		return content, false, ""
 	}
 	*dupCount = 0
 	// ② 全文尾部去重：仅去重模式生效（纯检测模式不截断内容）
@@ -3047,12 +3614,12 @@ func dedupStreamContent(content string, full *strings.Builder, last *string, dup
 		fullStr := full.String()
 		if strings.HasSuffix(fullStr, content) {
 			fmt.Printf("⚠️ 末日循环保护: 检测到全文重复, 截断 [%s]\n", truncateStr(content, 40))
-			return "", false
+			return "", false, "tail"
 		}
 	}
 	// ③ 正常内容：更新上一块并返回
 	*last = content
-	return content, false
+	return content, false, ""
 }
 
 // ==================== 末日循环保护：非流式重复检测 ====================
@@ -3123,19 +3690,35 @@ func truncateHalf(s string) string {
 	return string(runes[:len(runes)/2])
 }
 
-// dedupNonStreamContent 非流式响应重复检测与处理。
-// 返回处理后的 content（去重模式截断）和是否触发了警告标记。
-func dedupNonStreamContent(content, reqSig, key string) (string, bool) {
-	if content == "" || !cfg.DoomLoopProtection.Enable {
-		return content, false
+// markDlpReason 把非流式重复检测的触发原因（"internal"/"cross"，可能逗号分隔）标记到实时记录
+func markDlpReason(r *http.Request, reason string) {
+	if reason == "" {
+		return
 	}
-	warned := false
+	for _, part := range strings.Split(reason, ",") {
+		switch part {
+		case "internal":
+			markProtection(r, rtProtRepeatInner)
+		case "cross":
+			markProtection(r, rtProtRepeatCross)
+		}
+	}
+}
+
+// dedupNonStreamContent 非流式响应重复检测与处理。
+// 返回处理后的 content（去重模式截断）和触发原因 reason：
+// "internal"=响应内部重复 / "cross"=跨请求复读 / 两者可能以逗号分隔同时出现 / ""=未触发
+func dedupNonStreamContent(content, reqSig, key string) (string, string) {
+	if content == "" || !cfg.DoomLoopProtection.Enable {
+		return content, ""
+	}
+	var reasons []string
 
 	// ① 响应内部重复
 	if detectInternalRepeat(content) {
 		fmt.Printf("🚨 末日循环保护: 检测到响应内部重复 [%s]\n", truncateStr(content, 40))
 		markRepeatWarning(key)
-		warned = true
+		reasons = append(reasons, "internal")
 		if cfg.DoomLoopProtection.Dedup {
 			content = truncateHalf(content)
 			fmt.Printf("⚠️ 末日循环保护: 已截断重复内容\n")
@@ -3150,7 +3733,7 @@ func dedupNonStreamContent(content, reqSig, key string) (string, bool) {
 		if reqSig != "" && prev.reqSig == reqSig && prev.reply != "" && prev.reply == content {
 			fmt.Printf("🚨 末日循环保护: 检测到跨请求复读 (请求与回复均与上一轮相同)\n")
 			markRepeatWarning(key)
-			warned = true
+			reasons = append(reasons, "cross")
 			if cfg.DoomLoopProtection.Dedup {
 				content = truncateHalf(content)
 				fmt.Printf("⚠️ 末日循环保护: 已截断复读内容\n")
@@ -3163,7 +3746,7 @@ func dedupNonStreamContent(content, reqSig, key string) (string, bool) {
 	lastReplies.m[key] = lastReplyEntry{reqSig: reqSig, reply: content}
 	lastReplies.Unlock()
 
-	return content, warned
+	return content, strings.Join(reasons, ",")
 }
 
 // checkStreamRepeat 流式收尾时调用：跨请求复读检测（流式版）。
@@ -3515,15 +4098,17 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		if s, ok := sanitizeThinkTags(content); ok {
 			fmt.Printf("🛡️ 思考标签消毒: 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
 			content = s
+			markProtection(r, rtProtThinkTagResp)
 		}
 	}
 
 	// 末日循环保护：非流式重复检测（响应内部重复 + 跨请求复读）
 	if cfg.DoomLoopProtection.Enable && content != "" {
-		newC, _ := dedupNonStreamContent(content, reqSignature(b), clientIP(r)+"|"+model)
+		newC, reason := dedupNonStreamContent(content, reqSignature(b), clientSessionKey(r)+"|"+model)
 		if newC != content {
 			content = newC
 		}
+		markDlpReason(r, reason)
 	}
 
 	// 保存 reasoning_content，供后续请求自动注入
@@ -3831,16 +4416,27 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 				if s, ok := sanitizeThinkTagsInc(ttState, content); ok {
 					content = s
 					ttCleaned = true
+					markProtection(r, rtProtThinkTagResp)
 				}
 			}
 			// 末日循环保护：内容去重 + 连续重复熔断
 			if dlpEnabled && !dlpTripped {
 				var tripped bool
-				content, tripped = dedupStreamContent(content, &fullContent, &lastContent, &dupCount)
+				var reason string
+				content, tripped, reason = dedupStreamContent(content, &fullContent, &lastContent, &dupCount)
+				// 实时记录标记：跳过重复块/截断尾部重复/熔断
+				switch reason {
+				case "adjacent":
+					markProtection(r, rtProtDedupSkip)
+				case "tail":
+					markProtection(r, rtProtDedupTail)
+				case "trip":
+					markProtection(r, rtProtDedupTrip)
+				}
 				if tripped {
 					dlpTripped = true
 					// 标记跨请求提醒（C 方案）：下一轮请求注入警告，让 AI 停止复读
-					markRepeatWarning(clientIP(r) + "|" + model)
+					markRepeatWarning(clientSessionKey(r) + "|" + model)
 					break // 强制收尾，不再等待上游
 				}
 			}
@@ -3932,7 +4528,9 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 
 	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
 	if dlpEnabled && fullContent.Len() > 0 {
-		checkStreamRepeat(fullContent.String(), reqSignature(b), clientIP(r)+"|"+model)
+		if checkStreamRepeat(fullContent.String(), reqSignature(b), clientSessionKey(r)+"|"+model) {
+			markProtection(r, rtProtRepeatCross)
+		}
 	}
 }
 
@@ -3984,6 +4582,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 								fmt.Printf("🛡️ 思考标签消毒: 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
 								msg["content"] = s
 								raw, _ = json.Marshal(ttResp)
+								markProtection(r, rtProtThinkTagResp)
 							}
 						}
 					}
@@ -3998,18 +4597,19 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 			Model string `json:"model"`
 		}
 		json.Unmarshal(body, &dlpModel)
-		dlpKey := clientIP(r) + "|" + dlpModel.Model
+		dlpKey := clientSessionKey(r) + "|" + dlpModel.Model
 		var upstreamResp map[string]interface{}
 		if err := json.Unmarshal(raw, &upstreamResp); err == nil {
 			if choices, ok := upstreamResp["choices"].([]interface{}); ok && len(choices) > 0 {
 				if choice, ok := choices[0].(map[string]interface{}); ok {
 					if msg, ok := choice["message"].(map[string]interface{}); ok {
 						if c, ok := msg["content"].(string); ok && c != "" {
-							newC, _ := dedupNonStreamContent(c, reqSignature(body), dlpKey)
+							newC, reason := dedupNonStreamContent(c, reqSignature(body), dlpKey)
 							if newC != c {
 								msg["content"] = newC
 								raw, _ = json.Marshal(upstreamResp)
 							}
+							markDlpReason(r, reason)
 						}
 					}
 				}
@@ -4282,16 +4882,26 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 							if s, ok2 := sanitizeThinkTagsInc(ttState, c); ok2 {
 								c = s
 								ttCleaned = true
+								markProtection(r, rtProtThinkTagResp)
 							}
 						}
 						// 末日循环保护：内容去重 + 连续重复熔断
 						if dlpEnabled && !dlpTripped {
 							var tripped bool
-							c, tripped = dedupStreamContent(c, &loggedContent, &lastContent, &dupCount)
+							var reason string
+							c, tripped, reason = dedupStreamContent(c, &loggedContent, &lastContent, &dupCount)
+							switch reason {
+							case "adjacent":
+								markProtection(r, rtProtDedupSkip)
+							case "tail":
+								markProtection(r, rtProtDedupTail)
+							case "trip":
+								markProtection(r, rtProtDedupTrip)
+							}
 							if tripped {
 								dlpTripped = true
 								// 标记跨请求提醒（C 方案）：下一轮请求注入警告，让 AI 停止复读
-								markRepeatWarning(clientIP(r) + "|" + rawChunk.Model)
+								markRepeatWarning(clientSessionKey(r) + "|" + rawChunk.Model)
 								// 强制收尾：发送 [DONE] 并结束，不再等待上游
 								fmt.Fprintf(w, "data: [DONE]\n\n")
 								flusher.Flush()
@@ -4406,7 +5016,9 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 			Model string `json:"model"`
 		}
 		json.Unmarshal(body, &dlpModel)
-		checkStreamRepeat(loggedContent.String(), reqSignature(body), clientIP(r)+"|"+dlpModel.Model)
+		if checkStreamRepeat(loggedContent.String(), reqSignature(body), clientSessionKey(r)+"|"+dlpModel.Model) {
+			markProtection(r, rtProtRepeatCross)
+		}
 	}
 
 	if cfg.Log_Responses && loggedContent.Len() > 0 {
@@ -4468,7 +5080,7 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. 转换响应体 OpenAI → Anthropic
-	anthropicBody, convErr := convertOpenAIToAnthropic(raw, areq.Model, openaiBody)
+	anthropicBody, convErr := convertOpenAIToAnthropic(r, raw, areq.Model, openaiBody)
 	if convErr != nil {
 		fmt.Println("Anthropic 转换失败:", convErr)
 		// 降级：透传原始响应
@@ -4485,12 +5097,13 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 				if choice, ok := choices[0].(map[string]interface{}); ok {
 					if msg, ok := choice["message"].(map[string]interface{}); ok {
 						if c, ok := msg["content"].(string); ok && c != "" {
-							newC, _ := dedupNonStreamContent(c, reqSignature(openaiBody), clientIP(r)+"|"+areq.Model)
+							newC, reason := dedupNonStreamContent(c, reqSignature(openaiBody), clientSessionKey(r)+"|"+areq.Model)
+							markDlpReason(r, reason)
 							if newC != c {
 								msg["content"] = newC
 								raw, _ = json.Marshal(oaiResp)
 								// 重新转换（内容已截断）
-								if newBody, err2 := convertOpenAIToAnthropic(raw, areq.Model, openaiBody); err2 == nil {
+								if newBody, err2 := convertOpenAIToAnthropic(r, raw, areq.Model, openaiBody); err2 == nil {
 									anthropicBody = newBody
 								}
 							}
@@ -4840,16 +5453,26 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				if s, ok := sanitizeThinkTagsInc(ttState, deltaContent); ok {
 					deltaContent = s
 					ttCleaned = true
+					markProtection(r, rtProtThinkTagResp)
 				}
 			}
 			// 末日循环保护：内容去重 + 连续重复熔断
 			if dlpEnabled && !dlpTripped {
 				var tripped bool
-				deltaContent, tripped = dedupStreamContent(deltaContent, &fullText, &lastContent, &dupCount)
+				var reason string
+				deltaContent, tripped, reason = dedupStreamContent(deltaContent, &fullText, &lastContent, &dupCount)
+				switch reason {
+				case "adjacent":
+					markProtection(r, rtProtDedupSkip)
+				case "tail":
+					markProtection(r, rtProtDedupTail)
+				case "trip":
+					markProtection(r, rtProtDedupTrip)
+				}
 				if tripped {
 					dlpTripped = true
 					// 标记跨请求提醒（C 方案）：下一轮请求注入警告，让 AI 停止复读
-					markRepeatWarning(clientIP(r) + "|" + areq.Model)
+					markRepeatWarning(clientSessionKey(r) + "|" + areq.Model)
 					break // 强制收尾，不再等待上游
 				}
 			}
@@ -5081,7 +5704,9 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 
 	// 末日循环保护：流式跨请求复读检测（收尾时对比上一轮全文）
 	if dlpEnabled && fullText.Len() > 0 {
-		checkStreamRepeat(fullText.String(), reqSignature(openaiBody), clientIP(r)+"|"+areq.Model)
+		if checkStreamRepeat(fullText.String(), reqSignature(openaiBody), clientSessionKey(r)+"|"+areq.Model) {
+			markProtection(r, rtProtRepeatCross)
+		}
 	}
 
 	flusher.Flush()
@@ -5365,7 +5990,8 @@ func convertAnthropicToOpenAI(areq *AnthropicReq) ([]byte, error) {
 
 // 转换 OpenAI 响应 → Anthropic 响应
 // reqBody 为转换后的 OpenAI 请求体：上游未返回 usage 时用于本地估算输入 token
-func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte, error) {
+// r 用于保护标记（思考标签消毒触发时记录到实时请求）
+func convertOpenAIToAnthropic(r *http.Request, raw []byte, model string, reqBody []byte) ([]byte, error) {
 	var upstreamResp map[string]interface{}
 	if err := json.Unmarshal(raw, &upstreamResp); err != nil {
 		return nil, err
@@ -5393,6 +6019,7 @@ func convertOpenAIToAnthropic(raw []byte, model string, reqBody []byte) ([]byte,
 				if s, ok := sanitizeThinkTags(textContent); ok {
 					fmt.Printf("🛡️ 思考标签消毒: Anthropic 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
 					textContent = s
+					markProtection(r, rtProtThinkTagResp)
 				}
 			}
 
@@ -5926,19 +6553,20 @@ func hasImageInBody(body []byte) bool {
 // 客户端（VS Code Copilot 等）会用 /api/tags、/v1/models 返回的显示名
 // （含 OpenAI_Prefix/OpenAI_Suffix）发起请求，这里还原为上游真实模型 ID。
 // 支持 OpenAI /v1/chat/completions、Ollama /api/chat、Anthropic /v1/messages 三种格式。
-func stripModelPrefixSuffix(body []byte) []byte {
+// 返回 (处理后的请求体, 是否发生了还原)
+func stripModelPrefixSuffix(body []byte) ([]byte, bool) {
 	if len(body) == 0 || (cfg.OpenAIPrefix == "" && cfg.OpenAISuffix == "") {
-		return body
+		return body, false
 	}
 
 	var req map[string]interface{}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return body
+		return body, false
 	}
 
 	model, _ := req["model"].(string)
 	if model == "" {
-		return body
+		return body, false
 	}
 
 	cleaned := model
@@ -5949,31 +6577,63 @@ func stripModelPrefixSuffix(body []byte) []byte {
 		cleaned = strings.TrimSuffix(cleaned, cfg.OpenAISuffix)
 	}
 	if cleaned == model {
-		return body
+		return body, false
 	}
 
 	req["model"] = cleaned
 	newBody, err := json.Marshal(req)
 	if err != nil {
-		return body
+		return body, false
 	}
 	fmt.Printf("🔧 模型名还原: %q → %q\n", model, cleaned)
-	return newBody
+	return newBody, true
 }
 
-// injectModelContextPrompt 在请求体中注入当前模型信息提示词（模型ID/上下文长度/最大输出）。
-// 让 AI 模型了解自身运行环境，更合理地规划思考和输出长度。
-// Position 支持 prepend（插入到首条 system 消息开头，无 system 则新建）/ append（追加到末尾）。
-// 支持 OpenAI / Ollama chat 的 messages 数组格式。
-// injectDoomLoopWarning 跨请求注入末日循环警告（C 方案）：
-// 上一轮流式响应发生连续重复熔断后，下一轮请求自动注入 system 警告，
-// 让 AI 停止复读。只提醒一次（consumeRepeatWarning 消费后清除）。
-// clientKey 用于定位会话（如 r.RemoteAddr），与 markRepeatWarning 的 key 保持一致。
+// assistantMsgSignature 生成 assistant 消息签名：content + tool_calls(name+arguments)。
+// 与旧版相比的三处健壮化（防误报）：
+//  1. 空 content 且无 tool_calls 的消息返回空签名（不参与检测）——避免多条空消息撞成 "C:"
+//  2. arguments 兼容 string / 对象两种形态（对象稳定序列化为 JSON）——Ollama 格式不丢参数
+//  3. 空 content 的段落不写入签名（避免 "C:" 前缀污染）
+//
+// 返回空字符串表示该消息不参与循环检测。
+func assistantMsgSignature(m map[string]interface{}) string {
+	var sb strings.Builder
+	if c, ok := m["content"].(string); ok && strings.TrimSpace(c) != "" {
+		sb.WriteString("C:" + c)
+	}
+	if tcs, ok := m["tool_calls"].([]interface{}); ok && len(tcs) > 0 {
+		for _, tc := range tcs {
+			tcm, ok := tc.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			fn, ok := tcm["function"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := fn["name"].(string)
+			sb.WriteString("|T:" + name + ":")
+			switch args := fn["arguments"].(type) {
+			case string:
+				sb.WriteString(args)
+			case nil:
+				// 无参数调用：签名以冒号结尾，同名无参调用仍可正确比对
+			default:
+				// 对象等复杂类型 → 稳定序列化（json.Marshal 的 map key 有序）
+				if b, err := json.Marshal(args); err == nil {
+					sb.Write(b)
+				}
+			}
+		}
+	}
+	return sb.String()
+}
+
 // detectAssistantLoop 检测请求内 assistant 消息重复（Agent 自问自答循环特征）：
-// Agent 循环时，客户端会把模型上一轮的 assistant 消息（含 tool_calls）原样塞回
-// messages 再请求，循环中会出现多条签名相同的 assistant 消息。
-// 签名 = content + tool_calls(name+arguments)，达到 2 条相同即判定循环。
-// 只检测 role=assistant 的消息，不碰 user/tool，正常对话零误伤。
+// 仅统计「连续段」内的重复 —— user / system 消息视为正常对话边界，重置连续性，
+// 避免长会话中相隔多轮的重复工具调用（如先后两次读同一文件）被误判为循环。
+// 签名 = content + tool_calls(name+arguments)；空 content 且无 tool_calls 的消息跳过。
+// 连续（中间只有 tool 消息）出现 2 条相同签名的 assistant 消息 → 判定循环。
 func detectAssistantLoop(body []byte) bool {
 	var req map[string]interface{}
 	if json.Unmarshal(body, &req) != nil {
@@ -5983,68 +6643,100 @@ func detectAssistantLoop(body []byte) bool {
 	if !ok {
 		return false
 	}
-	seen := make(map[string]int)
+	lastSig := ""
 	for _, rawMsg := range msgs {
 		m, ok := rawMsg.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if role, _ := m["role"].(string); role != "assistant" {
+		role, _ := m["role"].(string)
+		switch role {
+		case "user", "system":
+			// 正常对话边界：重置连续性（相隔多轮的重复不算循环）
+			lastSig = ""
 			continue
+		case "assistant":
+			// 继续下面的签名检测
+		default:
+			continue // tool 等其他角色不重置连续性
 		}
-		// 生成 assistant 消息签名：content + tool_calls
-		var sb strings.Builder
-		if c, ok := m["content"].(string); ok {
-			sb.WriteString("C:" + c)
-		}
-		if tcs, ok := m["tool_calls"].([]interface{}); ok {
-			for _, tc := range tcs {
-				if tcm, ok := tc.(map[string]interface{}); ok {
-					if fn, ok := tcm["function"].(map[string]interface{}); ok {
-						name, _ := fn["name"].(string)
-						args, _ := fn["arguments"].(string)
-						sb.WriteString("|T:" + name + ":" + args)
-					}
-				}
-			}
-		}
-		sig := sb.String()
+		sig := assistantMsgSignature(m)
 		if sig == "" {
-			continue
+			continue // 空消息（无 content 无 tool_calls）不参与检测
 		}
-		seen[sig]++
-		if seen[sig] >= 2 {
-			fmt.Printf("🚨 末日循环保护: 检测到请求内 assistant 消息重复 (Agent 自问自答循环)\n")
+		if lastSig != "" && sig == lastSig {
+			fmt.Printf("🚨 末日循环保护: 检测到连续 assistant 消息重复 (Agent 自问自答循环), 签名: %s\n", truncateStr(sig, 80))
 			return true
 		}
+		lastSig = sig
 	}
 	return false
 }
 
-func injectDoomLoopWarning(body []byte, model, clientKey string) []byte {
+// assistantLoopWarned 记录 assistant-loop 警告的注入时间（key → 上次注入时间）。
+// 同一会话在冷却期内只注入一次，避免误报时每轮请求都被注入警告污染。
+var assistantLoopWarned = struct {
+	sync.Mutex
+	m map[string]time.Time
+}{m: make(map[string]time.Time)}
+
+// assistantLoopWarnCooldown assistant-loop 警告注入冷却时间
+const assistantLoopWarnCooldown = 10 * time.Minute
+
+// injectDoomLoopWarning 跨请求注入末日循环警告（C 方案）：
+// 上一轮流式响应发生连续重复熔断后，下一轮请求自动注入 system 警告，
+// 让 AI 停止复读。只提醒一次（consumeRepeatWarning 消费后清除）。
+// clientKey 用于定位会话（由 clientSessionKey 生成：IP + UA 指纹，
+// 保证同机多客户端（VS Code / VS2026 / Cherry Studio）状态互不污染），
+// 与 markRepeatWarning 的 key 保持一致。
+// 返回 (处理后的请求体, 触发原因)："repeat-warn"=上轮熔断/复读提醒 / "assistant-loop"=请求内 assistant 重复 / ""=未注入。
+func injectDoomLoopWarning(body []byte, model, clientKey string) ([]byte, string) {
 	if !cfg.DoomLoopProtection.Enable || !cfg.DoomLoopProtection.Warn || model == "" || len(body) == 0 {
-		return body
+		return body, ""
 	}
 	key := clientKey + "|" + model
 	// 触发条件：① 上一轮熔断/复读标记（consumeRepeatWarning，跨轮次）
 	//           ② 请求内 assistant 消息重复（detectAssistantLoop，Agent 自问自答循环，随 RepeatCheck 开关）
-	triggered := consumeRepeatWarning(key)
-	if !triggered && cfg.DoomLoopProtection.RepeatCheck {
-		triggered = detectAssistantLoop(body)
+	reason := ""
+	if consumeRepeatWarning(key) {
+		reason = "repeat-warn"
+	} else if cfg.DoomLoopProtection.RepeatCheck && detectAssistantLoop(body) {
+		// assistant-loop 警告加冷却：同一会话冷却期内只注入一次，
+		// 避免误报（或持续循环）时每轮请求都被注入警告污染上下文
+		assistantLoopWarned.Lock()
+		now := time.Now()
+		// 顺带清理过期记录，防止 map 无限增长
+		if len(assistantLoopWarned.m) > 64 {
+			for k, t := range assistantLoopWarned.m {
+				if now.Sub(t) > assistantLoopWarnCooldown {
+					delete(assistantLoopWarned.m, k)
+				}
+			}
+		}
+		last := assistantLoopWarned.m[key]
+		allowed := now.Sub(last) > assistantLoopWarnCooldown
+		if allowed {
+			assistantLoopWarned.m[key] = now
+		}
+		assistantLoopWarned.Unlock()
+		if !allowed {
+			return body, ""
+		}
+		reason = "assistant-loop"
 	}
-	if !triggered {
-		return body
+	if reason == "" {
+		return body, ""
 	}
 
 	var req map[string]interface{}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return body
+		return body, ""
 	}
 
 	rawMessages, ok := req["messages"].([]interface{})
 	if !ok {
 		// 非 messages 格式（如 Ollama 单条 prompt 或其它协议）不注入
-		return body
+		return body, ""
 	}
 
 	warn := strings.TrimSpace(cfg.DoomLoopProtection.WarnPrompt)
@@ -6078,26 +6770,31 @@ func injectDoomLoopWarning(body []byte, model, clientKey string) []byte {
 	req["messages"] = rawMessages
 	newBody, err := json.Marshal(req)
 	if err != nil {
-		return body
+		return body, ""
 	}
 	fmt.Printf("🚨 末日循环保护: 已向 [%s] 注入复读警告\n", model)
-	return newBody
+	return newBody, reason
 }
 
-func injectModelContextPrompt(body []byte, model string) []byte {
+// injectModelContextPrompt 在请求体中注入当前模型信息提示词（模型ID/上下文长度/最大输出）。
+// 让 AI 模型了解自身运行环境，更合理地规划思考和输出长度。
+// Position 支持 prepend（插入到首条 system 消息开头，无 system 则新建）/ append（追加到末尾）。
+// 支持 OpenAI / Ollama chat 的 messages 数组格式。
+// 返回 (处理后的请求体, 是否发生了注入)
+func injectModelContextPrompt(body []byte, model string) ([]byte, bool) {
 	if !cfg.ModelContextPrompt.Enable || model == "" || len(body) == 0 {
-		return body
+		return body, false
 	}
 
 	var req map[string]interface{}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return body
+		return body, false
 	}
 
 	rawMessages, ok := req["messages"].([]interface{})
 	if !ok {
 		// 非 messages 格式（如 Ollama 单条 prompt 或其它协议）不注入
-		return body
+		return body, false
 	}
 
 	ctxLen, maxOut := getModelMetaFor(model)
@@ -6108,7 +6805,7 @@ func injectModelContextPrompt(body []byte, model string) []byte {
 	visionNote := buildVisionNote(model)
 	info := renderModelContextTemplate(model, ctxLen, maxOut, capsList, visionNote)
 	if strings.TrimSpace(info) == "" {
-		return body
+		return body, false
 	}
 
 	position := normalizeCtxPos(cfg.ModelContextPrompt.Position)
@@ -6147,17 +6844,18 @@ func injectModelContextPrompt(body []byte, model string) []byte {
 	req["messages"] = rawMessages
 	newBody, err := json.Marshal(req)
 	if err != nil {
-		return body
+		return body, false
 	}
 	fmt.Printf("🧭 模型上下文注入 [%s]: %s\n", model, info)
-	return newBody
+	return newBody, true
 }
 
 // applyRequestPromptReplace 对请求体中的 messages 进行提示词替换
 // 根据配置的 RequestPromptReplace 规则，查找并替换指定位置消息中的文本
-func applyRequestPromptReplace(body []byte) []byte {
+// 返回 (处理后的请求体, 是否发生了替换)
+func applyRequestPromptReplace(body []byte) ([]byte, bool) {
 	if len(body) == 0 || len(cfg.RequestPromptReplace) == 0 {
-		return body
+		return body, false
 	}
 
 	// 检查是否有启用的规则（强制替换模式不需要 prompt）
@@ -6169,12 +6867,12 @@ func applyRequestPromptReplace(body []byte) []byte {
 		}
 	}
 	if !hasEnabled {
-		return body
+		return body, false
 	}
 
 	var req map[string]interface{}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return body
+		return body, false
 	}
 
 	modified := false
@@ -6254,11 +6952,11 @@ func applyRequestPromptReplace(body []byte) []byte {
 		newBody, err := json.Marshal(req)
 		if err == nil {
 			fmt.Println("✅ 提示词替换完成，请求体已更新")
-			return newBody
+			return newBody, true
 		}
 	}
 
-	return body
+	return body, false
 }
 
 // replaceRuleContent 根据规则模式决定替换方式：
@@ -6292,6 +6990,23 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body, _ := io.ReadAll(r.Body)
+
+	// 实时请求查看：包装响应写入器（捕获状态码/响应体）并登记「进行中」记录，
+	// 请求结束时由 finish() 更新为最终状态（响应体/耗时/token 用量）
+	var rec *realtimeRecorder
+	if normalizeRealtimeLog(cfg.RealtimeLog).Enable {
+		w, rec = newRealtimeRecorder(w, r, body)
+	}
+	defer func() {
+		if rec != nil {
+			rec.finish()
+		}
+	}()
+	// 把记录器放入请求 context：handler 内部（流式/非流式三条路径）
+	// 通过 markProtection(r, ...) 即可标记触发的保护（思考标签消毒/去重/熔断等）
+	if rec != nil {
+		r = r.WithContext(context.WithValue(r.Context(), realtimeRecorderCtxKey{}, rec))
+	}
 
 	// 提取会话标识（Ollama 请求格式支持 session_id，OpenAI 格式支持 user 字段）
 	var reqSession struct {
@@ -6330,17 +7045,32 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 
 	// 剥离模型名前缀/后缀：客户端会用显示名（含 OpenAI_Prefix/OpenAI_Suffix）发起请求，
 	// 必须还原为上游真实模型 ID，否则上游报 model_not_found
-	body = stripModelPrefixSuffix(body)
+	if newBody, changed := stripModelPrefixSuffix(body); changed {
+		body = newBody
+		if rec != nil {
+			rec.addProtection(rtProtModelAlias)
+		}
+	}
 
 	// 末日循环保护：思考标签消毒（请求侧，ollama cloud 死循环根因防护）
 	// 客户端历史里已污染的裸 <thinking>/</thinking> 标签在转发上游前替换为安全文本，
 	// 防止上游 prompt 渲染器在裸 </thinking> 处截断 assistant 历史导致死循环
 	if cfg.DoomLoopProtection.ThinkTag {
-		body = sanitizeMessagesThinkTags(body)
+		if newBody, changed := sanitizeMessagesThinkTags(body); changed {
+			body = newBody
+			if rec != nil {
+				rec.addProtection(rtProtThinkTagReq)
+			}
+		}
 	}
 
 	// 应用请求提示词替换（先执行，避免后加的模型信息被替换规则的 force/whole 整段覆盖）
-	body = applyRequestPromptReplace(body)
+	if newBody, changed := applyRequestPromptReplace(body); changed {
+		body = newBody
+		if rec != nil {
+			rec.addProtection(rtProtPromptReplace)
+		}
+	}
 
 	// 模型上下文信息注入：让 AI 了解自身模型/上下文/输出长度，辅助自我认知（最后执行，保证注入稳定不被替换规则误伤）
 	var curModel struct {
@@ -6348,12 +7078,30 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	}
 	json.Unmarshal(body, &curModel)
 	if curModel.Model != "" && cfg.ModelContextPrompt.Enable {
-		body = injectModelContextPrompt(body, curModel.Model)
+		if newBody, changed := injectModelContextPrompt(body, curModel.Model); changed {
+			body = newBody
+			if rec != nil {
+				rec.addProtection(rtProtCtxInject)
+			}
+		}
 	}
 
 	// 末日循环保护（C 方案）：上一轮流式发生连续重复熔断时，本轮注入复读警告
 	if curModel.Model != "" {
-		body = injectDoomLoopWarning(body, curModel.Model, clientIP(r))
+		var warnReason string
+		if newBody, wr := injectDoomLoopWarning(body, curModel.Model, clientSessionKey(r)); wr != "" {
+			body = newBody
+			warnReason = wr
+		}
+		if warnReason == "repeat-warn" {
+			if rec != nil {
+				rec.addProtection(rtProtWarnInject)
+			}
+		} else if warnReason == "assistant-loop" {
+			if rec != nil {
+				rec.addProtection(rtProtAssistantLoop)
+			}
+		}
 	}
 
 	// 视觉代理：主模型不支持图片但配置了 VisionProxyModel 时，
@@ -6369,6 +7117,9 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 			// 客户端断开不应中断已开始的识别（避免浪费已消耗的识别请求）
 			if newBody, proxied := applyVisionProxy(context.Background(), body, reqMeta.Model); proxied {
 				body = newBody
+				if rec != nil {
+					rec.addProtection(rtProtVisionProxy)
+				}
 				// 客户端已断开：识别结果已缓存，直接返回，不再转发主请求
 				if r.Context().Err() != nil {
 					return
@@ -6379,6 +7130,11 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 
 	// 把 body 放回去，否则后面 handler 读不到
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	// 实时请求查看：记录注入链处理后的转发上游请求体（最终形态）
+	if rec != nil {
+		rec.setUpstreamBody(body)
+	}
 
 	// 路由分发
 	// 更新模型参数要这样才生效:
@@ -6501,6 +7257,8 @@ func main() {
 	http.HandleFunc("/api/config/login", apiConfigLogin)
 	http.HandleFunc("/api/config/logout", apiConfigLogout)
 	http.HandleFunc("/api/config/test", apiTestConfig)
+	http.HandleFunc("/api/realtime", handleRealtimeAPI)
+	http.HandleFunc("/api/realtime/events", handleRealtimeEvents)
 
 	webHost := cfg.IP
 	if webHost == "" || webHost == "0.0.0.0" {

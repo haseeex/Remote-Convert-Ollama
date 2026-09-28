@@ -107,6 +107,42 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .login-box .btn{width:100%;justify-content:center;padding:11px}
 .login-err{color:var(--red);font-size:12.5px;min-height:16px;margin:0}
 .login-tip{color:var(--muted);font-size:11.5px;margin:0}
+/* ================= 实时请求查看 RealtimeLog ================= */
+.rt-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.rt-badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border-radius:20px;border:1px solid var(--border);color:var(--muted);background:var(--panel2);white-space:nowrap}
+.rt-badge .dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.rt-badge.on .dot{background:var(--green);box-shadow:0 0 6px rgba(63,185,80,.8);animation:rtpulse 1.6s infinite}
+.rt-badge.off .dot{background:var(--red)}
+.rt-badge.connecting .dot{background:var(--yellow);animation:rtpulse .8s infinite}
+@keyframes rtpulse{0%,100%{opacity:1}50%{opacity:.3}}
+.rt-count{margin-left:auto;font-family:Consolas,monospace;font-size:12px;color:var(--muted)}
+.rt-list{display:flex;flex-direction:column;gap:8px;max-height:66vh;overflow:auto}
+.rt-item{border:1px solid var(--border);border-radius:10px;background:var(--panel2);overflow:hidden;flex-shrink:0}
+.rt-head{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;font-size:12.5px;flex-wrap:wrap;user-select:none}
+.rt-head:hover{background:rgba(88,166,255,.06)}
+.rt-item .chev{color:var(--muted);transition:transform .15s;font-size:10px;flex-shrink:0}
+.rt-item.open .chev{transform:rotate(90deg)}
+.rt-time{font-family:Consolas,monospace;color:var(--muted);flex-shrink:0}
+.rt-model{font-weight:600;color:var(--accent);font-family:Consolas,monospace;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rt-path{font-family:Consolas,monospace;color:var(--muted);font-size:11.5px;flex-shrink:0}
+.rt-tag{font-size:10.5px;padding:1px 7px;border-radius:20px;border:1px solid var(--border);color:var(--muted);background:rgba(139,148,158,.1);flex-shrink:0}
+.rt-status{font-size:11px;padding:2px 8px;border-radius:20px;font-family:Consolas,monospace;flex-shrink:0}
+.rt-status.ok{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}
+.rt-status.err{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}
+.rt-status.pending{background:rgba(210,153,34,.15);color:var(--yellow);border:1px solid rgba(210,153,34,.3);animation:rtpulse 1.4s infinite}
+.rt-meta{margin-left:auto;font-family:Consolas,monospace;font-size:11.5px;color:var(--muted);white-space:nowrap}
+/* 保护/处理触发徽章：思考标签消毒（青）、去重熔断（黄/红）、复读（红）、其他处理（蓝） */
+.rt-prot{display:inline-flex;align-items:center;gap:3px;font-size:10.5px;padding:1px 7px;border-radius:20px;white-space:nowrap;flex-shrink:0;border:1px solid}
+.rt-prot.think{color:#39c5cf;border-color:rgba(57,197,207,.4);background:rgba(57,197,207,.12)}
+.rt-prot.dedup{color:var(--yellow);border-color:rgba(210,153,34,.4);background:rgba(210,153,34,.12)}
+.rt-prot.trip{color:var(--red);border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.15);font-weight:600}
+.rt-prot.repeat{color:#f0883e;border-color:rgba(240,136,62,.4);background:rgba(240,136,62,.12)}
+.rt-prot.proc{color:var(--accent);border-color:rgba(88,166,255,.35);background:rgba(88,166,255,.1)}
+.rt-body{flex-direction:column;gap:6px;padding:4px 12px 12px;border-top:1px solid var(--border);background:rgba(13,17,23,.45)}
+.rt-sec-label{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:8px;margin-top:8px}
+.rt-trunc{font-size:10.5px;color:var(--yellow);border:1px solid rgba(210,153,34,.35);background:rgba(210,153,34,.1);padding:1px 7px;border-radius:10px}
+.rt-pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:Consolas,"Courier New",monospace;font-size:11.5px;line-height:1.55;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;color:#c9d1d9;margin:0}
+.rt-empty{color:var(--muted);font-size:13px;text-align:center;padding:22px}
 </style>
 </head>
 <body>
@@ -132,6 +168,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
     <div class="tab-item" data-tab="log" onclick="switchTab('log')" data-i18n="tabLog">📜 日志设置</div>
     <div class="tab-item" data-tab="model" onclick="switchTab('model')" data-i18n="tabModel">🧩 模型设置</div>
     <div class="tab-item" data-tab="rules" onclick="switchTab('rules')" data-i18n="tabRules">✂️ 提示词替换</div>
+    <div class="tab-item" data-tab="realtime" onclick="switchTab('realtime')" data-i18n="tabRealtime">📡 实时请求</div>
   </div>
   <div class="panels">
     <div class="panel active" id="tab-conn">
@@ -300,6 +337,35 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
         </div>
       </div>
     </div>
+
+    <div class="panel" id="tab-realtime">
+      <div class="card">
+        <div class="head" data-i18n="rtTitle">📡 实时请求查看 RealtimeLog <span class="hint" data-i18n="rtHint">内存记录最近的请求与响应（不写磁盘），保存后立即生效</span></div>
+        <div class="body">
+          <div class="row"><label class="switch"><input type="checkbox" id="RtEnable"><span class="track"></span><span class="lbl" data-i18n="rtEnable">启用：记录请求与响应到内存（供本页实时查看）</span></label></div>
+          <div class="grid2">
+            <div class="row"><label data-i18n="rtMaxEntries">保留条数 MaxEntries（1-1000，默认 100）</label><input type="number" id="RtMaxEntries" min="1" max="1000" placeholder="100"></div>
+            <div class="row"><label data-i18n="rtMaxBodyLen">请求/响应体截断长度 MaxBodyLen（字符，默认 8000）</label><input type="number" id="RtMaxBodyLen" min="100" max="100000" placeholder="8000"></div>
+          </div>
+          <div class="row"><label style="color:var(--muted);font-size:12px" data-i18n="rtWarn">💡 记录含对话内容，仅存本机内存；若配置页面未设密码，局域网内可访问者也能看到，建议启用访问密码</label></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="rtLive">📋 实时记录 <span class="hint" data-i18n="rtLiveHint">最新请求显示在最上方，点击条目展开详情</span></div>
+        <div class="body">
+          <div class="rt-toolbar">
+            <span class="rt-badge off" id="rtBadge"><span class="dot"></span><span id="rtBadgeText">未连接</span></span>
+            <label class="switch"><input type="checkbox" id="rtHideProbe" checked onchange="rtRenderAll()"><span class="track"></span><span class="lbl" data-i18n="rtHideProbe">隐藏探活请求</span></label>
+            <button class="btn small" id="rtPauseBtn" onclick="rtTogglePause()">⏸ 暂停</button>
+            <button class="btn small" onclick="rtRefresh()">🔄 刷新</button>
+            <button class="btn small danger" onclick="rtClear()">🗑 清空</button>
+            <span class="rt-count" id="rtCount"></span>
+          </div>
+          <div class="rt-list" id="rtList"></div>
+        </div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -324,6 +390,8 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 
 <script>
 var state = { aliases: [], details: [], rules: [] };
+// 实时请求状态提前声明：applyI18n（DOMContentLoaded 时调用）会重渲染列表
+var rtState = { items: [], open: {}, paused: false, es: null, lastId: 0, enabled: true, timer: null };
 
 function $(id){ return document.getElementById(id); }
 
@@ -334,6 +402,27 @@ var I18N = {
     subListen: '监听 {addr} · 保存后立即写入 config.json',
     btnTest: '🔌 测试连接',
     tabConn: '🔌 连接设置', tabSec: '🔒 安全设置', tabLog: '📜 日志设置', tabModel: '🧩 模型设置', tabRules: '✂️ 提示词替换',
+    tabRealtime: '📡 实时请求',
+    rtTitle: '📡 实时请求查看 RealtimeLog', rtHint: '内存记录最近的请求与响应（不写磁盘），保存后立即生效',
+    rtEnable: '启用：记录请求与响应到内存（供本页实时查看）',
+    rtMaxEntries: '保留条数 MaxEntries（1-1000，默认 100）', rtMaxBodyLen: '请求/响应体截断长度 MaxBodyLen（字符，默认 8000）',
+    rtWarn: '💡 记录含对话内容，仅存本机内存；若配置页面未设密码，局域网内可访问者也能看到，建议启用访问密码',
+    rtLive: '📋 实时记录', rtLiveHint: '最新请求显示在最上方，点击条目展开详情',
+    rtConnected: '已连接', rtDisconnected: '未连接', rtConnecting: '连接中...', rtAborted: '已断开', rtHideProbe: '隐藏探活请求',
+    rtPause: '⏸ 暂停', rtResume: '▶ 继续', rtRefresh: '🔄 刷新', rtClear: '🗑 清空',
+    rtEmpty: '暂无记录（发一条对话试试～）', rtEmptyOff: '实时记录未启用（在上方打开「启用」并保存）',
+    rtPending: '进行中', rtReqBody: '📤 客户端原始请求体', rtUpBody: '📡 转发上游请求体', rtRespBody: '📥 响应体',
+    rtTrunc: '已截断', rtTokens: 'Token 输入 {i} / 输出 {o}', rtCached: '缓存 {c}', rtMs: '{ms} ms',
+    rtCount: '共 {n} 条', rtCleared: '🗑 已清空实时记录', rtClearFail: '清空失败: ', rtLoadFail: '加载实时记录失败: ', rtRefreshed: '🔄 实时记录已刷新',
+    rtCopied: '📋 已复制到剪贴板', rtCopyFail: '复制失败', rtCopy: '📋 复制',
+    rtStreamYes: '流式', rtStreamNo: '非流式',
+    rtProtTitle: '触发的保护/处理',
+    rtProt_think_tag_req: '请求侧思考标签消毒', rtProt_think_tag_resp: '响应侧思考标签消毒',
+    rtProt_dedup_skip: '去重·跳过重复块', rtProt_dedup_tail: '去重·截断尾部重复', rtProt_dedup_trip: '熔断·连续重复收尾',
+    rtProt_repeat_internal: '响应内部重复', rtProt_repeat_cross: '跨请求复读',
+    rtProt_warn_inject: '注入复读警告', rtProt_assistant_loop: 'assistant 循环检测',
+    rtProt_vision_proxy: '视觉代理识别', rtProt_ctx_inject: '模型上下文注入',
+    rtProt_prompt_replace: '提示词替换', rtProt_model_alias: '模型名还原',
     connListen: '🖥️ 监听设置', connListenHint: '修改 IP / PORT 需重启程序生效',
     lblIP: '监听地址 IP', lblPort: '监听端口 PORT',
     connUpstream: '📡 上游 API', connUpstreamHint: 'OPENAI_KEY 留空表示保持当前密钥',
@@ -393,6 +482,27 @@ var I18N = {
     subListen: 'Listening {addr} · saved to config.json immediately',
     btnTest: '🔌 Test Connection',
     tabConn: '🔌 Connection', tabSec: '🔒 Security', tabLog: '📜 Logging', tabModel: '🧩 Models', tabRules: '✂️ Prompt Replace',
+    tabRealtime: '📡 Realtime',
+    rtTitle: '📡 Realtime Request Viewer RealtimeLog', rtHint: 'Keeps recent requests and responses in memory (no disk writes); takes effect immediately after save',
+    rtEnable: 'Enable: record requests and responses in memory (viewable on this page)',
+    rtMaxEntries: 'Max entries MaxEntries (1-1000, default 100)', rtMaxBodyLen: 'Body truncation length MaxBodyLen (chars, default 8000)',
+    rtWarn: '💡 Records contain conversation content and stay in local memory only; if no config password is set, anyone on the LAN who can open this page can see them — enable an access password',
+    rtLive: '📋 Live Records', rtLiveHint: 'Newest requests appear on top; click an entry to expand details',
+    rtConnected: 'Connected', rtDisconnected: 'Disconnected', rtConnecting: 'Connecting...', rtAborted: 'Aborted', rtHideProbe: 'Hide probes',
+    rtPause: '⏸ Pause', rtResume: '▶ Resume', rtRefresh: '🔄 Refresh', rtClear: '🗑 Clear',
+    rtEmpty: 'No records yet (try sending a chat message~)', rtEmptyOff: 'Realtime log is disabled (turn on "Enable" above and save)',
+    rtPending: 'In progress', rtReqBody: '📤 Client raw request body', rtUpBody: '📡 Upstream request body', rtRespBody: '📥 Response body',
+    rtTrunc: 'truncated', rtTokens: 'Token in {i} / out {o}', rtCached: 'cached {c}', rtMs: '{ms} ms',
+    rtCount: '{n} entries', rtCleared: '🗑 Realtime records cleared', rtClearFail: 'Clear failed: ', rtLoadFail: 'Failed to load realtime records: ', rtRefreshed: '🔄 Realtime records refreshed',
+    rtCopied: '📋 Copied to clipboard', rtCopyFail: 'Copy failed', rtCopy: '📋 Copy',
+    rtStreamYes: 'stream', rtStreamNo: 'non-stream',
+    rtProtTitle: 'Triggered protections/processing',
+    rtProt_think_tag_req: 'Think-tag sanitize (request)', rtProt_think_tag_resp: 'Think-tag sanitize (response)',
+    rtProt_dedup_skip: 'Dedup · skipped block', rtProt_dedup_tail: 'Dedup · truncated tail', rtProt_dedup_trip: 'Trip · forced finish',
+    rtProt_repeat_internal: 'Internal repeat', rtProt_repeat_cross: 'Cross-request repeat',
+    rtProt_warn_inject: 'Repeat warning injected', rtProt_assistant_loop: 'Assistant loop detected',
+    rtProt_vision_proxy: 'Vision proxy', rtProt_ctx_inject: 'Model context injected',
+    rtProt_prompt_replace: 'Prompt replaced', rtProt_model_alias: 'Model name restored',
     connListen: '🖥️ Listen Settings', connListenHint: 'IP / PORT changes require restart',
     lblIP: 'Listen IP', lblPort: 'Listen Port',
     connUpstream: '📡 Upstream API', connUpstreamHint: 'Leave OPENAI_KEY empty to keep current key',
@@ -485,6 +595,10 @@ function applyI18n(){
   $('btnLang').textContent = currentLang === 'zh-CN' ? '🌐 EN' : '🌐 中文';
   // 动态渲染的列表
   renderAliases(); renderDetails(); renderRules();
+  // 实时请求列表（保护徽章文案随语言切换即时刷新）
+  rtRenderAll();
+  var pb = $('rtPauseBtn');
+  if(pb){ pb.textContent = rtState.paused ? t('rtResume') : t('rtPause'); }
   // 更新监听地址（含翻译）
   updateListenAddr();
 }
@@ -513,6 +627,8 @@ function switchTab(name){
   document.querySelectorAll('.panel').forEach(function(p){
     p.classList.toggle('active', p.id === 'tab-' + name);
   });
+  // 切到实时请求页时启动 SSE 实时推送，离开时断开（省资源）
+  if(name === 'realtime'){ rtStart(); } else { rtStop(); }
 }
 
 function esc(s){
@@ -657,6 +773,12 @@ async function loadCfg(notify){
     toggleVisionQualityInputs();
     // 视觉代理图片内存缓存大小（0=禁用）
     $('VisionProxyMemCacheSize').value = c.VisionProxyMemCacheSize != null ? c.VisionProxyMemCacheSize : 200;
+
+    // 实时请求查看（RealtimeLog）
+    var rl = c.RealtimeLog || {};
+    $('RtEnable').checked = rl.Enable !== false;
+    $('RtMaxEntries').value = rl.MaxEntries || 100;
+    $('RtMaxBodyLen').value = rl.MaxBodyLen || 8000;
 
     // 连接池设置（0 = 使用默认）
     var cp = c.ConnPool || {};
@@ -904,6 +1026,11 @@ function collectCfg(){
       CustomPercent: $('VisionImageQuality').value === 'custom' ? (parseInt($('VisionCustomPercent').value, 10) || 0) : 0
     },
     VisionProxyMemCacheSize: parseInt($('VisionProxyMemCacheSize').value, 10) || 0,
+    RealtimeLog: {
+      Enable: $('RtEnable').checked,
+      MaxEntries: parseInt($('RtMaxEntries').value, 10) || 100,
+      MaxBodyLen: parseInt($('RtMaxBodyLen').value, 10) || 8000
+    },
     ModelContextPrompt: {
       Enable: $('CtxEnable').checked,
       Position: $('CtxPos').value === 'append' ? 'append' : 'prepend',
@@ -945,6 +1072,9 @@ async function saveCfg(){
     var res = await api('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) });
     toast(res.message || t('toastSaveOk'));
     await loadCfg();
+    // 若当前停留在「实时请求」页，保存后刷新一次（开关/条数变更立即生效）
+    var rtPanel = $('tab-realtime');
+    if(rtPanel && rtPanel.classList.contains('active')){ rtRefresh(true); }
   }catch(e){
     toast(t('toastSaveFail') + e.message, 'err');
   }finally{
@@ -971,10 +1101,263 @@ async function testConn(){
   }
 }
 
+// ================= 实时请求查看（RealtimeLog） =================
+// 数据源：GET /api/realtime（快照）+ GET /api/realtime/events（SSE 推送）
+// 条目渲染：最新在最上方；进行中（Status=0）黄色脉冲；完成时同 ID 原位更新
+// （rtState 已在脚本顶部提前声明，供 applyI18n 重渲染使用）
+
+function rtStart(){
+  // 进入标签页：先拉快照，再连 SSE
+  rtRefresh(true);
+  rtConnect();
+  if(rtState.timer){ clearInterval(rtState.timer); }
+  // 兜底轮询：SSE 异常时也能保持最新（15s）
+  rtState.timer = setInterval(function(){ if(!rtState.es && !rtState.paused){ rtRefresh(); } }, 15000);
+}
+
+function rtStop(){
+  if(rtState.es){ try{ rtState.es.close(); }catch(e){} rtState.es = null; }
+  if(rtState.timer){ clearInterval(rtState.timer); rtState.timer = null; }
+  rtSetBadge('off', t('rtDisconnected'));
+}
+
+function rtSetBadge(cls, text){
+  var b = $('rtBadge');
+  if(!b){ return; }
+  b.className = 'rt-badge ' + cls;
+  $('rtBadgeText').textContent = text;
+}
+
+function rtConnect(){
+  if(rtState.es){ try{ rtState.es.close(); }catch(e){} rtState.es = null; }
+  rtSetBadge('connecting', t('rtConnecting'));
+  try{
+    var es = new EventSource('/api/realtime/events?after=' + rtState.lastId + '&token=' + encodeURIComponent(sessionStorage.getItem('cfg_token') || ''));
+    rtState.es = es;
+    es.onopen = function(){ rtSetBadge('on', t('rtConnected')); };
+    es.onmessage = function(ev){
+      try{
+        var e = JSON.parse(ev.data);
+        if(e && e.ID){ rtUpsert(e); }
+      }catch(err){}
+    };
+    es.onerror = function(){
+      // EventSource 自动重连；此处只更新状态显示
+      rtSetBadge('connecting', t('rtConnecting'));
+    };
+  }catch(e){
+    rtSetBadge('off', t('rtDisconnected'));
+  }
+}
+
+async function rtRefresh(silent){
+  try{
+    var res = await fetch('/api/realtime', { headers: authHeader(), cache: 'no-store' });
+    if(res.status === 401){ clearSession(); showLogin(); throw new Error(t('authExpired')); }
+    var data = await res.json();
+    rtState.enabled = data.enabled !== false;
+    var list = data.entries || [];
+    // 全量替换（快照权威），保留展开状态
+    rtState.items = list.slice().reverse(); // 最新在最上
+    rtState.lastId = list.length ? list[list.length - 1].ID : rtState.lastId;
+    rtRenderAll();
+    if(!silent){ toast(t('rtRefreshed')); }
+  }catch(e){
+    if(!silent){ toast(t('rtLoadFail') + e.message, 'err'); }
+  }
+}
+
+// 新条目插入 / 同 ID 原位更新（SSE 推送：进行中→完成会推两次）
+function rtUpsert(e){
+  if(!e || !e.ID){ return; }
+  if(e.ID > rtState.lastId){ rtState.lastId = e.ID; }
+  var idx = -1;
+  for(var i = 0; i < rtState.items.length; i++){
+    if(rtState.items[i].ID === e.ID){ idx = i; break; }
+  }
+  if(idx >= 0){
+    var wasOpen = rtState.open[e.ID] === true;
+    rtState.items[idx] = e;
+    var node = document.querySelector('[data-rtid="' + e.ID + '"]');
+    if(node){ rtRenderItem(node, e, wasOpen); }
+    else { rtRenderAll(); }
+  } else {
+    rtState.items.unshift(e);
+    rtRenderAll();
+  }
+  rtUpdateCount();
+}
+function rtUpdateCount(){
+  var el = $('rtCount');
+  if(el){ el.textContent = t('rtCount', { n: rtVisibleItems().length }); }
+}
+
+// 当前可见条目（应用探活过滤）
+function rtVisibleItems(){
+  var hide = $('rtHideProbe') && $('rtHideProbe').checked;
+  if(!hide){ return rtState.items; }
+  return rtState.items.filter(function(e){ return !rtIsProbe(e); });
+}
+
+function rtRenderAll(){
+  var box = $('rtList');
+  if(!box){ return; }
+  box.innerHTML = '';
+  if(!rtState.enabled){
+    box.innerHTML = '<div class="rt-empty">' + t('rtEmptyOff') + '</div>';
+    rtUpdateCount();
+    return;
+  }
+  var items = rtVisibleItems();
+  if(!items.length){
+    box.innerHTML = '<div class="rt-empty">' + t('rtEmpty') + '</div>';
+    rtUpdateCount();
+    return;
+  }
+  items.forEach(function(e){
+    var node = document.createElement('div');
+    node.className = 'rt-item';
+    node.setAttribute('data-rtid', e.ID);
+    rtRenderItem(node, e, rtState.open[e.ID] === true);
+    box.appendChild(node);
+  });
+  rtUpdateCount();
+}
+
+function rtStatusHtml(e){
+  if(e.Status === -1){ return '<span class="rt-status" style="color:var(--muted)">⛔ ' + t('rtAborted') + '</span>'; }
+  if(!e.Status){ return '<span class="rt-status pending">⏳ ' + t('rtPending') + '</span>'; }
+  var cls = e.Status >= 200 && e.Status < 400 ? 'ok' : 'err';
+  return '<span class="rt-status ' + cls + '">' + e.Status + '</span>';
+}
+
+// 探活/静态请求（无对话价值，默认隐藏）：/api/version、/favicon.ico 等
+function rtIsProbe(e){
+  var p = e.Path || '';
+  return p === '/api/version' || p === '/favicon.ico' || p === '/api/ps';
+}
+
+// 保护标记渲染：按 key 映射样式类别与图标
+var RT_PROT_META = {
+  'think-tag-req': { cls: 'think', icon: '🛡' },
+  'think-tag-resp': { cls: 'think', icon: '🛡' },
+  'dedup-skip': { cls: 'dedup', icon: '⚠' },
+  'dedup-tail': { cls: 'dedup', icon: '✂' },
+  'dedup-trip': { cls: 'trip', icon: '🚨' },
+  'repeat-internal': { cls: 'repeat', icon: '🔁' },
+  'repeat-cross': { cls: 'repeat', icon: '🔁' },
+  'warn-inject': { cls: 'trip', icon: '🚨' },
+  'assistant-loop': { cls: 'trip', icon: '🚨' },
+  'vision-proxy': { cls: 'proc', icon: '🖼' },
+  'ctx-inject': { cls: 'proc', icon: '🧭' },
+  'prompt-replace': { cls: 'proc', icon: '✂' },
+  'model-alias': { cls: 'proc', icon: '🔧' }
+};
+
+// 生成保护徽章 HTML（多个标记依次排列）
+function rtProtBadges(e){
+  if(!e.Protections || !e.Protections.length){ return ''; }
+  return e.Protections.map(function(p){
+    var meta = RT_PROT_META[p] || { cls: 'proc', icon: '🔹' };
+    var label = t('rtProt_' + p.replace(/-/g, '_'));
+    if(label.indexOf('rtProt_') === 0){ label = p; }
+    return '<span class="rt-prot ' + meta.cls + '" title="' + esc(t('rtProtTitle')) + '">' + meta.icon + ' ' + esc(label) + '</span>';
+  }).join('');
+}
+
+function rtRenderItem(node, e, open){
+  var meta = [];
+  if(e.DurationMs > 0){ meta.push(t('rtMs', { ms: e.DurationMs })); }
+  if(e.InTokens > 0 || e.OutTokens > 0){ meta.push(t('rtTokens', { i: e.InTokens || 0, o: e.OutTokens || 0 })); }
+  if(e.CachedTokens > 0){ meta.push(t('rtCached', { c: e.CachedTokens })); }
+  node.className = 'rt-item' + (open ? ' open' : '');
+  node.innerHTML =
+    '<div class="rt-head" onclick="rtToggle(' + e.ID + ')">' +
+      '<span class="chev">▶</span>' +
+      '<span class="rt-time">' + esc(e.Time) + '</span>' +
+      rtStatusHtml(e) +
+      '<span class="rt-model">' + esc(e.Model || '-') + '</span>' +
+      '<span class="rt-path">' + esc(e.Path) + '</span>' +
+      '<span class="rt-tag">' + esc(e.Client) + '</span>' +
+      '<span class="rt-tag">' + (e.Stream ? t('rtStreamYes') : t('rtStreamNo')) + '</span>' +
+      rtProtBadges(e) +
+      '<span class="rt-meta">' + esc(meta.join(' · ')) + '</span>' +
+    '</div>' +
+    '<div class="rt-body" style="display:' + (open ? 'flex' : 'none') + '">' +
+      rtBodySection(t('rtReqBody'), e.ReqBody, e.ReqTrunc) +
+      (e.UpBody && e.UpBody !== e.ReqBody ? rtBodySection(t('rtUpBody'), e.UpBody, e.UpTrunc) : '') +
+      rtBodySection(t('rtRespBody'), e.RespBody, e.RespTrunc) +
+    '</div>';
+}
+
+function rtBodySection(label, body, trunc){
+  if(body == null || body === ''){ return ''; }
+  return '<div class="rt-sec-label">' + esc(label) +
+    (trunc ? ' <span class="rt-trunc">✂ ' + t('rtTrunc') + '</span>' : '') +
+    ' <button class="btn small" onclick="rtCopyPre(event, this)">' + t('rtCopy') + '</button>' +
+    '</div><pre class="rt-pre">' + esc(rtPretty(body)) + '</pre>';
+}
+
+// 复制按钮：从同组的 <pre> 读取文本（避免把长文本内联进 onclick 属性）
+function rtCopyPre(ev, btn){
+  if(ev && ev.stopPropagation){ ev.stopPropagation(); }
+  var label = btn.closest('.rt-sec-label');
+  var pre = label && label.nextElementSibling;
+  rtCopyText(pre ? pre.textContent : '');
+}
+
+// 尝试美化 JSON（失败则原样返回）
+function rtPretty(s){
+  if(!s){ return ''; }
+  var trimmed = String(s).trim();
+  if(trimmed.charAt(0) !== '{' && trimmed.charAt(0) !== '['){ return s; }
+  try{ return JSON.stringify(JSON.parse(trimmed), null, 2); }catch(e){ return s; }
+}
+
+function rtToggle(id){
+  rtState.open[id] = !rtState.open[id];
+  var node = document.querySelector('[data-rtid="' + id + '"]');
+  if(!node){ return; }
+  node.classList.toggle('open', rtState.open[id]);
+  var body = node.querySelector('.rt-body');
+  if(body){ body.style.display = rtState.open[id] ? 'flex' : 'none'; }
+}
+
+function rtTogglePause(){
+  rtState.paused = !rtState.paused;
+  $('rtPauseBtn').textContent = rtState.paused ? t('rtResume') : t('rtPause');
+  if(rtState.paused){ rtStop(); rtSetBadge('off', t('rtPause')); }
+  else { rtStart(); }
+}
+
+async function rtClear(){
+  try{
+    var res = await fetch('/api/realtime', { method: 'DELETE', headers: authHeader() });
+    if(res.status === 401){ clearSession(); showLogin(); return; }
+    rtState.items = []; rtState.open = {}; rtState.lastId = 0;
+    rtRenderAll();
+    toast(t('rtCleared'));
+  }catch(e){
+    toast(t('rtClearFail') + e.message, 'err');
+  }
+}
+
+function rtCopyText(text){
+  var done = function(){ toast(t('rtCopied')); };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done, function(){ toast(t('rtCopyFail'), 'err'); });
+  } else {
+    try{
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta); done();
+    }catch(e){ toast(t('rtCopyFail'), 'err'); }
+  }
+}
+
 document.addEventListener('keydown', function(e){
   if((e.ctrlKey || e.metaKey) && e.key === 's'){ e.preventDefault(); saveCfg(); }
-});
-// 登录框回车提交
+});// 登录框回车提交
 $('loginPw').addEventListener('keydown', function(e){
   if(e.key === 'Enter'){ e.preventDefault(); doLogin(); }
 });

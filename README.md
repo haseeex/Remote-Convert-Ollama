@@ -34,6 +34,7 @@
 - 🖼️ **无中生有视觉**：主模型不支持图片时，自动用视觉代理模型识别后合并文本返回
 - 🛠️ **打通工具调用**：Ollama / OpenAI / Anthropic 三种格式的工具调用互相转换，解决 Agent 死循环
 - 🔌 **连接池调优**：HTTP/2 + keep-alive 连接复用，可配置空闲连接数/超时/并发上限，保存后立即生效无需重启
+- 📡 **实时请求查看**：配置页面内实时查看每一笔请求的原始请求体、转发上游请求体、响应体、耗时与 Token 用量，并自动标记本次触发的保护（思考标签消毒/去重/熔断/复读等）
 
 > 💡 **简单来说**：你只需在 VS Code / VS2026 中配置 Ollama 作为 API 提供商，然后指向本程序，就能使用任何 **OpenAI 兼容的 API 服务**（如 DeepSeek、GPT、Claude 等）——并且还能把任何一个模型"调教"成你想要的样子。
 
@@ -120,6 +121,7 @@
 - **模型上下文注入**：`ModelContextPrompt` 在对话时自动把当前模型信息（模型ID/上下文长度/最大输出/能力/视觉说明）注入提示词，让 AI 自我认知，更合理地规划思考与输出长度
 - **末日循环保护**：`DoomLoopProtection` 检测上游内容重复（相邻块/全文尾部/跨请求复读）并熔断，防止客户端陷入重试死循环
 - **连接池设置**：`ConnPool` 可配置上游 HTTP/2 + keep-alive 连接池（空闲连接数/超时/并发上限），保存后立即生效，无需重启
+- **实时请求查看**：`RealtimeLog` 在内存中记录最近的请求与响应（原始请求体/转发上游请求体/响应体/耗时/Token 用量），配置页面「📡 实时请求」页实时查看（SSE 推送），自动标记触发的保护（思考标签消毒/去重/熔断/复读/视觉代理等），只存内存不写磁盘
 
 ---
 
@@ -217,6 +219,11 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
         "RepeatCheck": false,
         "MaxRepeat": 3,
         "WarnPrompt": ""
+    },
+    "RealtimeLog": {
+        "Enable": true,
+        "MaxEntries": 100,
+        "MaxBodyLen": 8000
     }
 }
 ```
@@ -242,6 +249,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `ModelContextPrompt`   | 模型上下文信息注入`{Enable, Position, Template}`                         | `{Enable:false, Position:"prepend", Template:内置默认}` |
 | `ConnPool`            | 上游连接池设置`{MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}` | 内置默认（见下表） |
 | `DoomLoopProtection`  | 末日循环保护`{Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt}`         | `{Enable:false, Dedup:false, RepeatCheck:false, MaxRepeat:3, WarnPrompt:""}` |
+| `RealtimeLog`  | 实时请求查看`{Enable, MaxEntries, MaxBodyLen}`（内存记录，不写磁盘）         | `{Enable:true, MaxEntries:100, MaxBodyLen:8000}` |
 
 **`StreamMode` 说明**：
 
@@ -323,10 +331,13 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | 📡**上游 API**         | 修改`OPENAI_BASE`，密钥输入明文后**自动加密保存**（留空表示保持当前密钥）  |
 | 🔌**测试连接**         | 一键测试上游连通性，显示上游可用模型列表                                           |
 | 🔒**访问密码**         | 设置`WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改） |
-| 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            || 🔌**连接池设置**     | 可视化调整`ConnPool`（HTTP/2 + keep-alive 连接复用），**保存后立即生效，无需重启** || 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
+| 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            |
+| 🔌**连接池设置**     | 可视化调整`ConnPool`（HTTP/2 + keep-alive 连接复用），**保存后立即生效，无需重启** |
+| 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
 | 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                         |
 | 🧭**模型上下文注入** | 可视化配置`ModelContextPrompt`（开关、插入位置、模板）                            |
 | 🚨**末日循环保护** | 可视化配置`DoomLoopProtection`（总开关 + 去重/复读检测/熔断阈值/警告提示词，分级置灰联动） |
+| 📡**实时请求** | 实时查看每一笔请求（SSE 推送 + 手动刷新），展开查看原始请求体/转发上游请求体/响应体，自动标记触发的保护，可暂停/清空/隐藏探活请求 |
 | 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                      |
 | 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力、视觉代理模型与提示词）                  |
 | ✂️**提示词替换规则** | 可视化增删`RequestPromptReplace` 规则                                            |
@@ -450,6 +461,9 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
  ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启
                      格式: {MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}
                      0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true
+ ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)
+                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,默认8000)}
+                     记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量
 ════════════════════════════════════════════════════════════
 
 📋 上游拥有的模型:
@@ -535,7 +549,8 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 - **全文尾部去重**：新内容与已发送全文尾部重复时截断（上游整个响应重发 bug）
 - **连续重复熔断（D 方案）**：连续重复达 `MaxRepeat` 次 → 强制收尾当前流，客户端不挂起
 - **跨请求提醒（C 方案）**：熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）
-- **assistant 循环检测**：请求内出现 ≥2 条签名相同的 assistant 消息（Agent 自问自答循环特征）→ 注入警告，正常对话零误伤
+- **assistant 循环检测**：仅统计「连续段」内的重复——`user`/`system` 消息视为对话边界重置连续性，长会话中相隔多轮的重复调用（如先后两次读同一文件）不会误报；签名兼容 string/对象两种 arguments 形态，空 content 消息不参与检测；命中后警告注入带 **10 分钟冷却**（同一会话只提醒一次，避免污染上下文）
+- **多客户端隔离**：所有跨请求保护状态（警告标记/复读记录/冷却）以 `客户端IP + User-Agent 指纹` 为会话 key——同一台机器上同时运行 VS Code / VS2026 / Cherry Studio 等多个客户端时，各自状态互不污染（A 的熔断警告不会被 B 偷走，A 的冷却不会消耗 B 的额度）
 - 去重只影响 `content` 字段，`tool_calls` / `usage` / `finish_reason` / SSE 事件顺序全部保持原样
 
 示例配置：
@@ -551,6 +566,60 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 ```
 
 > 💡 **提示**：三条流式路径（Ollama / OpenAI / Anthropic）与非流式响应均接入检测；客户端断开时自动取消上游请求，不再继续烧 token。
+
+### 📡 实时请求查看
+
+通过 `RealtimeLog` 你可以在配置管理页面实时查看每一笔请求的完整内容，无需翻终端日志：
+
+- **实时推送**：SSE 长连接推送，新请求立即出现在列表顶部（进行中显示黄色脉冲，完成后自动更新为最终状态）
+- **三段详情**：点击任意条目展开查看
+  - 📤 **客户端原始请求体** — 客户端发来的原始内容
+  - 📡 **转发上游请求体** — 经过注入链（提示词替换/上下文注入/视觉代理/思考标签消毒）处理后的最终形态
+  - 📥 **响应体** — 返回给客户端的内容（流式为 SSE 原文，JSON 自动美化）
+- **Token 用量**：自动从响应中提取输入/输出/缓存命中 token 数（Ollama 与 OpenAI 两种规范字段）
+- **保护标记**：自动标记本次请求触发的所有保护/处理（见下表）
+- **工具栏**：连接状态徽章、隐藏探活请求（默认过滤 `/api/version` 等）、暂停/继续、刷新、清空
+- **只存内存**：不写磁盘、程序退出即清空；条数与截断长度可配置
+
+配置格式：
+
+```json
+"RealtimeLog": {
+    "Enable": true,
+    "MaxEntries": 100,
+    "MaxBodyLen": 8000
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `Enable` | bool | 总开关（默认 `true`） |
+| `MaxEntries` | int | 保留条数（1-1000，默认 100，超出丢弃最旧） |
+| `MaxBodyLen` | int | 请求/响应体截断长度（字符，默认 8000，上限 100000） |
+
+#### 🏷️ 保护标记一览
+
+每条记录上会显示本次请求触发的保护/处理徽章（不同类别不同颜色）：
+
+| 徽章 | 标记键 | 触发场景 |
+| --- | --- | --- |
+| 🛡 请求侧思考标签消毒 | `think-tag-req` | 客户端历史含裸 `<thinking>`/`</thinking>` 标签（开/闭未配对），转发上游前替换为 `[THINK-START]`/`[THINK-END]` 安全文本 |
+| 🛡 响应侧思考标签消毒 | `think-tag-resp` | 上游响应泄漏裸 `<thinking>`/`</thinking>` 标签（开/闭未配对），发给客户端前替换为 `[THINK-START]`/`[THINK-END]` 安全文本 |
+| ⚠ 去重·跳过重复块 | `dedup-skip` | 流式相邻块与上一块完全相同被跳过 |
+| ✂ 去重·截断尾部重复 | `dedup-tail` | 流式新内容与已发送全文尾部重复被截断 |
+| 🚨 熔断·连续重复收尾 | `dedup-trip` | 连续重复达 `MaxRepeat` 次，强制收尾当前流 |
+| 🔁 响应内部重复 | `repeat-internal` | 非流式响应内部大段重复 |
+| 🔁 跨请求复读 | `repeat-cross` | 请求与回复均与上一轮相同 |
+| 🚨 注入复读警告 | `warn-inject` | 上一轮熔断/复读后，本轮自动注入 system 警告 |
+| 🚨 assistant 循环检测 | `assistant-loop` | 请求内出现 ≥2 条签名相同的 assistant 消息 |
+| 🖼 视觉代理识别 | `vision-proxy` | 图片经视觉代理模型识别并合并文本 |
+| 🧭 模型上下文注入 | `ctx-inject` | 模型信息已注入提示词 |
+| ✂ 提示词替换 | `prompt-replace` | 请求提示词替换规则已生效 |
+| 🔧 模型名还原 | `model-alias` | 显示名（含前后缀）已还原为上游真实模型 ID |
+
+> 💡 **提示**：保护标记让排查死循环、重复输出、历史污染等问题一目了然——例如看到 `dedup-trip` + `warn-inject` 组合，说明上游正在复读且防护已介入。
+
+> 🔒 **安全提示**：实时记录包含对话内容，仅存本机内存；若配置页面未设访问密码，局域网内可访问者也能看到，建议启用访问密码。
 
 ### ✂️ 请求提示词替换
 
@@ -691,7 +760,8 @@ Remote Convert Ollama/
 | Go`net/http`           | HTTP 服务器和反向代理               |
 | AES-256-GCM              | API Key 加密存储                    |
 | SHA-256                  | 机器指纹 + UUID 密钥派生            |
-| Server-Sent Events (SSE) | 流式响应实时转发                    |
+| Server-Sent Events (SSE) | 流式响应实时转发；配置页面实时请求查看（`/api/realtime/events` 推送） |
+| 内存环形缓冲 + 互斥锁 | 实时请求记录（`RealtimeLog`）线程安全存储，只存内存不写磁盘 |
 | 系统调用 (Windows)       | 控制台标题设置、磁盘卷序列号获取    |
 | `bufio` 流式解析       | OpenAI / Anthropic 流式数据实时转发 |
 | `sync.RWMutex`         | reasoning_content 线程安全读写      |
@@ -759,6 +829,26 @@ Remote Convert Ollama/
 1. 确保使用的是 `StreamMode: "preserve"`（默认值）
 2. 检查客户端是否发送了完整的消息历史
 3. 某些客户端可能需要手动清除对话后重新开始
+
+</details>
+
+<details>
+<summary><b>Q: 实时请求页面看不到内容 / 怎么排查死循环？</b></summary>
+
+1. 确认「📡 实时请求」页顶部的「启用」开关已打开并保存
+2. 页面需保持打开才会连接 SSE（进入标签页自动连接，离开自动断开省资源）
+3. 探活请求（`/api/version` 等）默认被过滤，可取消勾选「隐藏探活请求」查看
+4. 排查死循环：展开条目查看「📡 转发上游请求体」与「📥 响应体」，并看保护徽章：
+   - `dedup-trip` + `warn-inject`：上游复读且熔断/警告已介入
+   - `think-tag-req/resp`：历史或响应含裸 `<thinking>`/`</thinking>` 标签（ollama cloud 死循环根因），自动替换为 `[THINK-START]`/`[THINK-END]`
+   - `assistant-loop`：请求内 assistant 消息重复（Agent 自问自答）
+
+</details>
+
+<details>
+<summary><b>Q: 实时记录会写入磁盘吗？隐私安全吗？</b></summary>
+
+不会。实时记录仅存于程序内存，程序退出即清空。但记录包含对话内容，若配置页面未设访问密码，局域网内可访问者也能看到，建议启用访问密码。
 
 </details>
 
