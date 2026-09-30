@@ -357,9 +357,12 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
           <div class="rt-toolbar">
             <span class="rt-badge off" id="rtBadge"><span class="dot"></span><span id="rtBadgeText">未连接</span></span>
             <label class="switch"><input type="checkbox" id="rtHideProbe" checked onchange="rtRenderAll()"><span class="track"></span><span class="lbl" data-i18n="rtHideProbe">隐藏探活请求</span></label>
+            <label class="switch"><input type="checkbox" id="rtFormat" checked onchange="rtToggleFormat()"><span class="track"></span><span class="lbl" data-i18n="rtFormat">格式化显示</span></label>
+            <button class="btn small" onclick="rtExpandAll()" data-i18n="rtExpandAll">📖 全部展开</button>
+            <button class="btn small" onclick="rtCollapseAll()" data-i18n="rtCollapseAll">📕 全部收起</button>
             <button class="btn small" id="rtPauseBtn" onclick="rtTogglePause()">⏸ 暂停</button>
-            <button class="btn small" onclick="rtRefresh()">🔄 刷新</button>
-            <button class="btn small danger" onclick="rtClear()">🗑 清空</button>
+            <button class="btn small" id="rtRefreshBtn" onclick="rtRefresh()">🔄 刷新</button>
+            <button class="btn small danger" id="rtClearBtn" onclick="rtClear()">🗑 清空</button>
             <span class="rt-count" id="rtCount"></span>
           </div>
           <div class="rt-list" id="rtList"></div>
@@ -409,10 +412,12 @@ var I18N = {
     rtWarn: '💡 记录含对话内容，仅存本机内存；若配置页面未设密码，局域网内可访问者也能看到，建议启用访问密码',
     rtLive: '📋 实时记录', rtLiveHint: '最新请求显示在最上方，点击条目展开详情',
     rtConnected: '已连接', rtDisconnected: '未连接', rtConnecting: '连接中...', rtAborted: '已断开', rtHideProbe: '隐藏探活请求',
+    rtFormat: '格式化显示（还原换行/缩进/转义字符）',
     rtPause: '⏸ 暂停', rtResume: '▶ 继续', rtRefresh: '🔄 刷新', rtClear: '🗑 清空',
+    rtExpandAll: '📖 全部展开', rtCollapseAll: '📕 全部收起',
     rtEmpty: '暂无记录（发一条对话试试～）', rtEmptyOff: '实时记录未启用（在上方打开「启用」并保存）',
     rtPending: '进行中', rtReqBody: '📤 客户端原始请求体', rtUpBody: '📡 转发上游请求体', rtRespBody: '📥 响应体',
-    rtTrunc: '已截断', rtTokens: 'Token 输入 {i} / 输出 {o}', rtCached: '缓存 {c}', rtMs: '{ms} ms',
+    rtTrunc: '已截断', rtTokens: 'Token[{src}] 输入 {i} / 输出 {o}', rtTokenUpstream: '上游', rtTokenEstimate: '估算', rtCached: '缓存 {c} ({p}%)', rtMs: '{ms} ms', rtSec: '{s} s',
     rtCount: '共 {n} 条', rtCleared: '🗑 已清空实时记录', rtClearFail: '清空失败: ', rtLoadFail: '加载实时记录失败: ', rtRefreshed: '🔄 实时记录已刷新',
     rtCopied: '📋 已复制到剪贴板', rtCopyFail: '复制失败', rtCopy: '📋 复制',
     rtStreamYes: '流式', rtStreamNo: '非流式',
@@ -489,10 +494,12 @@ var I18N = {
     rtWarn: '💡 Records contain conversation content and stay in local memory only; if no config password is set, anyone on the LAN who can open this page can see them — enable an access password',
     rtLive: '📋 Live Records', rtLiveHint: 'Newest requests appear on top; click an entry to expand details',
     rtConnected: 'Connected', rtDisconnected: 'Disconnected', rtConnecting: 'Connecting...', rtAborted: 'Aborted', rtHideProbe: 'Hide probes',
+    rtFormat: 'Formatted display (restore line breaks / indentation / escapes)',
     rtPause: '⏸ Pause', rtResume: '▶ Resume', rtRefresh: '🔄 Refresh', rtClear: '🗑 Clear',
+    rtExpandAll: '📖 Expand all', rtCollapseAll: '📕 Collapse all',
     rtEmpty: 'No records yet (try sending a chat message~)', rtEmptyOff: 'Realtime log is disabled (turn on "Enable" above and save)',
     rtPending: 'In progress', rtReqBody: '📤 Client raw request body', rtUpBody: '📡 Upstream request body', rtRespBody: '📥 Response body',
-    rtTrunc: 'truncated', rtTokens: 'Token in {i} / out {o}', rtCached: 'cached {c}', rtMs: '{ms} ms',
+    rtTrunc: 'truncated', rtTokens: 'Token[{src}] in {i} / out {o}', rtTokenUpstream: 'upstream', rtTokenEstimate: 'estimate', rtCached: 'cached {c} ({p}%)', rtMs: '{ms} ms', rtSec: '{s} s',
     rtCount: '{n} entries', rtCleared: '🗑 Realtime records cleared', rtClearFail: 'Clear failed: ', rtLoadFail: 'Failed to load realtime records: ', rtRefreshed: '🔄 Realtime records refreshed',
     rtCopied: '📋 Copied to clipboard', rtCopyFail: 'Copy failed', rtCopy: '📋 Copy',
     rtStreamYes: 'stream', rtStreamNo: 'non-stream',
@@ -599,6 +606,10 @@ function applyI18n(){
   rtRenderAll();
   var pb = $('rtPauseBtn');
   if(pb){ pb.textContent = rtState.paused ? t('rtResume') : t('rtPause'); }
+  var rb = $('rtRefreshBtn');
+  if(rb){ rb.textContent = t('rtRefresh'); }
+  var cb = $('rtClearBtn');
+  if(cb){ cb.textContent = t('rtClear'); }
   // 更新监听地址（含翻译）
   updateListenAddr();
 }
@@ -1267,9 +1278,18 @@ function rtProtBadges(e){
 
 function rtRenderItem(node, e, open){
   var meta = [];
-  if(e.DurationMs > 0){ meta.push(t('rtMs', { ms: e.DurationMs })); }
-  if(e.InTokens > 0 || e.OutTokens > 0){ meta.push(t('rtTokens', { i: e.InTokens || 0, o: e.OutTokens || 0 })); }
-  if(e.CachedTokens > 0){ meta.push(t('rtCached', { c: e.CachedTokens })); }
+  // 耗时：≥1 秒显示秒（2 位小数，去尾零），<1 秒保持毫秒
+  if(e.DurationMs > 0){
+    if(e.DurationMs >= 1000){ meta.push(t('rtSec', { s: parseFloat((e.DurationMs / 1000).toFixed(2)) })); }
+    else { meta.push(t('rtMs', { ms: e.DurationMs })); }
+  }
+  // Token 用量：来源标记（上游/估算）+ 输入/输出 + 缓存命中（含占输入百分比，与终端日志格式一致）
+  if(e.InTokens > 0 || e.OutTokens > 0){
+    var srcLabel = e.TokenSource === 'estimate' ? t('rtTokenEstimate') : t('rtTokenUpstream');
+    meta.push(t('rtTokens', { src: srcLabel, i: e.InTokens || 0, o: e.OutTokens || 0 }));
+    var pct = e.InTokens > 0 ? ((e.CachedTokens || 0) / e.InTokens * 100).toFixed(2) : '0.00';
+    meta.push(t('rtCached', { c: e.CachedTokens || 0, p: pct }));
+  }
   node.className = 'rt-item' + (open ? ' open' : '');
   node.innerHTML =
     '<div class="rt-head" onclick="rtToggle(' + e.ID + ')">' +
@@ -1306,12 +1326,103 @@ function rtCopyPre(ev, btn){
   rtCopyText(pre ? pre.textContent : '');
 }
 
-// 尝试美化 JSON（失败则原样返回）
+// ================= 格式化显示（开关） =================
+// 目标：把 JSON 字符串值内部的转义换行（\r\n\t）真实展开，让长文本可读；
+// 工具调用 arguments 等“字符串套 JSON”递归美化；NDJSON（流式）逐行处理。
+// ⚠️ 不能用 JSON.stringify 美化：它会把字符串值内的换行再次转义成字面 \r\n（不可读根源）
+function rtFormatEnabled(){
+  var el = $('rtFormat');
+  return el ? el.checked : true;
+}
+
+function rtToggleFormat(){
+  try{ localStorage.setItem('rt_fmt', rtFormatEnabled() ? '1' : '0'); }catch(e){}
+  rtRenderAll();
+}
+
+// 字符串值渲染：字符串本身是 JSON（如工具调用 arguments）→ 递归美化；否则带引号展示（真实换行）
+function rtFmtStr(v, indent){
+  var s = String(v);
+  var t = s.trim();
+  if((t.charAt(0) === '{' || t.charAt(0) === '[') && t.length > 1){
+    try{ return rtJsonFmt(JSON.parse(t), indent); }catch(e){}
+  }
+  return '"' + s + '"';
+}
+
+// 自定义 JSON 美化：字符串值内换行真实展开（JSON.stringify 会转义成字面 \n，完全不可读）
+function rtJsonFmt(v, indent){
+  var pad = '', padIn = '';
+  for(var i = 0; i < indent; i++){ pad += '  '; }
+  padIn = pad + '  ';
+  if(v === null){ return 'null'; }
+  if(typeof v === 'number' || typeof v === 'boolean'){ return String(v); }
+  if(typeof v === 'string'){ return rtFmtStr(v, indent); }
+  if(Array.isArray(v)){
+    if(!v.length){ return '[]'; }
+    var short = v.length <= 6 && v.every(function(x){
+      return x === null || typeof x === 'number' || typeof x === 'boolean' ||
+             (typeof x === 'string' && x.length <= 20 && x.indexOf('\n') < 0);
+    });
+    if(short){ return '[' + v.map(function(x){ return rtJsonFmt(x, 0); }).join(', ') + ']'; }
+    return '[\n' + v.map(function(x){ return padIn + rtJsonFmt(x, indent + 1); }).join(',\n') + '\n' + pad + ']';
+  }
+  if(typeof v === 'object'){
+    var keys = Object.keys(v);
+    if(!keys.length){ return '{}'; }
+    return '{\n' + keys.map(function(k){
+      return padIn + JSON.stringify(k) + ': ' + rtJsonFmt(v[k], indent + 1);
+    }).join(',\n') + '\n' + pad + '}';
+  }
+  return String(v);
+}
+
+// 转义还原兜底：JSON 解析失败（截断/非 JSON）时，把文本中的转义序列还原为可读字符。
+// 场景：body 超长被截断 → JSON.parse 失败 → 旧版直接显示 \r\n、\u0026、\" 满屏转义符。
+// 正则一次扫描，\ \ 优先匹配（避免 \\n 被误读成换行）；未知转义（如路径 C:\x）保持原样。
+function rtUnescapeText(s){
+  return String(s).replace(/\\(u[0-9a-fA-F]{4}|[\s\S])/g, function(m, g){
+    if(g.charAt(0) === 'u'){
+      try{ return String.fromCharCode(parseInt(g.substring(1), 16)); }catch(e){ return m; }
+    }
+    switch(g){
+      case 'n': return '\n';
+      case 'r': return '\r';
+      case 't': return '\t';
+      case 'b': return '\b';
+      case 'f': return '\f';
+      case '"': return '"';
+      case '\\': return '\\';
+      case '/': return '/';
+      default: return m;
+    }
+  });
+}
+
+// 美化入口：开关关闭时原样返回；先试整体 JSON，再试 NDJSON（流式响应逐行 JSON），
+// 都失败（截断文本）→ 转义还原兜底，保证任何情况下都能看懂
 function rtPretty(s){
   if(!s){ return ''; }
+  if(!rtFormatEnabled()){ return s; }
   var trimmed = String(s).trim();
-  if(trimmed.charAt(0) !== '{' && trimmed.charAt(0) !== '['){ return s; }
-  try{ return JSON.stringify(JSON.parse(trimmed), null, 2); }catch(e){ return s; }
+  if(!trimmed){ return s; }
+  if(trimmed.charAt(0) === '{' || trimmed.charAt(0) === '['){
+    try{ return rtJsonFmt(JSON.parse(trimmed), 0); }catch(e){}
+  }
+  var lines = trimmed.split('\n');
+  if(lines.length > 1){
+    var out = [], ok = 0;
+    for(var i = 0; i < lines.length; i++){
+      var ln = lines[i].trim();
+      if(!ln){ continue; }
+      if(ln.charAt(0) === '{' || ln.charAt(0) === '['){
+        try{ out.push(rtJsonFmt(JSON.parse(ln), 0)); ok++; continue; }catch(e){}
+      }
+      out.push(rtUnescapeText(ln));
+    }
+    if(ok > 0){ return out.join('\n'); }
+  }
+  return rtUnescapeText(s);
 }
 
 function rtToggle(id){
@@ -1321,6 +1432,27 @@ function rtToggle(id){
   node.classList.toggle('open', rtState.open[id]);
   var body = node.querySelector('.rt-body');
   if(body){ body.style.display = rtState.open[id] ? 'flex' : 'none'; }
+}
+
+// 一键展开全部：同步 rtState.open（新推送/重渲染时保持展开），
+// 直接更新 DOM 不重建列表（保留滚动位置）
+function rtExpandAll(){
+  rtVisibleItems().forEach(function(e){ rtState.open[e.ID] = true; });
+  document.querySelectorAll('#rtList .rt-item').forEach(function(node){
+    node.classList.add('open');
+    var body = node.querySelector('.rt-body');
+    if(body){ body.style.display = 'flex'; }
+  });
+}
+
+// 一键折叠全部：清空展开状态并收起所有条目
+function rtCollapseAll(){
+  rtState.open = {};
+  document.querySelectorAll('#rtList .rt-item').forEach(function(node){
+    node.classList.remove('open');
+    var body = node.querySelector('.rt-body');
+    if(body){ body.style.display = 'none'; }
+  });
 }
 
 function rtTogglePause(){
@@ -1363,6 +1495,10 @@ $('loginPw').addEventListener('keydown', function(e){
 });
 window.addEventListener('DOMContentLoaded', function(){
   document.documentElement.lang = currentLang;
+  // 恢复格式化显示开关（localStorage，默认开）——必须在 applyI18n（内含 rtRenderAll）之前
+  try{
+    if(localStorage.getItem('rt_fmt') === '0' && $('rtFormat')){ $('rtFormat').checked = false; }
+  }catch(e){}
   applyI18n();
   initAuth();
 });

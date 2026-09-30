@@ -661,6 +661,10 @@ type OpenAIChunk struct {
 		PromptTokensDetails *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details,omitempty"`
+		// DeepSeek 官方 API 缓存命中字段
+		PromptCacheHitTokens int `json:"prompt_cache_hit_tokens,omitempty"`
+		// Anthropic 规范缓存命中字段
+		CacheReadInputTokens int `json:"cache_read_input_tokens,omitempty"`
 	} `json:"usage,omitempty"`
 }
 
@@ -2497,6 +2501,8 @@ type realtimeEntry struct {
 	InTokens     int    `json:"InTokens"`
 	OutTokens    int    `json:"OutTokens"`
 	CachedTokens int    `json:"CachedTokens"`
+	// TokenSource token 用量来源："upstream"=上游返回的真实值 / "estimate"=上游未返回 usage 时的本地估算
+	TokenSource string `json:"TokenSource,omitempty"`
 	// Protections 本次请求触发的末日循环保护/处理链标记（如思考标签消毒、去重熔断、视觉代理等）
 	Protections []string `json:"Protections,omitempty"`
 }
@@ -2526,6 +2532,7 @@ func (e *realtimeEntry) clone() *realtimeEntry {
 		InTokens:     e.InTokens,
 		OutTokens:    e.OutTokens,
 		CachedTokens: e.CachedTokens,
+		TokenSource:  e.TokenSource,
 	}
 	if len(e.Protections) > 0 {
 		c.Protections = append([]string(nil), e.Protections...)
@@ -2740,6 +2747,42 @@ type realtimeRecorder struct {
 // logAllRequests 把记录器放入 context，handler 内部即可用 markProtection 标记触发的保护
 type realtimeRecorderCtxKey struct{}
 
+// token 用量来源标记键（实时请求页据此显示 Token[上游]/Token[估算]，与终端日志一致）
+const (
+	tokenSrcUpstream = "upstream" // token 用量来自上游返回的真实值
+	tokenSrcEstimate = "estimate" // 上游未返回 usage，本地估算兜底
+)
+
+// tokenSourceKey 把终端日志的用量来源文案（上游/估算）转为稳定的标记键
+func tokenSourceKey(label string) string {
+	if label == "估算" {
+		return tokenSrcEstimate
+	}
+	return tokenSrcUpstream
+}
+
+// markTokenSource 标记本次请求的 token 用量来源（"upstream"/"estimate"）。
+// 供实时请求页显示 Token[上游]/Token[估算]，与终端日志的 [上游]/[估算] 保持一致。
+func markTokenSource(r *http.Request, source string) {
+	if r == nil || source == "" {
+		return
+	}
+	if rec, ok := r.Context().Value(realtimeRecorderCtxKey{}).(*realtimeRecorder); ok && rec != nil {
+		rec.setTokenSource(source)
+	}
+}
+
+// setTokenSource 线程安全地记录 token 用量来源（后者覆盖前者，与终端最后一条日志一致）
+func (rec *realtimeRecorder) setTokenSource(source string) {
+	if rec == nil || source == "" {
+		return
+	}
+	e := rec.entry
+	e.mu.Lock()
+	e.TokenSource = source
+	e.mu.Unlock()
+}
+
 // markProtection 在实时记录上标记一次保护/处理触发（无记录器或未启用时静默忽略）。
 // name 取值见 rtProt* 常量；同一请求内同名标记自动去重。
 func markProtection(r *http.Request, name string) {
@@ -2841,6 +2884,12 @@ func (rec *realtimeRecorder) finish() {
 	if cachedTokens == 0 {
 		cachedTokens = lastMatchInt(reCachedTokens, tailStr)
 	}
+	if cachedTokens == 0 {
+		cachedTokens = lastMatchInt(rePromptCacheHit, tailStr) // DeepSeek 原生字段
+	}
+	if cachedTokens == 0 {
+		cachedTokens = lastMatchInt(reCacheReadInput, tailStr) // Anthropic 规范字段
+	}
 
 	e.mu.Lock()
 	e.DurationMs = durationMs
@@ -2855,7 +2904,7 @@ func (rec *realtimeRecorder) finish() {
 	realtimeUpdate(e) // 更新为最终状态（含响应体/耗时/token），并广播
 }
 
-// token 提取正则（Ollama / OpenAI 两种规范字段）
+// token 提取正则（Ollama / OpenAI / DeepSeek / Anthropic 多种规范字段）
 var (
 	rePromptEvalCount  = regexp.MustCompile(`"prompt_eval_count"\s*:\s*(\d+)`)
 	reEvalCount        = regexp.MustCompile(`"eval_count"\s*:\s*(\d+)`)
@@ -2863,6 +2912,10 @@ var (
 	rePromptTokens     = regexp.MustCompile(`"prompt_tokens"\s*:\s*(\d+)`)
 	reCompletionTokens = regexp.MustCompile(`"completion_tokens"\s*:\s*(\d+)`)
 	reCachedTokens     = regexp.MustCompile(`"cached_tokens"\s*:\s*(\d+)`)
+	// rePromptCacheHit DeepSeek 官方 API 缓存命中字段（prompt_cache_hit_tokens）
+	rePromptCacheHit = regexp.MustCompile(`"prompt_cache_hit_tokens"\s*:\s*(\d+)`)
+	// reCacheReadInput Anthropic 规范缓存命中字段（cache_read_input_tokens）
+	reCacheReadInput = regexp.MustCompile(`"cache_read_input_tokens"\s*:\s*(\d+)`)
 )
 
 // lastMatchInt 取正则最后一次匹配的数值（流式末尾 usage 才是最终值）
@@ -3921,6 +3974,36 @@ func logTokenUsage(source string, pt, ct, cached int) {
 	fmt.Printf("🔢 [%s] Token[%s] 输入:%d 输出:%d 缓存:%d%s\n", time.Now().Format("15:04:05"), source, pt, ct, cached, cachePct(pt, cached))
 }
 
+// extractCachedTokens 从 usage map 中提取缓存命中 token 数，兼容四种规范字段：
+//  1. OpenAI 规范：prompt_tokens_details.cached_tokens
+//  2. DeepSeek 官方 API：prompt_cache_hit_tokens
+//  3. Anthropic 规范：cache_read_input_tokens
+//  4. 部分网关：cached_tokens（顶层）
+func extractCachedTokens(usage map[string]interface{}) int {
+	if usage == nil {
+		return 0
+	}
+	// ① OpenAI 规范：prompt_tokens_details.cached_tokens
+	if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+		if cct, ok := details["cached_tokens"].(float64); ok && cct > 0 {
+			return int(cct)
+		}
+	}
+	// ② DeepSeek 官方 API：prompt_cache_hit_tokens
+	if v, ok := usage["prompt_cache_hit_tokens"].(float64); ok && v > 0 {
+		return int(v)
+	}
+	// ③ Anthropic 规范：cache_read_input_tokens
+	if v, ok := usage["cache_read_input_tokens"].(float64); ok && v > 0 {
+		return int(v)
+	}
+	// ④ 部分网关顶层：cached_tokens
+	if v, ok := usage["cached_tokens"].(float64); ok && v > 0 {
+		return int(v)
+	}
+	return 0
+}
+
 // estimateTokens 估算文本的 token 数（粗略估计：ASCII 约 4 字符=1 token，中文等非 ASCII 约 1 字=1 token）
 // 用途：上游不返回 usage 时本地估算，保证 VS Code 上下文占用显示不为 0
 func estimateTokens(text string) int {
@@ -4127,12 +4210,8 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		if ct, ok := usage["completion_tokens"].(float64); ok && ct > 0 {
 			outputTokens = int64(ct)
 		}
-		// 提取缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
-		if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
-			if cct, ok := details["cached_tokens"].(float64); ok && cct > 0 {
-				cachedTokens = int64(cct)
-			}
-		}
+		// 提取缓存命中 token 数（兼容 OpenAI / DeepSeek / Anthropic 多种规范字段）
+		cachedTokens = int64(extractCachedTokens(usage))
 	}
 	// 上游未返回 usage 时本地估算，保证 VS Code 上下文占用显示不为 0
 	usageSource := "上游"
@@ -4144,6 +4223,7 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		outputTokens = int64(estimateTokens(content) + estimateTokens(reasoningContent))
 		usageSource = "估算"
 	}
+	markTokenSource(r, tokenSourceKey(usageSource))
 	fmt.Printf("🔢 [%s] Token[%s] 输入:%d 输出:%d 缓存:%d%s (finish=%s)\n", time.Now().Format("15:04:05"), usageSource, inputTokens, outputTokens, cachedTokens, cachePct(int(inputTokens), int(cachedTokens)), finishReason)
 
 	out := map[string]interface{}{
@@ -4332,9 +4412,13 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 			if chunk.Usage.CompletionTokens > 0 {
 				outputTokens = chunk.Usage.CompletionTokens
 			}
-			// 提取缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
+			// 提取缓存命中 token 数（兼容 OpenAI / DeepSeek / Anthropic 多种规范字段）
 			if chunk.Usage.PromptTokensDetails != nil && chunk.Usage.PromptTokensDetails.CachedTokens > 0 {
 				cachedTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+			} else if chunk.Usage.PromptCacheHitTokens > 0 {
+				cachedTokens = chunk.Usage.PromptCacheHitTokens
+			} else if chunk.Usage.CacheReadInputTokens > 0 {
+				cachedTokens = chunk.Usage.CacheReadInputTokens
 			}
 		}
 
@@ -4473,6 +4557,7 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 		outputTokens = estimateTokens(fullContent.String()) + estimateTokens(reasoningContent.String())
 		usageSource = "估算"
 	}
+	markTokenSource(r, tokenSourceKey(usageSource))
 	fmt.Printf("🔢 [%s] Token[%s] 输入:%d 输出:%d 缓存:%d%s (finish=%s, tool_calls=%v)\n", time.Now().Format("15:04:05"), usageSource, inputTokens, outputTokens, cachedTokens, cachePct(inputTokens, cachedTokens), upstreamFinishReason, hasToolCalls)
 
 	// 构建最终消息
@@ -4665,6 +4750,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 					"cached_tokens": 0,
 				},
 			}
+			markTokenSource(r, tokenSrcEstimate)
 			logTokenUsage("估算", inputTokens, outputTokens, 0)
 		} else {
 			// 上游返回了 usage：打印完整 token 明细（含缓存命中数）
@@ -4677,12 +4763,9 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 			if v, ok := usage["completion_tokens"].(float64); ok {
 				ct = int(v)
 			}
-			// OpenAI 规范：usage.prompt_tokens_details.cached_tokens
-			if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
-				if cct, ok := details["cached_tokens"].(float64); ok {
-					cached = int(cct)
-				}
-			}
+			// 缓存命中（兼容 OpenAI / DeepSeek / Anthropic 多种规范字段）
+			cached = extractCachedTokens(usage)
+			markTokenSource(r, tokenSrcUpstream)
 			logTokenUsage("上游", pt, ct, cached)
 		}
 		// 重新序列化（因为可能修改了 message / usage）
@@ -4845,12 +4928,9 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 			if v, ok := chunkUsage["completion_tokens"].(float64); ok {
 				ct = int(v)
 			}
-			// OpenAI 规范：usage.prompt_tokens_details.cached_tokens
-			if details, ok := chunkUsage["prompt_tokens_details"].(map[string]interface{}); ok {
-				if cct, ok := details["cached_tokens"].(float64); ok {
-					cached = int(cct)
-				}
-			}
+			// 缓存命中（兼容 OpenAI / DeepSeek / Anthropic 多种规范字段）
+			cached = extractCachedTokens(chunkUsage)
+			markTokenSource(r, tokenSrcUpstream)
 			logTokenUsage("上游", pt, ct, cached)
 			payload := map[string]interface{}{
 				"id":      rawChunk.ID,
@@ -4924,6 +5004,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 											},
 										},
 									})
+									markTokenSource(r, tokenSrcEstimate)
 									logTokenUsage("估算", inputTokens, outputTokens, 0)
 								}
 								return
@@ -5002,6 +5083,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 				},
 			},
 		})
+		markTokenSource(r, tokenSrcEstimate)
 		logTokenUsage("估算", inputTokens, outputTokens, 0)
 	}
 
@@ -5266,6 +5348,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			return outputTokens
 		}
 		est := estimateTokens(fullText.String())
+		markTokenSource(r, tokenSrcEstimate)
 		logTokenUsage("估算", inputTokens, est, cachedTokens)
 		return est
 	}
@@ -5336,6 +5419,10 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 				PromptTokensDetails *struct {
 					CachedTokens int `json:"cached_tokens"`
 				} `json:"prompt_tokens_details,omitempty"`
+				// DeepSeek 官方 API 缓存命中字段
+				PromptCacheHitTokens int `json:"prompt_cache_hit_tokens,omitempty"`
+				// Anthropic 规范缓存命中字段
+				CacheReadInputTokens int `json:"cache_read_input_tokens,omitempty"`
 			} `json:"usage,omitempty"`
 		}
 		if err := json.Unmarshal([]byte(dataStr), &rawDelta); err != nil {
@@ -5350,10 +5437,15 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			if rawDelta.Usage.CompletionTokens > 0 {
 				outputTokens = rawDelta.Usage.CompletionTokens
 			}
-			// 提取缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
+			// 提取缓存命中 token 数（兼容 OpenAI / DeepSeek / Anthropic 多种规范字段）
 			if rawDelta.Usage.PromptTokensDetails != nil && rawDelta.Usage.PromptTokensDetails.CachedTokens > 0 {
 				cachedTokens = rawDelta.Usage.PromptTokensDetails.CachedTokens
+			} else if rawDelta.Usage.PromptCacheHitTokens > 0 {
+				cachedTokens = rawDelta.Usage.PromptCacheHitTokens
+			} else if rawDelta.Usage.CacheReadInputTokens > 0 {
+				cachedTokens = rawDelta.Usage.CacheReadInputTokens
 			}
+			markTokenSource(r, tokenSrcUpstream)
 			logTokenUsage("上游", inputTokens, outputTokens, cachedTokens)
 		}
 
@@ -6081,12 +6173,9 @@ func convertOpenAIToAnthropic(r *http.Request, raw []byte, model string, reqBody
 		if ct, ok := usage["completion_tokens"].(float64); ok {
 			outputTokens = int(ct)
 		}
-		// 提取缓存命中 token 数（OpenAI 规范：usage.prompt_tokens_details.cached_tokens）
-		if details, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
-			if cct, ok := details["cached_tokens"].(float64); ok && cct > 0 {
-				cachedTokens = int(cct)
-			}
-		}
+		// 缓存命中（兼容 OpenAI / DeepSeek / Anthropic 多种规范字段）
+		cachedTokens = extractCachedTokens(usage)
+		markTokenSource(r, tokenSrcUpstream)
 		// 上游返回了 usage：打印完整 token 明细（含缓存命中数）
 		logTokenUsage("上游", inputTokens, outputTokens, cachedTokens)
 	}
@@ -6104,6 +6193,7 @@ func convertOpenAIToAnthropic(r *http.Request, raw []byte, model string, reqBody
 		if outputTokens <= 0 {
 			outputTokens = estimateTokens(textContent)
 		}
+		markTokenSource(r, tokenSrcEstimate)
 		logTokenUsage("估算", inputTokens, outputTokens, cachedTokens)
 	}
 
