@@ -299,10 +299,12 @@ type Config struct {
 	OpenAIBase        string   `json:"OPENAI_BASE"`
 	OpenAIKey         string   `json:"OPENAI_KEY"`
 	WebConfigPassword string   `json:"WebConfigPassword,omitempty"` // 配置管理页面访问密码（空=不启用）
-	// ProxyAPIKey 代理请求 API 密钥（入站鉴权）：客户端请求本代理时必须携带的密钥，
-	// 加密存储（与 OPENAI_KEY 相同算法）；空=未设置
+	// ProxyAPIKey 旧版单密钥字段（已迁移到 ProxyAPIKeys 列表；保留仅用于读取旧配置）
 	ProxyAPIKey string `json:"ProxyAPIKey,omitempty"`
-	// ProxyAPIKeyEnabled 代理请求密钥开关：启用后客户端请求必须携带正确密钥，否则返回 401。
+	// ProxyAPIKeys 代理请求密钥列表（多密钥入站鉴权）：每个客户端可分配独立密钥，
+	// 便于区分请求来源、单独启用/禁用。密钥加密存储（与 OPENAI_KEY 相同算法）
+	ProxyAPIKeys []ProxyAPIKeyEntry `json:"ProxyAPIKeys,omitempty"`
+	// ProxyAPIKeyEnabled 代理请求密钥总开关：启用后客户端请求必须携带任一启用密钥，否则返回 401。
 	// ⚠️ bool 字段不能加 omitempty（false 是零值会被静默丢弃，导致"关不掉"类 bug）
 	ProxyAPIKeyEnabled    bool                            `json:"ProxyAPIKeyEnabled"`
 	ModelAlias            map[string]string               `json:"ModelAlias"`
@@ -325,6 +327,17 @@ type Config struct {
 	ConnPool ConnPool `json:"ConnPool,omitempty"`
 	// RealtimeLog 实时请求查看：内存记录最近的请求与响应，供配置页面实时查看
 	RealtimeLog RealtimeLog `json:"RealtimeLog,omitempty"`
+}
+
+// ProxyAPIKeyEntry 代理请求密钥条目（多密钥入站鉴权）：
+// 每个客户端可分配独立密钥，日志与实时记录显示匹配的密钥名称以区分请求来源。
+type ProxyAPIKeyEntry struct {
+	Name   string `json:"Name"`          // 密钥名称（用于区分客户端，如 "VS Code"；空名称兜底为"默认"）
+	Key    string `json:"Key,omitempty"` // 密钥（config.json 中加密存储；空=未设置）
+	Enable bool   `json:"Enable"`        // 是否启用（仅启用且已设置密钥的条目参与鉴权比对）
+	// KeyRef 密钥引用（加密值的 SHA-256 前 16 位十六进制）：仅用于前端↔后端传输——
+	// 前端保存时「留空保持」回传 KeyRef，后端据此匹配原加密值；不写入 config.json
+	KeyRef string `json:"KeyRef,omitempty"`
 }
 
 // RealtimeLog 实时请求查看：内存记录最近的请求与响应（含请求体/响应体，按 MaxBodyLen 截断），
@@ -494,9 +507,32 @@ var storedOpenAIKey string
 // 供配置管理页面在用户未修改密码时原样写回，避免密码丢失
 var storedWebConfigPassword string
 
-// storedProxyAPIKey 保存 config.json 中持久化的 ProxyAPIKey（加密格式），
-// 供配置管理页面在用户未修改密钥时原样写回，避免密钥丢失
-var storedProxyAPIKey string
+// storedProxyAPIKeys 保存 config.json 中持久化的 ProxyAPIKeys（加密格式），
+// 供配置管理页面保存时按 KeyRef 匹配「留空保持」的原加密值，避免密钥丢失
+var storedProxyAPIKeys []ProxyAPIKeyEntry
+
+// defaultProxyKeyName 代理密钥名称缺省值（旧配置迁移/空名称兜底）
+const defaultProxyKeyName = "默认"
+
+// proxyKeyRef 计算加密密钥的引用值（SHA-256 前 16 位十六进制）。
+// 前端保存时「留空保持」回传该引用，后端据此匹配原加密值（前端不接触加密值本身）。
+func proxyKeyRef(encrypted string) string {
+	if encrypted == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(encrypted))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// proxyKeysHasValid 是否存在启用且已设置密钥的条目（总开关开启但无有效密钥时鉴权不生效）
+func proxyKeysHasValid() bool {
+	for _, e := range cfg.ProxyAPIKeys {
+		if e.Enable && e.Key != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // lastReasoningContent 存储上一个 assistant 响应的 reasoning_content，
 // 因为 DeepSeek 思考模式要求客户端下次请求时必须传回这个字段。
@@ -1891,10 +1927,13 @@ func printConfigHelp() {
 	fmt.Println(" ▼ Capabilities    : 向客户端声明支持的能力列表 (tools, vision 等)")
 	fmt.Println(" ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)")
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
-	fmt.Println(" ▼ ProxyAPIKey     : 代理请求 API 密钥 (入站鉴权:客户端请求本代理时必须携带的密钥,空=未设置)")
-	fmt.Println("                     ProxyAPIKeyEnabled: 开关(true=启用,错误密钥返回401;密钥为空时开关不生效)")
+	fmt.Println(" ▼ ProxyAPIKeys    : 代理请求密钥列表 (多密钥入站鉴权,每个客户端可分配独立密钥,便于区分请求来源)")
+	fmt.Println("                     格式: [{Name: 密钥名称, Key: 密钥(加密存储), Enable: 是否启用}]")
 	fmt.Println("                     客户端请求头兼容格式: Authorization: Bearer <密钥> / Authorization: <密钥> / x-api-key / api-key")
+	fmt.Println("                     任一启用密钥匹配即通过;日志与实时记录显示匹配的密钥名称(区分是谁请求的)")
+	fmt.Println("                     ProxyAPIKeyEnabled: 总开关(true=启用,错误密钥返回401;无有效密钥时开关不生效)")
 	fmt.Println("                     与 OPENAI_KEY 一样自动加密存储,换设备需重新输入; 修改后立即生效无需重启")
+	fmt.Println("                     旧版单密钥字段 ProxyAPIKey 会自动迁移为名称\"默认\"的列表条目")
 	fmt.Println(" ▼ ModelAlias      : 模型别名映射,仅影响模型名字显示 {上游模型ID: 显示名称, 上游模型ID: 显示名称, ...}")
 	fmt.Println(" ▼ ModelDetailedSettings : 模型详细设置,覆盖上游自动获取的值")
 	fmt.Println("                     格式: {上游模型ID: {ContextLength: 上下文长度, MaxOutputTokens: 最大输出, Capabilities: [能力列表], VisionProxyModel: 视觉代理模型ID, VisionProxyPrompt: 视觉代理提示词, VisionImageQuality: 图片质量配置}}")
@@ -2171,6 +2210,13 @@ func loadConfig() {
 	} else {
 		stored.RealtimeLog = normalizeRealtimeLog(stored.RealtimeLog)
 	}
+	// 兼容迁移：旧版单密钥字段 ProxyAPIKey → 多密钥列表 ProxyAPIKeys（名称"默认"，启用）
+	if _, hasNew := rawMap["ProxyAPIKeys"]; !hasNew && stored.ProxyAPIKey != "" {
+		stored.ProxyAPIKeys = []ProxyAPIKeyEntry{{Name: defaultProxyKeyName, Key: stored.ProxyAPIKey, Enable: true}}
+		stored.ProxyAPIKey = ""
+		needSave = true
+		fmt.Println("🔄 检测到旧版代理请求密钥（ProxyAPIKey），已迁移为多密钥列表（ProxyAPIKeys）")
+	}
 	// 迁移旧版替换规则：force / replaceWhole 布尔字段 → mode 枚举
 	if migrateRequestPromptReplace(&stored, rawMap) {
 		needSave = true
@@ -2236,31 +2282,44 @@ func loadConfig() {
 		}
 	}
 
-	// 处理 ProxyAPIKey：明文自动加密回写；已加密则解密供入站鉴权比对
-	var plainProxyKey, persistedProxyKey string
-	if stored.ProxyAPIKey != "" {
-		plainProxyKey, persistedProxyKey, err = normalizeProxyAPIKey(stored.ProxyAPIKey)
-		if err != nil {
-			fmt.Println("🔒 ProxyAPIKey 校验失败:", err)
+	// 处理 ProxyAPIKeys：逐条解密/加密（明文自动加密回写；已加密则解密供入站鉴权比对），
+	// 同时计算每条密钥的引用值（KeyRef）供配置页「留空保持」匹配
+	var plainProxyKeys []ProxyAPIKeyEntry
+	persistedProxyKeys := make([]ProxyAPIKeyEntry, 0, len(stored.ProxyAPIKeys))
+	anyProxyKeyPersisted := false
+	for i, entry := range stored.ProxyAPIKeys {
+		plainEntryKey, persistedEntryKey, perr := normalizeProxyAPIKey(entry.Key)
+		if perr != nil {
+			fmt.Printf("🔒 ProxyAPIKeys[%d] (%s) 校验失败: %v\n", i, entry.Name, perr)
 			pauseAndExit()
 		}
+		encrypted := entry.Key
+		if persistedEntryKey != "" {
+			encrypted = persistedEntryKey
+			anyProxyKeyPersisted = true
+		}
+		plainEntry := ProxyAPIKeyEntry{Name: entry.Name, Key: plainEntryKey, Enable: entry.Enable}
+		if encrypted != "" {
+			plainEntry.KeyRef = proxyKeyRef(encrypted)
+		}
+		plainProxyKeys = append(plainProxyKeys, plainEntry)
+		persistedProxyKeys = append(persistedProxyKeys, ProxyAPIKeyEntry{Name: entry.Name, Key: encrypted, Enable: entry.Enable})
 	}
 
 	cfg = stored
 	cfg.OpenAIKey = plainKey
 	cfg.WebConfigPassword = plainPw
-	cfg.ProxyAPIKey = plainProxyKey
+	cfg.ProxyAPIKey = "" // 旧版单密钥字段已迁移到列表，运行时不再使用
+	cfg.ProxyAPIKeys = plainProxyKeys
 
-	if persistedKey != "" || persistedPw != "" || persistedProxyKey != "" {
+	if persistedKey != "" || persistedPw != "" || anyProxyKeyPersisted {
 		if persistedKey != "" {
 			stored.OpenAIKey = persistedKey
 		}
 		if persistedPw != "" {
 			stored.WebConfigPassword = persistedPw
 		}
-		if persistedProxyKey != "" {
-			stored.ProxyAPIKey = persistedProxyKey
-		}
+		stored.ProxyAPIKeys = persistedProxyKeys
 		if err := saveConfig(stored); err != nil {
 			fmt.Println("🔒 配置加密回写失败:", err)
 			pauseAndExit()
@@ -2271,15 +2330,15 @@ func loadConfig() {
 		if persistedPw != "" {
 			fmt.Println("🔒 WebConfigPassword 已按本机信息加密并回写到 config.json")
 		}
-		if persistedProxyKey != "" {
-			fmt.Println("🔒 ProxyAPIKey 已按本机信息加密并回写到 config.json")
+		if anyProxyKeyPersisted {
+			fmt.Println("🔒 ProxyAPIKeys 密钥已按本机信息加密并回写到 config.json")
 		}
 	}
 
 	// 记录文件中持久化的密钥/密码格式，供配置管理页面在未修改时原样写回
 	storedOpenAIKey = stored.OpenAIKey
 	storedWebConfigPassword = stored.WebConfigPassword
-	storedProxyAPIKey = stored.ProxyAPIKey
+	storedProxyAPIKeys = persistedProxyKeys
 
 	// 应用连接池配置（构建共享 Transport）
 	applyConnPoolConfig(stored.ConnPool)
@@ -2562,6 +2621,8 @@ type realtimeEntry struct {
 	CachedTokens int    `json:"CachedTokens"`
 	// TokenSource token 用量来源："upstream"=上游返回的真实值 / "estimate"=上游未返回 usage 时的本地估算
 	TokenSource string `json:"TokenSource,omitempty"`
+	// ClientKey 客户端使用的代理请求密钥名称（多密钥鉴权通过时记录，用于区分请求来源；未启用鉴权为空）
+	ClientKey string `json:"ClientKey,omitempty"`
 	// Protections 本次请求触发的末日循环保护/处理链标记（如思考标签消毒、去重熔断、视觉代理等）
 	Protections []string `json:"Protections,omitempty"`
 }
@@ -2592,6 +2653,7 @@ func (e *realtimeEntry) clone() *realtimeEntry {
 		OutTokens:    e.OutTokens,
 		CachedTokens: e.CachedTokens,
 		TokenSource:  e.TokenSource,
+		ClientKey:    e.ClientKey,
 	}
 	if len(e.Protections) > 0 {
 		c.Protections = append([]string(nil), e.Protections...)
@@ -2839,6 +2901,17 @@ func (rec *realtimeRecorder) setTokenSource(source string) {
 	e := rec.entry
 	e.mu.Lock()
 	e.TokenSource = source
+	e.mu.Unlock()
+}
+
+// setClientKey 线程安全地记录客户端使用的代理请求密钥名称（多密钥鉴权通过时调用，区分请求来源）
+func (rec *realtimeRecorder) setClientKey(name string) {
+	if rec == nil || name == "" {
+		return
+	}
+	e := rec.entry
+	e.mu.Lock()
+	e.ClientKey = name
 	e.mu.Unlock()
 }
 
@@ -3136,44 +3209,62 @@ func requireConfigAuth(w http.ResponseWriter, r *http.Request) bool {
 }
 
 // requireProxyAuth 校验客户端请求携带的代理请求 API 密钥（入站鉴权）。
-// 未启用（开关关闭或密钥为空）时直接放行；启用后要求请求头携带正确密钥，兼容多种客户端格式：
+// 未启用（总开关关闭或无任何有效密钥）时直接放行；启用后要求请求头携带任一启用密钥，兼容多种客户端格式：
 //
 //	Authorization: Bearer <key>  （OpenAI 标准格式）
 //	Authorization: <key>         （裸密钥，无 Bearer 前缀）
 //	x-api-key: <key>             （Anthropic 客户端格式）
 //	api-key: <key>               （Azure OpenAI 格式）
 //
-// 校验通过返回 true；失败返回 401 JSON 错误（按端点风格区分 OpenAI / Anthropic / Ollama），
-// 并在终端打印拒绝日志。OPTIONS 预检请求直接放行（浏览器 CORS 预检不携带凭证）。
+// 校验通过返回 (匹配的密钥名称, true)（名称用于日志/实时记录区分请求来源）；
+// 失败返回 ("", false) 并写 401 JSON 错误（按端点风格区分 OpenAI / Anthropic / Ollama），
+// 同时终端打印拒绝日志。OPTIONS 预检请求直接放行（浏览器 CORS 预检不携带凭证）。
 // 密钥比对用常量时间比较（subtle.ConstantTimeCompare），避免时序侧信道。
-func requireProxyAuth(w http.ResponseWriter, r *http.Request) bool {
+func requireProxyAuth(w http.ResponseWriter, r *http.Request) (string, bool) {
 	// OPTIONS 预检请求放行（浏览器 CORS 预检不携带凭证）
 	if r.Method == http.MethodOptions {
-		return true
+		return "", true
 	}
-	if !cfg.ProxyAPIKeyEnabled || cfg.ProxyAPIKey == "" {
-		return true
+	if !cfg.ProxyAPIKeyEnabled {
+		return "", true
 	}
-	expected := []byte(cfg.ProxyAPIKey)
+	// 收集启用且已设置密钥的条目（总开关开启但无有效密钥时放行，避免把自己锁在外面）
+	type keyCandidate struct{ name, key string }
+	var candidates []keyCandidate
+	for _, e := range cfg.ProxyAPIKeys {
+		if e.Enable && e.Key != "" {
+			name := e.Name
+			if name == "" {
+				name = defaultProxyKeyName
+			}
+			candidates = append(candidates, keyCandidate{name: name, key: e.Key})
+		}
+	}
+	if len(candidates) == 0 {
+		return "", true
+	}
 	for _, h := range []string{"Authorization", "x-api-key", "api-key"} {
 		raw := strings.TrimSpace(r.Header.Get(h))
 		if raw == "" {
 			continue
 		}
-		// 原样比对（覆盖密钥本身以 "Bearer " 开头的极端情况）
-		if subtle.ConstantTimeCompare([]byte(raw), expected) == 1 {
-			return true
-		}
-		// 剥离 "Bearer " 前缀（大小写不敏感）后再比对
+		// 候选值：原样（覆盖密钥本身以 "Bearer " 开头的极端情况）+ 剥离 "Bearer " 前缀（大小写不敏感）
+		values := []string{raw}
 		if len(raw) >= 7 && strings.EqualFold(raw[:7], "Bearer ") {
-			if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(raw[7:])), expected) == 1 {
-				return true
+			values = append(values, strings.TrimSpace(raw[7:]))
+		}
+		for _, cand := range candidates {
+			expected := []byte(cand.key)
+			for _, v := range values {
+				if subtle.ConstantTimeCompare([]byte(v), expected) == 1 {
+					return cand.name, true
+				}
 			}
 		}
 	}
 	fmt.Printf("🔑 代理密钥校验失败: %s %s | 客户端: %s\n", r.Method, r.URL.Path, clientIP(r))
 	writeProxyAuthError(w, r)
-	return false
+	return "", false
 }
 
 // writeProxyAuthError 返回代理密钥鉴权失败的 401 响应（按端点风格选择错误格式，
@@ -3326,11 +3417,11 @@ func apiConfigLogout(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
 }
 
-// apiRevealProxyKey 返回已保存的代理请求密钥明文，供配置页「复制」按钮按需获取。
+// apiRevealProxyKeys 返回全部已保存的代理请求密钥明文，供配置页「复制」按钮按需获取。
 // GET /api/config 脱敏不返回明文，密钥只在用户主动点击复制时通过本接口拉取一次。
 // 必须通过配置页会话鉴权（启用访问密码时），响应禁止缓存。
-// 未设置密钥时返回 ok=false（业务状态，非服务器错误）。
-func apiRevealProxyKey(w http.ResponseWriter, r *http.Request) {
+// 无任何已设置密钥时返回 ok=false（业务状态，非服务器错误）。
+func apiRevealProxyKeys(w http.ResponseWriter, r *http.Request) {
 	if !requireConfigAuth(w, r) {
 		return
 	}
@@ -3340,30 +3431,55 @@ func apiRevealProxyKey(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	if cfg.ProxyAPIKey == "" {
+	type keyView struct {
+		Name   string `json:"Name"`
+		Key    string `json:"Key"`
+		KeyRef string `json:"KeyRef,omitempty"`
+	}
+	keys := make([]keyView, 0, len(cfg.ProxyAPIKeys))
+	for _, e := range cfg.ProxyAPIKeys {
+		if e.Key == "" {
+			continue // 未设置密钥的条目无可复制内容
+		}
+		keys = append(keys, keyView{Name: e.Name, Key: e.Key, KeyRef: e.KeyRef})
+	}
+	if len(keys) == 0 {
 		json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "message": "代理请求密钥未设置"})
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "key": cfg.ProxyAPIKey})
+	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "keys": keys})
 }
 
-// apiGetConfig 返回当前配置（OPENAI_KEY / WebConfigPassword / ProxyAPIKey 脱敏，绝不返回明文）
+// proxyKeyView 代理密钥的前端视图（脱敏：不含密钥内容，仅含引用 KeyRef）
+type proxyKeyView struct {
+	Name   string `json:"Name"`             // 密钥名称
+	Enable bool   `json:"Enable"`           // 是否启用
+	KeySet bool   `json:"KeySet"`           // 是否已设置密钥
+	KeyRef string `json:"KeyRef,omitempty"` // 密钥引用（加密值 SHA-256 前 16 位）：前端「留空保持」回传匹配
+}
+
+// apiGetConfig 返回当前配置（OPENAI_KEY / WebConfigPassword / 代理密钥明文 脱敏，绝不返回明文）
 func apiGetConfig(w http.ResponseWriter, r *http.Request) {
 	cfgCopy := cfg
 	keySet := cfgCopy.OpenAIKey != ""
 	cfgCopy.OpenAIKey = ""
 	pwSet := cfgCopy.WebConfigPassword != ""
 	cfgCopy.WebConfigPassword = ""
-	proxyKeySet := cfgCopy.ProxyAPIKey != ""
+	// 代理密钥列表脱敏：明文不外发，仅返回名称/开关/是否已设置/引用值
+	proxyKeys := make([]proxyKeyView, 0, len(cfg.ProxyAPIKeys))
+	for _, e := range cfg.ProxyAPIKeys {
+		proxyKeys = append(proxyKeys, proxyKeyView{Name: e.Name, Enable: e.Enable, KeySet: e.Key != "", KeyRef: e.KeyRef})
+	}
+	cfgCopy.ProxyAPIKeys = nil
 	cfgCopy.ProxyAPIKey = ""
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	json.NewEncoder(w).Encode(struct {
 		Config
-		OpenAIKeySet         bool `json:"OPENAI_KEY_SET"`
-		WebConfigPasswordSet bool `json:"WEB_CONFIG_PASSWORD_SET"`
-		ProxyAPIKeySet       bool `json:"PROXY_API_KEY_SET"`
-	}{Config: cfgCopy, OpenAIKeySet: keySet, WebConfigPasswordSet: pwSet, ProxyAPIKeySet: proxyKeySet})
+		OpenAIKeySet         bool           `json:"OPENAI_KEY_SET"`
+		WebConfigPasswordSet bool           `json:"WEB_CONFIG_PASSWORD_SET"`
+		ProxyAPIKeys         []proxyKeyView `json:"ProxyAPIKeys"`
+	}{Config: cfgCopy, OpenAIKeySet: keySet, WebConfigPasswordSet: pwSet, ProxyAPIKeys: proxyKeys})
 }
 
 // apiSaveConfig 保存配置到 config.json 并同步更新运行内存
@@ -3465,28 +3581,58 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 		newCfg.WebConfigPassword = storedWebConfigPassword
 	}
 
-	// 处理 ProxyAPIKey：空=保持不变；已加密=验证后原样保存；明文=自动加密保存
-	plainProxyKey := cfg.ProxyAPIKey // 默认沿用当前内存明文
-	switch {
-	case newCfg.ProxyAPIKey == "":
-		newCfg.ProxyAPIKey = storedProxyAPIKey
-	case strings.HasPrefix(newCfg.ProxyAPIKey, encryptedKeyPrefix):
-		pk, err := decryptOpenAIKey(newCfg.ProxyAPIKey)
-		if err != nil {
-			http.Error(w, "ProxyAPIKey 校验失败: "+err.Error(), http.StatusBadRequest)
-			return
+	// 处理 ProxyAPIKeys：逐条处理密钥——
+	//   明文=自动加密保存；已加密值=校验后原样保存；
+	//   留空 + KeyRef=按引用匹配原加密值保持（前端不接触加密值）；留空无引用=视为未设置
+	newPlainKeys := make([]ProxyAPIKeyEntry, 0, len(newCfg.ProxyAPIKeys))
+	newStoredKeys := make([]ProxyAPIKeyEntry, 0, len(newCfg.ProxyAPIKeys))
+	for i := range newCfg.ProxyAPIKeys {
+		e := newCfg.ProxyAPIKeys[i]
+		name := strings.TrimSpace(e.Name)
+		if name == "" {
+			name = defaultProxyKeyName
 		}
-		plainProxyKey = pk
-		// 保持用户提供的加密值原样保存
-	default:
-		pk, persisted, err := normalizeProxyAPIKey(newCfg.ProxyAPIKey)
-		if err != nil {
-			http.Error(w, "ProxyAPIKey 校验失败: "+err.Error(), http.StatusBadRequest)
-			return
+		plain, encrypted := "", ""
+		key := strings.TrimSpace(e.Key)
+		ref := strings.TrimSpace(e.KeyRef)
+		switch {
+		case key != "" && strings.HasPrefix(key, encryptedKeyPrefix):
+			// 已加密值：校验后原样保存
+			pk, err := decryptOpenAIKey(key)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("ProxyAPIKeys[%d] (%s) 校验失败: %v", i, name, err), http.StatusBadRequest)
+				return
+			}
+			plain, encrypted = pk, key
+		case key != "":
+			// 明文：自动加密保存
+			pk, persisted, err := normalizeProxyAPIKey(key)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("ProxyAPIKeys[%d] (%s) 校验失败: %v", i, name, err), http.StatusBadRequest)
+				return
+			}
+			plain, encrypted = pk, persisted
+		case ref != "":
+			// 留空保持：按 KeyRef 匹配当前密钥（运行时明文 + 持久化加密值）
+			for j, old := range cfg.ProxyAPIKeys {
+				if old.Key == "" || j >= len(storedProxyAPIKeys) || storedProxyAPIKeys[j].Key == "" {
+					continue
+				}
+				if proxyKeyRef(storedProxyAPIKeys[j].Key) == ref {
+					plain, encrypted = old.Key, storedProxyAPIKeys[j].Key
+					break
+				}
+			}
 		}
-		plainProxyKey = pk
-		newCfg.ProxyAPIKey = persisted
+		plainEntry := ProxyAPIKeyEntry{Name: name, Key: plain, Enable: e.Enable}
+		if encrypted != "" {
+			plainEntry.KeyRef = proxyKeyRef(encrypted)
+		}
+		newPlainKeys = append(newPlainKeys, plainEntry)
+		newStoredKeys = append(newStoredKeys, ProxyAPIKeyEntry{Name: name, Key: encrypted, Enable: e.Enable})
 	}
+	newCfg.ProxyAPIKeys = newStoredKeys
+	newCfg.ProxyAPIKey = "" // 旧版单密钥字段已迁移到列表，不再写盘
 
 	if err := saveConfig(newCfg); err != nil {
 		http.Error(w, "写入 config.json 失败: "+err.Error(), http.StatusInternalServerError)
@@ -3495,10 +3641,11 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 
 	// 更新运行内存（map 整体替换引用，避免并发读写同一 map）
 	storedOpenAIKey = newCfg.OpenAIKey
-	storedProxyAPIKey = newCfg.ProxyAPIKey
+	storedProxyAPIKeys = newStoredKeys
 	applyConfigToRuntime(newCfg)
 	cfg.OpenAIKey = plainKey
-	cfg.ProxyAPIKey = plainProxyKey
+	cfg.ProxyAPIKey = ""
+	cfg.ProxyAPIKeys = newPlainKeys
 	// 模型详细信息可能变化 → 使缓存失效，下次请求重新获取
 	invalidateModelMetaCache()
 
@@ -3507,10 +3654,18 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 		clearAllConfigSessions()
 	}
 
-	// 开关已启用但密钥为空时提示（否则入站鉴权不会生效）
+	// 总开关已启用但无有效密钥时提示（否则入站鉴权不会生效）
 	msg := "✅ 配置已保存。IP/PORT 修改需重启程序生效，其余配置立即生效。"
-	if newCfg.ProxyAPIKeyEnabled && newCfg.ProxyAPIKey == "" {
-		msg += " ⚠️ 代理请求密钥开关已启用但密钥为空，鉴权不会生效，请设置密钥。"
+	if newCfg.ProxyAPIKeyEnabled {
+		valid := 0
+		for _, e := range newPlainKeys {
+			if e.Enable && e.Key != "" {
+				valid++
+			}
+		}
+		if valid == 0 {
+			msg += " ⚠️ 代理请求密钥总开关已启用但无有效密钥（未设置或未启用），鉴权不会生效，请检查密钥列表。"
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -3520,7 +3675,7 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// applyConfigToRuntime 将新配置应用到运行时的全局 cfg（不含 OpenAIKey / WebConfigPassword / ProxyAPIKey，
+// applyConfigToRuntime 将新配置应用到运行时的全局 cfg（不含 OpenAIKey / WebConfigPassword / ProxyAPIKeys，
 // 三者由调用方单独处理为明文，避免加密值覆盖内存明文）
 func applyConfigToRuntime(newCfg Config) {
 	cfg.IP = newCfg.IP
@@ -3534,7 +3689,7 @@ func applyConfigToRuntime(newCfg Config) {
 	cfg.StreamMode = newCfg.StreamMode
 	cfg.Capabilities = newCfg.Capabilities
 	cfg.OpenAIBase = newCfg.OpenAIBase
-	// ProxyAPIKey 由调用方单独处理为明文；这里只同步开关（立即生效，无需重启）
+	// ProxyAPIKeys 密钥列表由调用方单独处理为明文；这里只同步总开关（立即生效，无需重启）
 	cfg.ProxyAPIKeyEnabled = newCfg.ProxyAPIKeyEnabled
 	cfg.ModelAlias = newCfg.ModelAlias
 	cfg.ModelDetailedSettings = newCfg.ModelDetailedSettings
@@ -7303,6 +7458,17 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		sessionID = "-"
 	}
 
+	// 代理请求 API 密钥（入站鉴权）：启用后客户端必须携带任一启用密钥，否则返回 401。
+	// 鉴权在日志块之前执行：通过时把密钥名称并入客户端行（区分请求来源）；
+	// 失败时仅打印一行拒绝日志（不输出请求细节）。
+	keyName, authOK := requireProxyAuth(w, r)
+	if !authOK {
+		return
+	}
+	if rec != nil && keyName != "" {
+		rec.setClientKey(keyName)
+	}
+
 	ts := time.Now().Format("2006-01-02 15:04:05")
 	hasImage := hasImageInBody(body)
 	// 每轮请求前空一行，方便区分不同轮次的日志
@@ -7312,7 +7478,11 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fmt.Printf("📤 [%s] ========= 客户端 请求 ==========\n", ts)
 	}
-	fmt.Printf("📡 客户端: %s | 会话: %s\n", clientIP(r), sessionID)
+	if keyName != "" {
+		fmt.Printf("📡 客户端: %s | 🔑 %s | 会话: %s\n", clientIP(r), keyName, sessionID)
+	} else {
+		fmt.Printf("📡 客户端: %s | 会话: %s\n", clientIP(r), sessionID)
+	}
 	fmt.Println("方法:", r.Method)
 	fmt.Println("路径:", r.URL.Path)
 	fmt.Println("查询:", r.URL.RawQuery)
@@ -7323,11 +7493,6 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("Body:", string(body))
 	}
 	fmt.Println("================================")
-
-	// 代理请求 API 密钥（入站鉴权）：启用后客户端必须携带正确密钥，否则返回 401
-	if !requireProxyAuth(w, r) {
-		return
-	}
 
 	// 剥离模型名前缀/后缀：客户端会用显示名（含 OpenAI_Prefix/OpenAI_Suffix）发起请求，
 	// 必须还原为上游真实模型 ID，否则上游报 model_not_found
@@ -7543,7 +7708,7 @@ func main() {
 	http.HandleFunc("/api/config/login", apiConfigLogin)
 	http.HandleFunc("/api/config/logout", apiConfigLogout)
 	http.HandleFunc("/api/config/test", apiTestConfig)
-	http.HandleFunc("/api/config/reveal", apiRevealProxyKey)
+	http.HandleFunc("/api/config/reveal", apiRevealProxyKeys)
 	http.HandleFunc("/api/realtime", handleRealtimeAPI)
 	http.HandleFunc("/api/realtime/events", handleRealtimeEvents)
 
@@ -7557,10 +7722,18 @@ func main() {
 	}
 	fmt.Println("⚙️ 配置管理页面: http://" + webHost + ":" + cfg.PORT + "/config " + pwHint)
 
-	if cfg.ProxyAPIKeyEnabled && cfg.ProxyAPIKey != "" {
-		fmt.Println("🔑 代理请求密钥: 已启用（客户端请求需携带 API 密钥，错误密钥返回 401）")
-	} else if cfg.ProxyAPIKeyEnabled {
-		fmt.Println("🔑 代理请求密钥: 开关已开启但密钥为空，鉴权不会生效，请在配置页设置密钥")
+	if cfg.ProxyAPIKeyEnabled {
+		valid := 0
+		for _, e := range cfg.ProxyAPIKeys {
+			if e.Enable && e.Key != "" {
+				valid++
+			}
+		}
+		if valid > 0 {
+			fmt.Printf("🔑 代理请求密钥: 已启用（%d 个密钥，客户端请求需携带 API 密钥，错误密钥返回 401）\n", valid)
+		} else {
+			fmt.Println("🔑 代理请求密钥: 总开关已开启但无有效密钥，鉴权不会生效，请在配置页设置密钥")
+		}
 	}
 
 	http.HandleFunc("/", logAllRequests)

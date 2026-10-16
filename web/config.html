@@ -59,9 +59,6 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .vq-slider-row input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#fff;border:2px solid var(--accent2);box-shadow:0 2px 6px rgba(0,0,0,.4)}
 .vq-slider-row input[type=number]{width:88px;flex-shrink:0;text-align:center}
 .vq-percent-val{font-family:Consolas,monospace;font-size:12px;color:var(--accent);background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.25);padding:1px 8px;border-radius:12px;margin-left:auto;white-space:nowrap}
-.key-row{display:flex;align-items:center;gap:10px}
-.key-row input{flex:1;min-width:0}
-.key-row .btn{flex-shrink:0;white-space:nowrap}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font-size:13px;font-weight:500;cursor:pointer;transition:.15s;font-family:inherit}
 .btn:hover{border-color:var(--accent);color:#fff}
 .btn.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
@@ -100,6 +97,10 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .dlp-group .row:first-child{margin-top:0}
 .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}
 .empty{color:var(--muted);font-size:13px;text-align:center;padding:10px}
+.pkrow{display:grid;grid-template-columns:1fr 1.5fr auto auto auto auto;gap:8px;align-items:center}
+.pk-enable{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer;white-space:nowrap}
+.pk-enable input{accent-color:var(--accent2);cursor:pointer}
+.rt-tag-key{color:var(--yellow);border-color:rgba(210,153,34,.4)}
 #loginOverlay{position:fixed;inset:0;z-index:200;background:rgba(5,8,12,.88);backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:center}
 #loginOverlay.hidden{display:none}
 .login-box{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:36px 40px;width:min(380px,90vw);display:flex;flex-direction:column;gap:14px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.6)}
@@ -224,17 +225,12 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
       </div>
 
       <div class="card">
-        <div class="head" data-i18n="secProxyKey">🔑 代理请求密钥 <span class="hint" data-i18n="secProxyKeyHint">启用后客户端请求本代理必须携带 API 密钥，防止被随意调用</span></div>
+        <div class="head" data-i18n="secProxyKey">🔑 代理请求密钥 <span class="hint" data-i18n="secProxyKeyHint">启用后客户端请求本代理必须携带 API 密钥，防止被随意调用；每个客户端可分配独立密钥以区分来源</span></div>
         <div class="body">
-          <div class="row"><label class="switch"><input type="checkbox" id="ProxyKeyEnable"><span class="track"></span><span class="lbl" data-i18n="proxyKeyEnable">启用：客户端请求必须携带 API 密钥（错误密钥返回 401）</span></label></div>
-          <div class="row">
-            <label data-i18n="lblProxyKey">代理请求 API 密钥 ProxyAPIKey <span id="proxyKeyStatus" class="badge hidden" data-i18n="proxyKeySet">已设置</span></label>
-            <div class="key-row">
-              <input type="password" id="ProxyAPIKey" data-i18n-ph="proxyKeyPlaceholder" placeholder="留空保持不变；输入明文新密钥将自动加密保存" autocomplete="off">
-              <button class="btn small" onclick="copyProxyKey()" data-i18n="btnCopyProxyKey">📋 复制</button>
-            </div>
-          </div>
-          <div class="row"><label class="mono" style="color:var(--muted);font-size:12px" data-i18n="proxyKeyTip">💡 客户端请求头需携带 Authorization: Bearer &lt;密钥&gt;（也兼容 x-api-key / api-key 格式）；密钥与 OPENAI_KEY 一样加密存储</label></div>
+          <div class="row"><label class="switch"><input type="checkbox" id="ProxyKeyEnable"><span class="track"></span><span class="lbl" data-i18n="proxyKeyEnable">启用：客户端请求必须携带任一启用密钥（错误密钥返回 401）</span></label></div>
+          <div id="proxyKeyList"></div>
+          <div><button class="btn small" onclick="addProxyKey()" data-i18n="btnAddProxyKey">＋ 添加密钥</button></div>
+          <div class="row"><label class="mono" style="color:var(--muted);font-size:12px" data-i18n="proxyKeyTip">💡 客户端请求头需携带 Authorization: Bearer &lt;密钥&gt;（也兼容 x-api-key / api-key 格式）；密钥与 OPENAI_KEY 一样加密存储；日志与实时记录会显示匹配的密钥名称</label></div>
         </div>
       </div>
     </div>
@@ -410,7 +406,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 </div>
 
 <script>
-var state = { aliases: [], details: [], rules: [] };
+var state = { aliases: [], details: [], rules: [], proxyKeys: [] };
 // 实时请求状态提前声明：applyI18n（DOMContentLoaded 时调用）会重渲染列表
 var rtState = { items: [], open: {}, paused: false, es: null, lastId: 0, enabled: true, timer: null };
 
@@ -438,7 +434,7 @@ var I18N = {
     rtTrunc: '已截断', rtTokens: 'Token[{src}] 输入 {i} / 输出 {o}', rtTokenUpstream: '上游', rtTokenEstimate: '估算', rtCached: '缓存 {c} ({p}%)', rtMs: '{ms} ms', rtSec: '{s} s',
     rtCount: '共 {n} 条', rtCleared: '🗑 已清空实时记录', rtClearFail: '清空失败: ', rtLoadFail: '加载实时记录失败: ', rtRefreshed: '🔄 实时记录已刷新',
     rtCopied: '📋 已复制到剪贴板', rtCopyFail: '复制失败', rtCopy: '📋 复制',
-    rtStreamYes: '流式', rtStreamNo: '非流式',
+    rtStreamYes: '流式', rtStreamNo: '非流式', rtClientKey: '代理请求密钥',
     rtProtTitle: '触发的保护/处理',
     rtProt_think_tag_req: '请求侧思考标签消毒', rtProt_think_tag_resp: '响应侧思考标签消毒',
     rtProt_dedup_skip: '去重·跳过重复块', rtProt_dedup_tail: '去重·截断尾部重复', rtProt_dedup_trip: '熔断·连续重复收尾',
@@ -456,11 +452,13 @@ var I18N = {
     secPw: '🔒 访问密码', secPwHint: '防止局域网内被他人乱改，留空保持不变',
     lblWebPw: '配置页面访问密码 WebConfigPassword', pwEnabled: '已启用', webPwPlaceholder: '留空保持不变；设置新密码后需重新登录',
     secPwTip: '💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改',
-    secProxyKey: '🔑 代理请求密钥', secProxyKeyHint: '启用后客户端请求本代理必须携带 API 密钥，防止被随意调用',
-    proxyKeyEnable: '启用：客户端请求必须携带 API 密钥（错误密钥返回 401）',
-    lblProxyKey: '代理请求 API 密钥 ProxyAPIKey', proxyKeySet: '已设置', proxyKeyPlaceholder: '留空保持不变；输入明文新密钥将自动加密保存',
-    proxyKeyTip: '💡 客户端请求头需携带 Authorization: Bearer &lt;密钥&gt;（也兼容 x-api-key / api-key 格式）；密钥与 OPENAI_KEY 一样加密存储',
-    btnCopyProxyKey: '📋 复制', proxyKeyNotSet: '代理请求密钥未设置，无法复制', proxyKeyCopied: '📋 代理请求密钥已复制到剪贴板', proxyKeyCopyFail: '复制失败: ',
+    secProxyKey: '🔑 代理请求密钥', secProxyKeyHint: '启用后客户端请求本代理必须携带 API 密钥，防止被随意调用；每个客户端可分配独立密钥以区分来源',
+    proxyKeyEnable: '启用：客户端请求必须携带任一启用密钥（错误密钥返回 401）',
+    proxyKeyTip: '💡 客户端请求头需携带 Authorization: Bearer &lt;密钥&gt;（也兼容 x-api-key / api-key 格式）；密钥与 OPENAI_KEY 一样加密存储；日志与实时记录会显示匹配的密钥名称',
+    btnAddProxyKey: '＋ 添加密钥', emptyProxyKey: '暂无代理请求密钥（点击下方按钮添加）',
+    proxyKeyNamePh: '名称（如 VS Code）', proxyKeyNewPh: '输入密钥', proxyKeyKeepPh: '已设置 · 留空保持', pkEnableShort: '启用',
+    btnCopyProxyKey: '📋 复制', proxyKeyNotSet: '该密钥未设置，无法复制', proxyKeyCopied: '📋 代理请求密钥已复制到剪贴板', proxyKeyCopyFail: '复制失败: ',
+    btnGenProxyKey: '🎲 自动生成密钥（sk- 开头，生成后自动复制）', proxyKeyGenerated: '🎲 已生成新密钥并复制到剪贴板，记得点「保存配置」生效',
     logTitle: '📜 日志设置', lblLogLimit: '终端日志清理阈值 Log_Limit',
     lblLogResp: '打印响应内容', lblLogHeaders: '打印请求头', lblLogBody: '打印请求体',
     modelDisplay: '🧩 模型显示', modelDisplayHint: '仅影响客户端看到的模型名称',
@@ -525,7 +523,7 @@ var I18N = {
     rtTrunc: 'truncated', rtTokens: 'Token[{src}] in {i} / out {o}', rtTokenUpstream: 'upstream', rtTokenEstimate: 'estimate', rtCached: 'cached {c} ({p}%)', rtMs: '{ms} ms', rtSec: '{s} s',
     rtCount: '{n} entries', rtCleared: '🗑 Realtime records cleared', rtClearFail: 'Clear failed: ', rtLoadFail: 'Failed to load realtime records: ', rtRefreshed: '🔄 Realtime records refreshed',
     rtCopied: '📋 Copied to clipboard', rtCopyFail: 'Copy failed', rtCopy: '📋 Copy',
-    rtStreamYes: 'stream', rtStreamNo: 'non-stream',
+    rtStreamYes: 'stream', rtStreamNo: 'non-stream', rtClientKey: 'Proxy request key',
     rtProtTitle: 'Triggered protections/processing',
     rtProt_think_tag_req: 'Think-tag sanitize (request)', rtProt_think_tag_resp: 'Think-tag sanitize (response)',
     rtProt_dedup_skip: 'Dedup · skipped block', rtProt_dedup_tail: 'Dedup · truncated tail', rtProt_dedup_trip: 'Trip · forced finish',
@@ -543,11 +541,13 @@ var I18N = {
     secPw: '🔒 Access Password', secPwHint: 'Prevent others on LAN from modifying; leave empty to keep',
     lblWebPw: 'Config page password WebConfigPassword', pwEnabled: 'Enabled', webPwPlaceholder: 'Leave empty to keep; new password requires re-login',
     secPwTip: '💡 After setting, /config requires password and all config APIs are protected',
-    secProxyKey: '🔑 Proxy Request Key', secProxyKeyHint: 'When enabled, clients must send an API key with every request to this proxy',
-    proxyKeyEnable: 'Enable: clients must carry an API key (wrong key returns 401)',
-    lblProxyKey: 'Proxy request API key ProxyAPIKey', proxyKeySet: 'Set', proxyKeyPlaceholder: 'Leave empty to keep; enter plaintext to auto-encrypt',
-    proxyKeyTip: '💡 Clients must send Authorization: Bearer &lt;key&gt; (x-api-key / api-key also accepted); the key is encrypted like OPENAI_KEY',
-    btnCopyProxyKey: '📋 Copy', proxyKeyNotSet: 'Proxy request key is not set', proxyKeyCopied: '📋 Proxy request key copied to clipboard', proxyKeyCopyFail: 'Copy failed: ',
+    secProxyKey: '🔑 Proxy Request Key', secProxyKeyHint: 'When enabled, clients must send an API key with every request to this proxy; assign a separate key per client to tell them apart',
+    proxyKeyEnable: 'Enable: clients must carry any enabled key (wrong key returns 401)',
+    proxyKeyTip: '💡 Clients must send Authorization: Bearer &lt;key&gt; (x-api-key / api-key also accepted); keys are encrypted like OPENAI_KEY; logs and live records show the matched key name',
+    btnAddProxyKey: '＋ Add Key', emptyProxyKey: 'No proxy request keys yet (click the button below to add)',
+    proxyKeyNamePh: 'Name (e.g. VS Code)', proxyKeyNewPh: 'Enter key', proxyKeyKeepPh: 'Set · leave empty to keep', pkEnableShort: 'Enable',
+    btnCopyProxyKey: '📋 Copy', proxyKeyNotSet: 'This key is not set', proxyKeyCopied: '📋 Proxy request key copied to clipboard', proxyKeyCopyFail: 'Copy failed: ',
+    btnGenProxyKey: '🎲 Generate a random key (sk- prefix, auto-copied)', proxyKeyGenerated: '🎲 New key generated & copied; remember to click Save Config',
     logTitle: '📜 Logging', lblLogLimit: 'Terminal log limit Log_Limit',
     lblLogResp: 'Print response', lblLogHeaders: 'Print headers', lblLogBody: 'Print body',
     modelDisplay: '🧩 Model Display', modelDisplayHint: 'Only affects model names seen by client',
@@ -629,7 +629,7 @@ function applyI18n(){
   // 语言按钮
   $('btnLang').textContent = currentLang === 'zh-CN' ? '🌐 EN' : '🌐 中文';
   // 动态渲染的列表
-  renderAliases(); renderDetails(); renderRules();
+  renderAliases(); renderDetails(); renderRules(); renderProxyKeys();
   // 实时请求列表（保护徽章文案随语言切换即时刷新）
   rtRenderAll();
   var pb = $('rtPauseBtn');
@@ -793,9 +793,14 @@ async function loadCfg(notify){
     if(c.OPENAI_KEY_SET){ $('keyStatus').classList.remove('hidden'); } else { $('keyStatus').classList.add('hidden'); }
     $('WebConfigPassword').value = '';
     if(c.WEB_CONFIG_PASSWORD_SET){ $('pwStatus').classList.remove('hidden'); } else { $('pwStatus').classList.add('hidden'); }
-    $('ProxyAPIKey').value = '';
     $('ProxyKeyEnable').checked = !!c.ProxyAPIKeyEnabled;
-    if(c.PROXY_API_KEY_SET){ $('proxyKeyStatus').classList.remove('hidden'); } else { $('proxyKeyStatus').classList.add('hidden'); }
+    state.proxyKeys = [];
+    if(Array.isArray(c.ProxyAPIKeys)){
+      c.ProxyAPIKeys.forEach(function(k){
+        state.proxyKeys.push({ name: k.Name || '', key: '', enable: k.Enable !== false, keySet: !!k.KeySet, keyRef: k.KeyRef || '' });
+      });
+    }
+    renderProxyKeys();
     $('Log_Limit').value = c.Log_Limit != null ? c.Log_Limit : 100;
     $('Log_Responses').checked = !!c.Log_Responses;
     $('Log_Headers').checked = !!c.Log_Headers;
@@ -1098,8 +1103,13 @@ function collectCfg(){
     OPENAI_BASE: $('OPENAI_BASE').value.trim(),
     OPENAI_KEY: $('OPENAI_KEY').value.trim(),
     WebConfigPassword: $('WebConfigPassword').value.trim(),
-    ProxyAPIKey: $('ProxyAPIKey').value.trim(),
     ProxyAPIKeyEnabled: $('ProxyKeyEnable').checked,
+    ProxyAPIKeys: state.proxyKeys.filter(function(k){ return (k.name && k.name.trim()) || k.key || k.keyRef; }).map(function(k){
+      var o = { Name: (k.name || '').trim(), Enable: !!k.enable };
+      if(k.key && k.key.trim()){ o.Key = k.key.trim(); }
+      else if(k.keyRef){ o.KeyRef = k.keyRef; }
+      return o;
+    }),
     ModelAlias: aliases,
     ModelDetailedSettings: details,
     RequestPromptReplace: rules
@@ -1145,19 +1155,73 @@ async function testConn(){
   }
 }
 
-// 复制代理请求密钥：输入框有内容（刚输入未保存的新密钥）时优先复制输入值，
+// 复制指定行的代理请求密钥：输入框有内容（刚输入未保存的新密钥）时优先复制输入值，
 // 否则从服务端拉取已保存的明文密钥（GET /api/config 脱敏不返回明文，
-// 密钥仅在用户主动点击复制时通过 /api/config/reveal 拉取一次）
-async function copyProxyKey(){
-  var typed = $('ProxyAPIKey').value.trim();
+// 密钥仅在用户主动点击复制时通过 /api/config/reveal 拉取一次，按 KeyRef 匹配行）
+async function copyProxyKey(i){
+  var k = state.proxyKeys[i];
+  if(!k) return;
+  var typed = (k.key || '').trim();
   if(typed){ copyTextToClipboard(typed, t('proxyKeyCopied'), t('proxyKeyCopyFail')); return; }
+  if(!k.keySet){ toast(t('proxyKeyNotSet'), 'err'); return; }
   try{
     var res = await api('/api/config/reveal', { method: 'POST' });
-    if(!res || !res.ok || !res.key){ toast(t('proxyKeyNotSet'), 'err'); return; }
-    copyTextToClipboard(res.key, t('proxyKeyCopied'), t('proxyKeyCopyFail'));
+    if(!res || !res.ok || !res.keys || !res.keys.length){ toast(t('proxyKeyNotSet'), 'err'); return; }
+    var hit = null;
+    for(var j = 0; j < res.keys.length; j++){
+      if(k.keyRef && res.keys[j].KeyRef === k.keyRef){ hit = res.keys[j]; break; }
+    }
+    if(!hit){ toast(t('proxyKeyNotSet'), 'err'); return; }
+    copyTextToClipboard(hit.Key, t('proxyKeyCopied'), t('proxyKeyCopyFail'));
   }catch(e){
     toast(t('proxyKeyCopyFail') + e.message, 'err');
   }
+}
+
+// 渲染代理请求密钥列表（多密钥）：名称 + 密钥（留空保持）+ 单独启用 + 📋复制 + ✕删除
+function renderProxyKeys(){
+  var box = $('proxyKeyList');
+  if(!box) return;
+  box.innerHTML = '';
+  if(!state.proxyKeys.length){ box.innerHTML = '<div class="empty">' + t('emptyProxyKey') + '</div>'; return; }
+  state.proxyKeys.forEach(function(k, i){
+    var row = document.createElement('div');
+    row.className = 'pkrow';
+    var ph = k.keySet ? t('proxyKeyKeepPh') : t('proxyKeyNewPh');
+    row.innerHTML =
+      '<input type="text" value="' + esc(k.name) + '" placeholder="' + esc(t('proxyKeyNamePh')) + '" oninput="state.proxyKeys[' + i + '].name=this.value">' +
+      '<input type="password" value="' + esc(k.key) + '" placeholder="' + esc(ph) + '" autocomplete="off" oninput="state.proxyKeys[' + i + '].key=this.value">' +
+      '<label class="pk-enable" title="' + esc(t('lblEnable')) + '"><input type="checkbox"' + (k.enable ? ' checked' : '') + ' onchange="state.proxyKeys[' + i + '].enable=this.checked"><span>' + t('pkEnableShort') + '</span></label>' +
+      '<button class="btn small" onclick="generateProxyKey(' + i + ')" title="' + esc(t('btnGenProxyKey')) + '">🎲</button>' +
+      '<button class="btn small" onclick="copyProxyKey(' + i + ')" title="' + esc(t('btnCopyProxyKey')) + '">📋</button>' +
+      '<button class="btn danger" onclick="removeAt(state.proxyKeys,' + i + ',renderProxyKeys)" title="' + esc(t('btnDelete')) + '">✕</button>';
+    box.appendChild(row);
+  });
+}
+
+// 添加一条空的代理请求密钥行
+function addProxyKey(){
+  state.proxyKeys.push({ name: '', key: '', enable: true, keySet: false, keyRef: '' });
+  renderProxyKeys();
+}
+
+// 自动生成一个 OpenAI 格式的随机密钥（sk- + 48 位随机字符）填充到指定行，
+// 并自动复制到剪贴板（用户拿到新密钥通常马上要配置到客户端）
+function generateProxyKey(i){
+  var k = state.proxyKeys[i];
+  if(!k) return;
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  var out = '';
+  var buf = new Uint8Array(48);
+  if(window.crypto && window.crypto.getRandomValues){
+    window.crypto.getRandomValues(buf);
+    for(var j = 0; j < buf.length; j++){ out += chars[buf[j] % chars.length]; }
+  } else {
+    for(var j = 0; j < 48; j++){ out += chars[Math.floor(Math.random() * chars.length)]; }
+  }
+  k.key = 'sk-' + out;
+  renderProxyKeys();
+  copyTextToClipboard(k.key, t('proxyKeyGenerated'), t('proxyKeyCopyFail'));
 }
 
 // ================= 实时请求查看（RealtimeLog） =================
@@ -1347,6 +1411,7 @@ function rtRenderItem(node, e, open){
       '<span class="rt-model">' + esc(e.Model || '-') + '</span>' +
       '<span class="rt-path">' + esc(e.Path) + '</span>' +
       '<span class="rt-tag">' + esc(e.Client) + '</span>' +
+      (e.ClientKey ? '<span class="rt-tag rt-tag-key" title="' + esc(t('rtClientKey')) + '">🔑 ' + esc(e.ClientKey) + '</span>' : '') +
       '<span class="rt-tag">' + (e.Stream ? t('rtStreamYes') : t('rtStreamNo')) + '</span>' +
       rtProtBadges(e) +
       '<span class="rt-meta">' + esc(meta.join(' · ')) + '</span>' +
