@@ -345,13 +345,14 @@ type ProxyAPIKeyEntry struct {
 type RealtimeLog struct {
 	Enable     bool `json:"Enable"`     // 总开关
 	MaxEntries int  `json:"MaxEntries"` // 保留条数（0 回退默认 100，上限 1000）
-	MaxBodyLen int  `json:"MaxBodyLen"` // 请求/响应体截断长度（0 回退默认 8000 字符）
+	MaxBodyLen int  `json:"MaxBodyLen"` // 请求/响应体截断长度（0=不截断；负数回退默认 8000；上限 5000000 字符）
 }
 
 // defaultRealtimeLog 实时请求查看默认配置
 var defaultRealtimeLog = RealtimeLog{Enable: true, MaxEntries: 100, MaxBodyLen: 8000}
 
-// normalizeRealtimeLog 规范化实时请求查看配置（非法值回退默认，限制上下界）
+// normalizeRealtimeLog 规范化实时请求查看配置（非法值回退默认，限制上下界）。
+// MaxBodyLen 特殊语义：0=不截断（保留 0，内存占用由用户自担）；负数回退默认；上限 5000000 字符
 func normalizeRealtimeLog(rl RealtimeLog) RealtimeLog {
 	if rl.MaxEntries <= 0 {
 		rl.MaxEntries = defaultRealtimeLog.MaxEntries
@@ -359,11 +360,11 @@ func normalizeRealtimeLog(rl RealtimeLog) RealtimeLog {
 	if rl.MaxEntries > 1000 {
 		rl.MaxEntries = 1000
 	}
-	if rl.MaxBodyLen <= 0 {
+	if rl.MaxBodyLen < 0 {
 		rl.MaxBodyLen = defaultRealtimeLog.MaxBodyLen
 	}
-	if rl.MaxBodyLen > 100000 {
-		rl.MaxBodyLen = 100000
+	if rl.MaxBodyLen > 5000000 {
+		rl.MaxBodyLen = 5000000
 	}
 	return rl
 }
@@ -1985,7 +1986,7 @@ func printConfigHelp() {
 	fmt.Println("                           IdleConnTimeoutSec: 空闲连接回收秒数, TLSHandshakeTimeoutSec: TLS握手超时秒数, ForceHTTP2: 强制协商HTTP/2}")
 	fmt.Println("                     0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true")
 	fmt.Println(" ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)")
-	fmt.Println("                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,默认8000)}")
+	fmt.Println("                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,0=不截断,默认8000,上限5000000)}")
 	fmt.Println("                     记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量")
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════════════════════════════════")
 	fmt.Println("")
@@ -2209,6 +2210,14 @@ func loadConfig() {
 		needSave = true
 	} else {
 		stored.RealtimeLog = normalizeRealtimeLog(stored.RealtimeLog)
+		// 旧配置升级：RealtimeLog 存在但 MaxBodyLen 字段缺失时补默认——
+		// 区分"显式 0=不截断"与"字段缺失反序列化为 0"，避免旧配置意外变成不截断
+		if rawRL, ok := rawMap["RealtimeLog"].(map[string]interface{}); ok {
+			if _, hasMBL := rawRL["MaxBodyLen"]; !hasMBL {
+				stored.RealtimeLog.MaxBodyLen = defaultCfg.RealtimeLog.MaxBodyLen
+				needSave = true
+			}
+		}
 	}
 	// 兼容迁移：旧版单密钥字段 ProxyAPIKey → 多密钥列表 ProxyAPIKeys（名称"默认"，启用）
 	if _, hasNew := rawMap["ProxyAPIKeys"]; !hasNew && stored.ProxyAPIKey != "" {
@@ -2820,8 +2829,10 @@ func (c *realtimeCaptureWriter) Write(p []byte) (int, error) {
 		c.status = http.StatusOK
 		c.wrote = true
 	}
-	// head 累积（超出 limit 后标记截断，不再累积）
-	if !c.truncated && len(c.head) < c.limit {
+	// head 累积（limit>0 时超出后标记截断不再累积；limit<=0 表示不截断，无限累积）
+	if c.limit <= 0 {
+		c.head = append(c.head, p...)
+	} else if !c.truncated && len(c.head) < c.limit {
 		remain := c.limit - len(c.head)
 		if len(p) <= remain {
 			c.head = append(c.head, p...)
@@ -2904,7 +2915,9 @@ func (rec *realtimeRecorder) setTokenSource(source string) {
 	e.mu.Unlock()
 }
 
-// setClientKey 线程安全地记录客户端使用的代理请求密钥名称（多密钥鉴权通过时调用，区分请求来源）
+// setClientKey 线程安全地记录客户端使用的代理请求密钥名称（多密钥鉴权通过时调用，区分请求来源），
+// 并重新广播：新建记录时尚未鉴权（密钥名未知），此处更新后立即推送，
+// 让前端「进行中」的条目即时显示密钥名（同 ID 原位更新）
 func (rec *realtimeRecorder) setClientKey(name string) {
 	if rec == nil || name == "" {
 		return
@@ -2913,6 +2926,7 @@ func (rec *realtimeRecorder) setClientKey(name string) {
 	e.mu.Lock()
 	e.ClientKey = name
 	e.mu.Unlock()
+	realtimeUpdate(e)
 }
 
 // markProtection 在实时记录上标记一次保护/处理触发（无记录器或未启用时静默忽略）。

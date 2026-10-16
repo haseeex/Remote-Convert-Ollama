@@ -359,7 +359,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
           <div class="row"><label class="switch"><input type="checkbox" id="RtEnable"><span class="track"></span><span class="lbl" data-i18n="rtEnable">启用：记录请求与响应到内存（供本页实时查看）</span></label></div>
           <div class="grid2">
             <div class="row"><label data-i18n="rtMaxEntries">保留条数 MaxEntries（1-1000，默认 100）</label><input type="number" id="RtMaxEntries" min="1" max="1000" placeholder="100"></div>
-            <div class="row"><label data-i18n="rtMaxBodyLen">请求/响应体截断长度 MaxBodyLen（字符，默认 8000）</label><input type="number" id="RtMaxBodyLen" min="100" max="100000" placeholder="8000"></div>
+            <div class="row"><label data-i18n="rtMaxBodyLen">请求/响应体截断长度 MaxBodyLen（字符，0=不截断，默认 8000，上限 5000000）</label><input type="number" id="RtMaxBodyLen" min="0" max="5000000" placeholder="8000"></div>
           </div>
           <div class="row"><label style="color:var(--muted);font-size:12px" data-i18n="rtWarn">💡 记录含对话内容，仅存本机内存；若配置页面未设密码，局域网内可访问者也能看到，建议启用访问密码</label></div>
         </div>
@@ -422,7 +422,7 @@ var I18N = {
     tabRealtime: '📡 实时请求',
     rtTitle: '📡 实时请求查看 RealtimeLog', rtHint: '内存记录最近的请求与响应（不写磁盘），保存后立即生效',
     rtEnable: '启用：记录请求与响应到内存（供本页实时查看）',
-    rtMaxEntries: '保留条数 MaxEntries（1-1000，默认 100）', rtMaxBodyLen: '请求/响应体截断长度 MaxBodyLen（字符，默认 8000）',
+    rtMaxEntries: '保留条数 MaxEntries（1-1000，默认 100）', rtMaxBodyLen: '请求/响应体截断长度 MaxBodyLen（字符，0=不截断，默认 8000，上限 5000000）',
     rtWarn: '💡 记录含对话内容，仅存本机内存；若配置页面未设密码，局域网内可访问者也能看到，建议启用访问密码',
     rtLive: '📋 实时记录', rtLiveHint: '最新请求显示在最上方，点击条目展开详情',
     rtConnected: '已连接', rtDisconnected: '未连接', rtConnecting: '连接中...', rtAborted: '已断开', rtHideProbe: '隐藏探活请求',
@@ -511,7 +511,7 @@ var I18N = {
     tabRealtime: '📡 Realtime',
     rtTitle: '📡 Realtime Request Viewer RealtimeLog', rtHint: 'Keeps recent requests and responses in memory (no disk writes); takes effect immediately after save',
     rtEnable: 'Enable: record requests and responses in memory (viewable on this page)',
-    rtMaxEntries: 'Max entries MaxEntries (1-1000, default 100)', rtMaxBodyLen: 'Body truncation length MaxBodyLen (chars, default 8000)',
+    rtMaxEntries: 'Max entries MaxEntries (1-1000, default 100)', rtMaxBodyLen: 'Body truncation length MaxBodyLen (chars, 0 = no truncation, default 8000, max 5000000)',
     rtWarn: '💡 Records contain conversation content and stay in local memory only; if no config password is set, anyone on the LAN who can open this page can see them — enable an access password',
     rtLive: '📋 Live Records', rtLiveHint: 'Newest requests appear on top; click an entry to expand details',
     rtConnected: 'Connected', rtDisconnected: 'Disconnected', rtConnecting: 'Connecting...', rtAborted: 'Aborted', rtHideProbe: 'Hide probes',
@@ -825,7 +825,7 @@ async function loadCfg(notify){
     var rl = c.RealtimeLog || {};
     $('RtEnable').checked = rl.Enable !== false;
     $('RtMaxEntries').value = rl.MaxEntries || 100;
-    $('RtMaxBodyLen').value = rl.MaxBodyLen || 8000;
+    $('RtMaxBodyLen').value = rl.MaxBodyLen != null ? rl.MaxBodyLen : 8000;
 
     // 连接池设置（0 = 使用默认）
     var cp = c.ConnPool || {};
@@ -1076,7 +1076,7 @@ function collectCfg(){
     RealtimeLog: {
       Enable: $('RtEnable').checked,
       MaxEntries: parseInt($('RtMaxEntries').value, 10) || 100,
-      MaxBodyLen: parseInt($('RtMaxBodyLen').value, 10) || 8000
+      MaxBodyLen: (function(){ var v = parseInt($('RtMaxBodyLen').value, 10); return (isNaN(v) || v < 0) ? 8000 : v; })()
     },
     ModelContextPrompt: {
       Enable: $('CtxEnable').checked,
