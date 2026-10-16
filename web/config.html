@@ -59,6 +59,9 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .vq-slider-row input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#fff;border:2px solid var(--accent2);box-shadow:0 2px 6px rgba(0,0,0,.4)}
 .vq-slider-row input[type=number]{width:88px;flex-shrink:0;text-align:center}
 .vq-percent-val{font-family:Consolas,monospace;font-size:12px;color:var(--accent);background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.25);padding:1px 8px;border-radius:12px;margin-left:auto;white-space:nowrap}
+.key-row{display:flex;align-items:center;gap:10px}
+.key-row input{flex:1;min-width:0}
+.key-row .btn{flex-shrink:0;white-space:nowrap}
 .btn{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;border-radius:8px;border:1px solid var(--border);background:var(--panel2);color:var(--text);font-size:13px;font-weight:500;cursor:pointer;transition:.15s;font-family:inherit}
 .btn:hover{border-color:var(--accent);color:#fff}
 .btn.primary{background:var(--accent2);border-color:var(--accent2);color:#fff}
@@ -217,6 +220,21 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
             <input type="password" id="WebConfigPassword" data-i18n-ph="webPwPlaceholder" placeholder="留空保持不变；设置新密码后需重新登录" autocomplete="new-password">
           </div>
           <div class="row"><label class="mono" style="color:var(--muted);font-size:12px" data-i18n="secPwTip">💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改</label></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="secProxyKey">🔑 代理请求密钥 <span class="hint" data-i18n="secProxyKeyHint">启用后客户端请求本代理必须携带 API 密钥，防止被随意调用</span></div>
+        <div class="body">
+          <div class="row"><label class="switch"><input type="checkbox" id="ProxyKeyEnable"><span class="track"></span><span class="lbl" data-i18n="proxyKeyEnable">启用：客户端请求必须携带 API 密钥（错误密钥返回 401）</span></label></div>
+          <div class="row">
+            <label data-i18n="lblProxyKey">代理请求 API 密钥 ProxyAPIKey <span id="proxyKeyStatus" class="badge hidden" data-i18n="proxyKeySet">已设置</span></label>
+            <div class="key-row">
+              <input type="password" id="ProxyAPIKey" data-i18n-ph="proxyKeyPlaceholder" placeholder="留空保持不变；输入明文新密钥将自动加密保存" autocomplete="off">
+              <button class="btn small" onclick="copyProxyKey()" data-i18n="btnCopyProxyKey">📋 复制</button>
+            </div>
+          </div>
+          <div class="row"><label class="mono" style="color:var(--muted);font-size:12px" data-i18n="proxyKeyTip">💡 客户端请求头需携带 Authorization: Bearer &lt;密钥&gt;（也兼容 x-api-key / api-key 格式）；密钥与 OPENAI_KEY 一样加密存储</label></div>
         </div>
       </div>
     </div>
@@ -438,6 +456,11 @@ var I18N = {
     secPw: '🔒 访问密码', secPwHint: '防止局域网内被他人乱改，留空保持不变',
     lblWebPw: '配置页面访问密码 WebConfigPassword', pwEnabled: '已启用', webPwPlaceholder: '留空保持不变；设置新密码后需重新登录',
     secPwTip: '💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改',
+    secProxyKey: '🔑 代理请求密钥', secProxyKeyHint: '启用后客户端请求本代理必须携带 API 密钥，防止被随意调用',
+    proxyKeyEnable: '启用：客户端请求必须携带 API 密钥（错误密钥返回 401）',
+    lblProxyKey: '代理请求 API 密钥 ProxyAPIKey', proxyKeySet: '已设置', proxyKeyPlaceholder: '留空保持不变；输入明文新密钥将自动加密保存',
+    proxyKeyTip: '💡 客户端请求头需携带 Authorization: Bearer &lt;密钥&gt;（也兼容 x-api-key / api-key 格式）；密钥与 OPENAI_KEY 一样加密存储',
+    btnCopyProxyKey: '📋 复制', proxyKeyNotSet: '代理请求密钥未设置，无法复制', proxyKeyCopied: '📋 代理请求密钥已复制到剪贴板', proxyKeyCopyFail: '复制失败: ',
     logTitle: '📜 日志设置', lblLogLimit: '终端日志清理阈值 Log_Limit',
     lblLogResp: '打印响应内容', lblLogHeaders: '打印请求头', lblLogBody: '打印请求体',
     modelDisplay: '🧩 模型显示', modelDisplayHint: '仅影响客户端看到的模型名称',
@@ -520,6 +543,11 @@ var I18N = {
     secPw: '🔒 Access Password', secPwHint: 'Prevent others on LAN from modifying; leave empty to keep',
     lblWebPw: 'Config page password WebConfigPassword', pwEnabled: 'Enabled', webPwPlaceholder: 'Leave empty to keep; new password requires re-login',
     secPwTip: '💡 After setting, /config requires password and all config APIs are protected',
+    secProxyKey: '🔑 Proxy Request Key', secProxyKeyHint: 'When enabled, clients must send an API key with every request to this proxy',
+    proxyKeyEnable: 'Enable: clients must carry an API key (wrong key returns 401)',
+    lblProxyKey: 'Proxy request API key ProxyAPIKey', proxyKeySet: 'Set', proxyKeyPlaceholder: 'Leave empty to keep; enter plaintext to auto-encrypt',
+    proxyKeyTip: '💡 Clients must send Authorization: Bearer &lt;key&gt; (x-api-key / api-key also accepted); the key is encrypted like OPENAI_KEY',
+    btnCopyProxyKey: '📋 Copy', proxyKeyNotSet: 'Proxy request key is not set', proxyKeyCopied: '📋 Proxy request key copied to clipboard', proxyKeyCopyFail: 'Copy failed: ',
     logTitle: '📜 Logging', lblLogLimit: 'Terminal log limit Log_Limit',
     lblLogResp: 'Print response', lblLogHeaders: 'Print headers', lblLogBody: 'Print body',
     modelDisplay: '🧩 Model Display', modelDisplayHint: 'Only affects model names seen by client',
@@ -765,6 +793,9 @@ async function loadCfg(notify){
     if(c.OPENAI_KEY_SET){ $('keyStatus').classList.remove('hidden'); } else { $('keyStatus').classList.add('hidden'); }
     $('WebConfigPassword').value = '';
     if(c.WEB_CONFIG_PASSWORD_SET){ $('pwStatus').classList.remove('hidden'); } else { $('pwStatus').classList.add('hidden'); }
+    $('ProxyAPIKey').value = '';
+    $('ProxyKeyEnable').checked = !!c.ProxyAPIKeyEnabled;
+    if(c.PROXY_API_KEY_SET){ $('proxyKeyStatus').classList.remove('hidden'); } else { $('proxyKeyStatus').classList.add('hidden'); }
     $('Log_Limit').value = c.Log_Limit != null ? c.Log_Limit : 100;
     $('Log_Responses').checked = !!c.Log_Responses;
     $('Log_Headers').checked = !!c.Log_Headers;
@@ -1067,6 +1098,8 @@ function collectCfg(){
     OPENAI_BASE: $('OPENAI_BASE').value.trim(),
     OPENAI_KEY: $('OPENAI_KEY').value.trim(),
     WebConfigPassword: $('WebConfigPassword').value.trim(),
+    ProxyAPIKey: $('ProxyAPIKey').value.trim(),
+    ProxyAPIKeyEnabled: $('ProxyKeyEnable').checked,
     ModelAlias: aliases,
     ModelDetailedSettings: details,
     RequestPromptReplace: rules
@@ -1109,6 +1142,21 @@ async function testConn(){
   }finally{
     btn.disabled = false;
     btn.innerHTML = t('btnTest');
+  }
+}
+
+// 复制代理请求密钥：输入框有内容（刚输入未保存的新密钥）时优先复制输入值，
+// 否则从服务端拉取已保存的明文密钥（GET /api/config 脱敏不返回明文，
+// 密钥仅在用户主动点击复制时通过 /api/config/reveal 拉取一次）
+async function copyProxyKey(){
+  var typed = $('ProxyAPIKey').value.trim();
+  if(typed){ copyTextToClipboard(typed, t('proxyKeyCopied'), t('proxyKeyCopyFail')); return; }
+  try{
+    var res = await api('/api/config/reveal', { method: 'POST' });
+    if(!res || !res.ok || !res.key){ toast(t('proxyKeyNotSet'), 'err'); return; }
+    copyTextToClipboard(res.key, t('proxyKeyCopied'), t('proxyKeyCopyFail'));
+  }catch(e){
+    toast(t('proxyKeyCopyFail') + e.message, 'err');
   }
 }
 
@@ -1475,15 +1523,21 @@ async function rtClear(){
 }
 
 function rtCopyText(text){
-  var done = function(){ toast(t('rtCopied')); };
+  copyTextToClipboard(text, t('rtCopied'), t('rtCopyFail'));
+}
+
+// 通用剪贴板复制（含非安全上下文回退：局域网 IP 访问时 navigator.clipboard 不可用，
+// 回退到 execCommand 方案）。okMsg/failMsg 为提示文案。
+function copyTextToClipboard(text, okMsg, failMsg){
+  var done = function(){ toast(okMsg); };
   if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(done, function(){ toast(t('rtCopyFail'), 'err'); });
+    navigator.clipboard.writeText(text).then(done, function(){ toast(failMsg, 'err'); });
   } else {
     try{
       var ta = document.createElement('textarea');
       ta.value = text; document.body.appendChild(ta); ta.select();
       document.execCommand('copy'); document.body.removeChild(ta); done();
-    }catch(e){ toast(t('rtCopyFail'), 'err'); }
+    }catch(e){ toast(failMsg, 'err'); }
   }
 }
 
