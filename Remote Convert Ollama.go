@@ -31,6 +31,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -327,6 +328,8 @@ type Config struct {
 	ConnPool ConnPool `json:"ConnPool,omitempty"`
 	// RealtimeLog 实时请求查看：内存记录最近的请求与响应，供配置页面实时查看
 	RealtimeLog RealtimeLog `json:"RealtimeLog,omitempty"`
+	// ModelMetaProbe 模型元数据探测：上游 /models 列表缺少上下文长度/最大输出时，逐个向上游查询补全
+	ModelMetaProbe ModelMetaProbe `json:"ModelMetaProbe,omitempty"`
 }
 
 // ProxyAPIKeyEntry 代理请求密钥条目（多密钥入站鉴权）：
@@ -346,6 +349,34 @@ type RealtimeLog struct {
 	Enable     bool `json:"Enable"`     // 总开关
 	MaxEntries int  `json:"MaxEntries"` // 保留条数（0 回退默认 100，上限 1000）
 	MaxBodyLen int  `json:"MaxBodyLen"` // 请求/响应体截断长度（0=不截断；负数回退默认 8000；上限 5000000 字符）
+}
+
+// ModelMetaProbe 模型元数据探测（上下文长度 / 最大输出）。
+// 标准 OpenAI /v1/models 通常不返回上下文窗口与最大输出信息（Open WebUI、Ollama 的 OpenAI 兼容端点等），
+// 代理只能退回内置默认值。开启后，对列表里缺少这些字段的模型逐个向上游查询：
+//   - Open WebUI：GET <站点根>/api/v1/models/model?id=<模型ID> → params.num_ctx / params.max_tokens
+//   - 通用 OpenAI 兼容：GET <OPENAI_BASE>/models/<模型ID>（标准「获取模型」接口）
+//   - Ollama：POST <站点根>/api/show → parameters 中的 num_ctx，或 model_info.*.context_length
+//
+// 所有地址均由 OPENAI_BASE 推导，不写死任何服务商；结果按 CacheMinutes 缓存（含「查不到」的负缓存），
+// ModelDetailedSettings 中的手动配置始终优先。
+type ModelMetaProbe struct {
+	Enable       bool `json:"Enable"`                 // 总开关（⚠️ 不能加 omitempty，false 是零值会被丢弃）
+	CacheMinutes int  `json:"CacheMinutes,omitempty"` // 探测结果缓存时长（分钟，0 回退默认 30，上限 1440）
+}
+
+// defaultModelMetaProbe 模型元数据探测默认配置
+var defaultModelMetaProbe = ModelMetaProbe{Enable: true, CacheMinutes: 30}
+
+// normalizeModelMetaProbe 规范化探测配置（非法值回退默认，限制上界）
+func normalizeModelMetaProbe(p ModelMetaProbe) ModelMetaProbe {
+	if p.CacheMinutes <= 0 {
+		p.CacheMinutes = defaultModelMetaProbe.CacheMinutes
+	}
+	if p.CacheMinutes > 1440 {
+		p.CacheMinutes = 1440
+	}
+	return p
 }
 
 // defaultRealtimeLog 实时请求查看默认配置
@@ -473,6 +504,8 @@ func invalidateModelMetaCache() {
 	modelMetaCacheMu.Lock()
 	modelMetaCacheInit = false
 	modelMetaCacheMu.Unlock()
+	// 上游地址/密钥/探测配置可能已变化：探测缓存一并清空
+	resetModelProbeCache()
 }
 
 // getModelMetaCache 获取模型元数据缓存（惰性初始化；配置变更后可调用 invalidateModelMetaCache 刷新）
@@ -1908,8 +1941,9 @@ func getDefaultConfig() Config {
 			// 只替换异常泄漏的裸标签，正常对话零影响
 			ThinkTag: true,
 		},
-		ConnPool:    defaultConnPool,
-		RealtimeLog: defaultRealtimeLog,
+		ConnPool:       defaultConnPool,
+		RealtimeLog:    defaultRealtimeLog,
+		ModelMetaProbe: defaultModelMetaProbe,
 	}
 }
 
@@ -1988,6 +2022,11 @@ func printConfigHelp() {
 	fmt.Println(" ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)")
 	fmt.Println("                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,0=不截断,默认8000,上限5000000)}")
 	fmt.Println("                     记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量")
+	fmt.Println(" ▼ ModelMetaProbe   : 模型元数据探测,上游 /models 列表缺少上下文长度/最大输出时,逐个向上游查询补全(Open WebUI / Ollama / 通用 OpenAI 兼容)")
+	fmt.Println("                     格式: {Enable: 总开关(默认 true), CacheMinutes: 探测结果缓存分钟数(默认 30,上限 1440)}")
+	fmt.Println("                     Open WebUI: GET <站点根>/api/v1/models/model?id=<模型ID> → params.num_ctx / params.max_tokens")
+	fmt.Println("                     通用: GET <OPENAI_BASE>/models/<模型ID>; Ollama: POST <站点根>/api/show (parameters 的 num_ctx 或 model_info.*.context_length)")
+	fmt.Println("                     地址均由 OPENAI_BASE 推导; ModelDetailedSettings 手动配置始终优先; 查不到的模型沿用内置默认值")
 	fmt.Println("════════════════════════════════════════════════════════════════════════════════════════════════════════════")
 	fmt.Println("")
 }
@@ -2050,8 +2089,15 @@ func printModelAliases() {
 		} else {
 			fmt.Printf("       🔖 别名映射:   未设置，使用原始名称\n")
 		}
-		fmt.Printf("       📐 上下文长度: %d\n", ctxLen)
-		fmt.Printf("       📤 最大输出:   %d\n", maxOut)
+		ctxNote, outNote := "", ""
+		if !meta.ContextFound {
+			ctxNote = " (默认值，上游未提供)"
+		}
+		if !meta.OutputFound {
+			outNote = " (默认值，上游未提供)"
+		}
+		fmt.Printf("       📐 上下文长度: %d%s\n", ctxLen, ctxNote)
+		fmt.Printf("       📤 最大输出:   %d%s\n", maxOut, outNote)
 		// 优先使用 ModelDetailedSettings 中的 Capabilities
 		modelCaps := cfg.Capabilities
 		if setting, ok := cfg.ModelDetailedSettings[m.ID]; ok && len(setting.Capabilities) > 0 {
@@ -2215,6 +2261,20 @@ func loadConfig() {
 		if rawRL, ok := rawMap["RealtimeLog"].(map[string]interface{}); ok {
 			if _, hasMBL := rawRL["MaxBodyLen"]; !hasMBL {
 				stored.RealtimeLog.MaxBodyLen = defaultCfg.RealtimeLog.MaxBodyLen
+				needSave = true
+			}
+		}
+	}
+	if _, ok := rawMap["ModelMetaProbe"]; !ok {
+		stored.ModelMetaProbe = defaultCfg.ModelMetaProbe
+		needSave = true
+	} else {
+		stored.ModelMetaProbe = normalizeModelMetaProbe(stored.ModelMetaProbe)
+		// 旧配置升级：ModelMetaProbe 存在但缺少 Enable 字段时补默认值，
+		// 区分「显式 false」与「字段缺失反序列化为 false」
+		if rawMP, ok := rawMap["ModelMetaProbe"].(map[string]interface{}); ok {
+			if _, hasEnable := rawMP["Enable"]; !hasEnable {
+				stored.ModelMetaProbe.Enable = defaultCfg.ModelMetaProbe.Enable
 				needSave = true
 			}
 		}
@@ -3559,6 +3619,13 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 模型元数据探测：旧版配置页未携带 ModelMetaProbe 字段时保持当前运行值
+	// （否则 bool 零值会让探测在保存配置时被静默关闭）
+	if _, ok := rawCfg["ModelMetaProbe"]; !ok {
+		newCfg.ModelMetaProbe = cfg.ModelMetaProbe
+	}
+	newCfg.ModelMetaProbe = normalizeModelMetaProbe(newCfg.ModelMetaProbe)
+
 	// 规范化图片质量配置（枚举 + 百分比范围）
 	vq := normalizeVisionQuality(ptrOrZero(newCfg.VisionImageQuality))
 	newCfg.VisionImageQuality = &vq
@@ -3728,6 +3795,8 @@ func applyConfigToRuntime(newCfg Config) {
 	applyConnPoolConfig(cfg.ConnPool)
 	// 应用实时请求查看配置（记录条数/截断长度，立即生效）
 	cfg.RealtimeLog = normalizeRealtimeLog(newCfg.RealtimeLog)
+	// 应用模型元数据探测配置（缓存时长/开关立即生效；缓存由 invalidateModelMetaCache 清空）
+	cfg.ModelMetaProbe = normalizeModelMetaProbe(newCfg.ModelMetaProbe)
 }
 
 // apiTestConfig 测试上游 API 连通性并返回模型列表
@@ -4189,10 +4258,72 @@ func checkStreamRepeat(fullText, reqSig, key string) bool {
 type upstreamModelMeta struct {
 	ContextLength   int64
 	MaxOutputTokens int64
+	// ContextFound / OutputFound：数值是否真实来自上游（/models 列表、探测）或手动配置；
+	// false 表示使用的是内置默认值
+	ContextFound bool
+	OutputFound  bool
+	// Source 数值来源（仅用于日志展示）
+	Source string
 }
 
-// fetchUpstreamModelMeta 调用上游 /v1/models 获取模型元数据并构建映射，
-// 然后合并 ModelDetailedSettings 中手动指定的值（手动设置优先）
+// 上下文长度 / 最大输出的候选字段名，按优先级排序。
+// 前 5 个（上下文）和前 3 个（输出）是原有字段，优先级保持不变；其余是各 OpenAI 兼容实现中常见的字段：
+// num_ctx / num_predict（Open WebUI params、Ollama options）、max_model_len（vLLM）、
+// max_context_length / loaded_context_length、n_ctx / n_ctx_train（llama.cpp）、
+// inputTokenLimit / outputTokenLimit（Gemini）等。
+// OpenRouter 的 top_provider.max_completion_tokens 是嵌套字段，由 findModelNumber 逐层查找。
+var (
+	modelCtxKeys = []string{
+		"context_length", "max_input_tokens", "max_input_length", "context_window", "max_context",
+		"num_ctx", "n_ctx", "loaded_context_length", "max_context_length", "max_model_len",
+		"context_size", "inputTokenLimit", "input_token_limit", "n_ctx_train",
+	}
+	modelOutKeys = []string{
+		"max_output_tokens", "max_completion_tokens", "max_tokens",
+		"outputTokenLimit", "output_token_limit", "num_predict",
+	}
+)
+
+// findModelNumber 在模型对象中按「层级优先、层内按字段优先级」查找第一个 >0 的数值字段，
+// 只向下遍历对象（不进入数组），最多 maxDepth 层。同层键名排序保证结果稳定。
+func findModelNumber(root map[string]interface{}, keys []string, maxDepth int) int64 {
+	level := []map[string]interface{}{root}
+	for depth := 0; depth <= maxDepth && len(level) > 0; depth++ {
+		for _, key := range keys {
+			for _, m := range level {
+				if v := extractNumeric(m, key); v > 0 {
+					return v
+				}
+			}
+		}
+		var next []map[string]interface{}
+		for _, m := range level {
+			names := make([]string, 0, len(m))
+			for k := range m {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			for _, k := range names {
+				if sub, ok := m[k].(map[string]interface{}); ok {
+					next = append(next, sub)
+				}
+			}
+		}
+		level = next
+	}
+	return 0
+}
+
+// extractModelLimits 从一个模型对象（/models 列表项、单模型详情等）中提取上下文长度与最大输出，0 表示未找到
+func extractModelLimits(modelData map[string]interface{}) (ctxLen, maxOut int64) {
+	return findModelNumber(modelData, modelCtxKeys, 3), findModelNumber(modelData, modelOutKeys, 3)
+}
+
+// fetchUpstreamModelMeta 调用上游 /models 获取模型元数据并构建映射：
+//  1. 从列表项中提取上下文长度 / 最大输出（含嵌套字段）
+//  2. 列表缺少这些字段的模型，按 ModelMetaProbe 配置逐个向上游探测补全（Open WebUI / Ollama / 通用）
+//  3. 仍然缺失的使用内置默认值
+//  4. 合并 ModelDetailedSettings 中手动指定的值（手动设置优先）
 func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 	result := make(map[string]upstreamModelMeta)
 
@@ -4229,25 +4360,21 @@ func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 			ContextLength:   DefaultContextLength,
 			MaxOutputTokens: DefaultMaxOutputTokens,
 		}
-
-		// 尝试从多种可能的字段名中提取上下文长度
-		for _, field := range []string{"context_length", "max_input_tokens", "max_input_length", "context_window", "max_context"} {
-			if v := extractNumeric(modelData, field); v > 0 {
-				info.ContextLength = v
-				break
+		ctxLen, maxOut := extractModelLimits(modelData)
+		if ctxLen > 0 {
+			info.ContextLength, info.ContextFound, info.Source = ctxLen, true, "模型列表"
+		}
+		if maxOut > 0 {
+			info.MaxOutputTokens, info.OutputFound = maxOut, true
+			if info.Source == "" {
+				info.Source = "模型列表"
 			}
 		}
-
-		// 尝试提取最大输出 token 数
-		for _, field := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
-			if v := extractNumeric(modelData, field); v > 0 {
-				info.MaxOutputTokens = v
-				break
-			}
-		}
-
 		result[id] = info
 	}
+
+	// 列表里缺少上下文/输出信息的模型：向上游逐个探测（失败不影响主流程，沿用默认值）
+	enrichModelMetaByProbe(result)
 
 	// 合并 ModelDetailedSettings 手动配置（手动设置优先）
 	return applyManualModelSettings(result)
@@ -4262,16 +4389,19 @@ func applyManualModelSettings(result map[string]upstreamModelMeta) map[string]up
 		info := result[modelID]
 		if setting.ContextLength > 0 {
 			info.ContextLength = setting.ContextLength
+			info.ContextFound = true
 		}
 		if setting.MaxOutputTokens > 0 {
 			info.MaxOutputTokens = setting.MaxOutputTokens
+			info.OutputFound = true
 		}
+		info.Source = "手动配置"
 		result[modelID] = info
 	}
 	return result
 }
 
-// extractNumeric 从 map 中提取 int64 数值字段（支持 float64 / int / int64 / json.Number）
+// extractNumeric 从 map 中提取 int64 数值字段（支持 float64 / int / int64 / json.Number / 数字字符串）
 func extractNumeric(data map[string]interface{}, field string) int64 {
 	v, ok := data[field]
 	if !ok {
@@ -4289,8 +4419,466 @@ func extractNumeric(data map[string]interface{}, field string) int64 {
 		if err == nil {
 			return val
 		}
+	case string:
+		if val, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+			return val
+		}
 	}
 	return 0
+}
+
+// ==================== 模型元数据探测（Model Meta Probe） ====================
+// 标准 OpenAI /v1/models 不含上下文窗口 / 最大输出，Open WebUI、Ollama 的 OpenAI 兼容端点都是如此。
+// 对列表里缺少这些信息的模型，逐个向上游查询其「单模型详情」：
+//   - 上游是 Open WebUI（由 GET <站点根>/api/config 识别）：
+//     GET <站点根>/api/v1/models/model?id=<模型ID> → params.num_ctx / params.max_tokens
+//     （没有自定义模型条目的基础模型返回 404，沿用默认值）
+//   - 其它上游：依次尝试
+//     GET <OPENAI_BASE>/models/<模型ID>（标准「获取模型」接口，用与列表相同的字段提取逻辑）
+//     POST <站点根>/api/show（Ollama：parameters 的 num_ctx 优先，其次 model_info.*.context_length）
+//
+// 所有地址均由 OPENAI_BASE 推导，请求只发往 OPENAI_BASE 所在站点（沿用同一个密钥）。
+// 为避免对不支持的上游造成请求风暴：
+//   - 探测结果（含「查不到」）按 CacheMinutes 缓存，配置保存时清空
+//   - 通用探测连续 probeBreakerLimit 次无任何有效数据且从未成功，则暂停该探测一个缓存周期（熔断）
+//   - 并发 probeConcurrency，单次刷新总预算 probeTotalBudget，最多探测 probeMaxModels 个模型
+
+const (
+	probeRequestTimeout = 8 * time.Second
+	probeTotalBudget    = 25 * time.Second
+	probeConcurrency    = 4
+	probeMaxModels      = 256
+	probeBreakerLimit   = 4
+
+	probeKindRetrieve = "retrieve"
+	probeKindOllama   = "ollama-show"
+)
+
+// modelProbeEntry 单个模型的探测结果（0 表示该项未查到）
+type modelProbeEntry struct {
+	ContextLength   int64
+	MaxOutputTokens int64
+	Source          string
+	At              time.Time
+}
+
+// probeOutcome 单次探测请求的结果
+type probeOutcome struct {
+	ctx, out int64
+	err      error // 网络错误 / 超时（不缓存，下次重试）
+}
+
+type webUIDetect struct {
+	is bool
+	at time.Time
+}
+
+// probeBreaker 通用探测的熔断状态：从未成功且连续无数据达到阈值后暂停
+type probeBreaker struct {
+	empties int
+	success bool
+	tripped time.Time
+}
+
+var modelProbeState = struct {
+	sync.Mutex
+	entries  map[string]modelProbeEntry // key: OPENAI_BASE \x00 模型ID
+	webUI    map[string]webUIDetect     // key: OPENAI_BASE
+	breakers map[string]*probeBreaker   // key: OPENAI_BASE \x00 探测类型
+}{
+	entries:  make(map[string]modelProbeEntry),
+	webUI:    make(map[string]webUIDetect),
+	breakers: make(map[string]*probeBreaker),
+}
+
+// resetModelProbeCache 清空探测缓存、Open WebUI 识别结果与熔断状态
+func resetModelProbeCache() {
+	modelProbeState.Lock()
+	modelProbeState.entries = make(map[string]modelProbeEntry)
+	modelProbeState.webUI = make(map[string]webUIDetect)
+	modelProbeState.breakers = make(map[string]*probeBreaker)
+	modelProbeState.Unlock()
+}
+
+// probeCacheTTL 探测结果缓存时长
+func probeCacheTTL() time.Duration {
+	return time.Duration(normalizeModelMetaProbe(cfg.ModelMetaProbe).CacheMinutes) * time.Minute
+}
+
+// upstreamWebRoot 由 OPENAI_BASE 推导站点根地址：去掉结尾的 /api/v1、/v1 或 /api。
+// 例：http://host:8080/api/v1 → http://host:8080；http://host:11434/v1 → http://host:11434
+func upstreamWebRoot(base string) string {
+	root := strings.TrimRight(strings.TrimSpace(base), "/")
+	lower := strings.ToLower(root)
+	for _, suffix := range []string{"/api/v1", "/v1", "/api"} {
+		if strings.HasSuffix(lower, suffix) {
+			return strings.TrimRight(root[:len(root)-len(suffix)], "/")
+		}
+	}
+	return root
+}
+
+// probeHTTP 向上游发起一次探测请求（沿用 OPENAI_KEY 与共享连接池），返回状态码与响应体（最多 4MB）
+func probeHTTP(ctx context.Context, method, target string, body []byte) (int, []byte, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	client := &http.Client{Transport: getSharedTransport(), Timeout: probeRequestTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	return resp.StatusCode, data, nil
+}
+
+// isOpenWebUIUpstream 判断上游是否是 Open WebUI：其 GET /api/config 无需认证，且返回的名称包含 "Open WebUI"。
+// 结果按缓存时长缓存；网络错误不缓存（下次重试）。
+func isOpenWebUIUpstream(ctx context.Context, base string) bool {
+	modelProbeState.Lock()
+	d, ok := modelProbeState.webUI[base]
+	modelProbeState.Unlock()
+	if ok && time.Since(d.at) < probeCacheTTL() {
+		return d.is
+	}
+	status, body, err := probeHTTP(ctx, http.MethodGet, upstreamWebRoot(base)+"/api/config", nil)
+	if err != nil {
+		return false
+	}
+	is := status == http.StatusOK && strings.Contains(strings.ToLower(string(body)), "open webui")
+	modelProbeState.Lock()
+	modelProbeState.webUI[base] = webUIDetect{is: is, at: time.Now()}
+	modelProbeState.Unlock()
+	return is
+}
+
+// probeOpenWebUIModel 查询 Open WebUI 的单模型定义：params.num_ctx → 上下文，params.max_tokens → 最大输出
+func probeOpenWebUIModel(ctx context.Context, base, id string) probeOutcome {
+	target := upstreamWebRoot(base) + "/api/v1/models/model?id=" + url.QueryEscape(id)
+	status, body, err := probeHTTP(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return probeOutcome{err: err}
+	}
+	if status != http.StatusOK {
+		return probeOutcome{} // 404 等：该模型没有自定义条目
+	}
+	var def map[string]interface{}
+	if json.Unmarshal(body, &def) != nil {
+		return probeOutcome{}
+	}
+	params, _ := def["params"].(map[string]interface{})
+	if params == nil {
+		return probeOutcome{}
+	}
+	var o probeOutcome
+	o.ctx = extractNumeric(params, "num_ctx")
+	if o.out = extractNumeric(params, "max_tokens"); o.out <= 0 {
+		o.out = extractNumeric(params, "num_predict")
+	}
+	return o
+}
+
+// probeRetrieveModel 查询标准 OpenAI「获取模型」接口 GET <OPENAI_BASE>/models/<id>，并复用列表的字段提取逻辑
+func probeRetrieveModel(ctx context.Context, base, id string) probeOutcome {
+	status, body, err := probeHTTP(ctx, http.MethodGet, base+"/models/"+url.PathEscape(id), nil)
+	if err != nil {
+		return probeOutcome{err: err}
+	}
+	if status != http.StatusOK {
+		return probeOutcome{}
+	}
+	var def map[string]interface{}
+	if json.Unmarshal(body, &def) != nil {
+		return probeOutcome{}
+	}
+	var o probeOutcome
+	o.ctx, o.out = extractModelLimits(def)
+	return o
+}
+
+var (
+	reParamNumCtx     = regexp.MustCompile(`(?m)^\s*num_ctx\s+(\d+)\s*$`)
+	reParamNumPredict = regexp.MustCompile(`(?m)^\s*num_predict\s+(\d+)\s*$`)
+)
+
+// parseOllamaShow 解析 Ollama /api/show 响应：
+// parameters 里显式设置的 num_ctx 优先（实际生效值），否则取 model_info 中 *.context_length（模型训练长度）
+func parseOllamaShow(raw []byte) (ctxLen, maxOut int64) {
+	var show struct {
+		Parameters string                 `json:"parameters"`
+		ModelInfo  map[string]interface{} `json:"model_info"`
+	}
+	if json.Unmarshal(raw, &show) != nil {
+		return 0, 0
+	}
+	if m := reParamNumCtx.FindStringSubmatch(show.Parameters); m != nil {
+		ctxLen, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	if m := reParamNumPredict.FindStringSubmatch(show.Parameters); m != nil {
+		maxOut, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	if ctxLen <= 0 {
+		for key := range show.ModelInfo {
+			if strings.HasSuffix(key, ".context_length") {
+				if v := extractNumeric(show.ModelInfo, key); v > ctxLen {
+					ctxLen = v
+				}
+			}
+		}
+	}
+	return ctxLen, maxOut
+}
+
+// probeOllamaShow 查询 Ollama 原生接口 POST <站点根>/api/show
+func probeOllamaShow(ctx context.Context, base, id string) probeOutcome {
+	payload, _ := json.Marshal(map[string]string{"model": id, "name": id})
+	status, body, err := probeHTTP(ctx, http.MethodPost, upstreamWebRoot(base)+"/api/show", payload)
+	if err != nil {
+		return probeOutcome{err: err}
+	}
+	if status != http.StatusOK {
+		return probeOutcome{}
+	}
+	var o probeOutcome
+	o.ctx, o.out = parseOllamaShow(body)
+	return o
+}
+
+// probeNum 日志用：0 表示未查到
+func probeNum(v int64) string {
+	if v > 0 {
+		return strconv.FormatInt(v, 10)
+	}
+	return "未知"
+}
+
+// probeKindLabel 探测类型的日志名称
+func probeKindLabel(kind string) string {
+	switch kind {
+	case probeKindRetrieve:
+		return "GET /models/{id}"
+	case probeKindOllama:
+		return "Ollama /api/show"
+	default:
+		return kind
+	}
+}
+
+// probeKindUsable 通用探测是否可用（熔断期内返回 false，期满自动恢复）
+func probeKindUsable(base, kind string) bool {
+	modelProbeState.Lock()
+	defer modelProbeState.Unlock()
+	b := modelProbeState.breakers[base+"\x00"+kind]
+	if b == nil || b.tripped.IsZero() {
+		return true
+	}
+	if time.Since(b.tripped) >= probeCacheTTL() {
+		*b = probeBreaker{}
+		return true
+	}
+	return false
+}
+
+// probeKindReport 记录一次通用探测的结果，用于熔断判断
+func probeKindReport(base, kind string, o probeOutcome) {
+	if o.err != nil {
+		return // 网络错误不计入（可能只是临时故障）
+	}
+	modelProbeState.Lock()
+	defer modelProbeState.Unlock()
+	key := base + "\x00" + kind
+	b := modelProbeState.breakers[key]
+	if b == nil {
+		b = &probeBreaker{}
+		modelProbeState.breakers[key] = b
+	}
+	if o.ctx > 0 || o.out > 0 {
+		b.success = true
+		b.empties = 0
+		return
+	}
+	b.empties++
+	if !b.success && b.empties >= probeBreakerLimit && b.tripped.IsZero() {
+		b.tripped = time.Now()
+		fmt.Printf("🔎 模型元数据探测: 上游未提供 [%s] 的有效数据，已暂停该探测 %d 分钟\n", probeKindLabel(kind), int(probeCacheTTL()/time.Minute))
+	}
+}
+
+// probeOneModel 探测单个模型。返回结果与「是否可缓存」：
+// 网络错误/超时且没有拿到任何数据时不缓存，下次刷新重试；其余情况（含查不到）缓存。
+func probeOneModel(ctx context.Context, base, id string, isWebUI bool) (modelProbeEntry, bool) {
+	var e modelProbeEntry
+	sawErr := false
+
+	merge := func(o probeOutcome, source string) {
+		if o.err != nil {
+			sawErr = true
+			return
+		}
+		if e.ContextLength <= 0 && o.ctx > 0 {
+			e.ContextLength = o.ctx
+			if e.Source == "" {
+				e.Source = source
+			}
+		}
+		if e.MaxOutputTokens <= 0 && o.out > 0 {
+			e.MaxOutputTokens = o.out
+			if e.Source == "" {
+				e.Source = source
+			}
+		}
+	}
+
+	if isWebUI {
+		merge(probeOpenWebUIModel(ctx, base, id), "Open WebUI")
+	} else {
+		for _, kind := range []string{probeKindRetrieve, probeKindOllama} {
+			if e.ContextLength > 0 && e.MaxOutputTokens > 0 {
+				break
+			}
+			if ctx.Err() != nil {
+				sawErr = true
+				break
+			}
+			if !probeKindUsable(base, kind) {
+				continue
+			}
+			var o probeOutcome
+			if kind == probeKindRetrieve {
+				o = probeRetrieveModel(ctx, base, id)
+			} else {
+				o = probeOllamaShow(ctx, base, id)
+			}
+			probeKindReport(base, kind, o)
+			merge(o, probeKindLabel(kind))
+		}
+	}
+
+	found := e.ContextLength > 0 || e.MaxOutputTokens > 0
+	if found {
+		fmt.Printf("🔎 模型元数据探测 [%s]: 上下文=%s 最大输出=%s (来源: %s)\n", id, probeNum(e.ContextLength), probeNum(e.MaxOutputTokens), e.Source)
+	}
+	return e, found || !sawErr
+}
+
+// mergeProbeEntry 把探测结果合并进 result（只填补缺失项，不覆盖列表中已有的真实值），返回是否有改动
+func mergeProbeEntry(result map[string]upstreamModelMeta, id string, e modelProbeEntry) bool {
+	info := result[id]
+	changed := false
+	if !info.ContextFound && e.ContextLength > 0 {
+		info.ContextLength, info.ContextFound, changed = e.ContextLength, true, true
+	}
+	if !info.OutputFound && e.MaxOutputTokens > 0 {
+		info.MaxOutputTokens, info.OutputFound, changed = e.MaxOutputTokens, true, true
+	}
+	if changed {
+		info.Source = e.Source
+		result[id] = info
+	}
+	return changed
+}
+
+// enrichModelMetaByProbe 对 result 中缺少上下文/输出信息的模型逐个探测并补全（见上方说明）
+func enrichModelMetaByProbe(result map[string]upstreamModelMeta) {
+	if !normalizeModelMetaProbe(cfg.ModelMetaProbe).Enable || len(result) == 0 {
+		return
+	}
+	base := strings.TrimRight(strings.TrimSpace(cfg.OpenAIBase), "/")
+
+	// 找出需要探测的模型：列表缺少上下文或输出，且没有被手动配置完全覆盖
+	var todo []string
+	for id, info := range result {
+		if info.ContextFound && info.OutputFound {
+			continue
+		}
+		if s, ok := cfg.ModelDetailedSettings[id]; ok && s.ContextLength > 0 && s.MaxOutputTokens > 0 {
+			continue
+		}
+		todo = append(todo, id)
+	}
+	if len(todo) == 0 {
+		return
+	}
+	sort.Strings(todo)
+	if len(todo) > probeMaxModels {
+		fmt.Printf("⚠️ 模型元数据探测: 共 %d 个模型需要探测，本轮只处理前 %d 个\n", len(todo), probeMaxModels)
+		todo = todo[:probeMaxModels]
+	}
+
+	// 先用缓存（含「查不到」的负缓存）
+	var pending []string
+	ttl := probeCacheTTL()
+	modelProbeState.Lock()
+	for _, id := range todo {
+		if e, ok := modelProbeState.entries[base+"\x00"+id]; ok && time.Since(e.At) < ttl {
+			mergeProbeEntry(result, id, e)
+		} else {
+			pending = append(pending, id)
+		}
+	}
+	modelProbeState.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), probeTotalBudget)
+	defer cancel()
+	isWebUI := isOpenWebUIUpstream(ctx, base)
+
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex // 保护 result 与 filled
+		filled int
+	)
+	sem := make(chan struct{}, probeConcurrency)
+	for _, id := range pending {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
+			e, cacheable := probeOneModel(ctx, base, id, isWebUI)
+			if !cacheable {
+				return
+			}
+			e.At = time.Now()
+			modelProbeState.Lock()
+			modelProbeState.entries[base+"\x00"+id] = e
+			modelProbeState.Unlock()
+			mu.Lock()
+			if mergeProbeEntry(result, id, e) {
+				filled++
+			}
+			mu.Unlock()
+		}(id)
+	}
+	wg.Wait()
+
+	kind := "通用"
+	if isWebUI {
+		kind = "Open WebUI"
+	}
+	fmt.Printf("🔎 模型元数据探测 (%s): %d 个模型缺少上下文/输出信息，本轮补全 %d 个\n", kind, len(pending), filled)
+	if ctx.Err() != nil {
+		fmt.Println("⚠️ 模型元数据探测: 超出本轮时间预算，未完成的模型将在下次刷新时继续探测")
+	}
 }
 
 // mapFinishReason 将 OpenAI 的 finish_reason 映射为 Ollama 的 done_reason
@@ -6699,16 +7287,13 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 				ContextLength:   DefaultContextLength,
 				MaxOutputTokens: DefaultMaxOutputTokens,
 			}
-			for _, field := range []string{"context_length", "max_input_tokens", "max_input_length", "context_window", "max_context"} {
-				if v := extractNumeric(modelData, field); v > 0 {
-					info.ContextLength = v
-					break
+			// 与 fetchUpstreamModelMeta 共用同一套字段提取逻辑
+			if v, o := extractModelLimits(modelData); v > 0 || o > 0 {
+				if v > 0 {
+					info.ContextLength, info.ContextFound = v, true
 				}
-			}
-			for _, field := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
-				if v := extractNumeric(modelData, field); v > 0 {
-					info.MaxOutputTokens = v
-					break
+				if o > 0 {
+					info.MaxOutputTokens, info.OutputFound = o, true
 				}
 			}
 			modelMeta[id] = info
