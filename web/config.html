@@ -22,6 +22,28 @@ header .spacer{flex:1}
 .panels{flex:1;min-width:0;display:flex;flex-direction:column}
 .panel{display:none;flex-direction:column;gap:18px}
 .panel.active{display:flex}
+/* ================= 子页面（二级 Tab） ================= */
+.subtabs{display:flex;gap:6px;flex-wrap:wrap;position:sticky;top:68px;z-index:6;padding:8px 0;background:linear-gradient(180deg,rgba(13,17,23,.97) 60%,rgba(13,17,23,.86));backdrop-filter:blur(8px);border-bottom:1px solid rgba(48,54,61,.55);margin-bottom:-6px}
+.subtab{padding:7px 14px;border-radius:20px;border:1px solid var(--border);background:var(--panel2);color:var(--muted);font-size:12.5px;cursor:pointer;user-select:none;transition:.15s;white-space:nowrap}
+.subtab:hover{color:var(--text);border-color:var(--accent)}
+.subtab.active{color:var(--accent);border-color:var(--accent);background:rgba(88,166,255,.12);font-weight:600}
+.subpanel{display:none;flex-direction:column;gap:18px}
+.subpanel.active{display:flex}
+/* 卡片头部：右侧工具区（快速跳转等） */
+.head-tools{display:flex;align-items:center;gap:8px;margin-left:12px;flex-shrink:0}
+.head-tools input[type=text]{width:130px;padding:5px 10px;font-size:12px}
+.head-tools select{width:auto;min-width:150px;padding:5px 26px 5px 10px;font-size:12px}
+.card>.head:has(.head-tools){flex-wrap:wrap;row-gap:8px}
+/* 子页 Tab 条右侧的粘滞工具栏（快速跳转）：跟着吸顶条一起，永远可见 */
+.subtab-tools{display:none;align-items:center;gap:8px;margin-left:auto;flex-shrink:0}
+.subtab-tools.show{display:flex}
+.subtab-tools select{width:auto;min-width:170px;max-width:240px;padding:5px 26px 5px 10px;font-size:12px;border-radius:20px}
+.subtab-tools .badge{white-space:nowrap}
+@keyframes detailFlash{0%{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.3)}100%{border-color:var(--border);box-shadow:0 0 0 0 rgba(88,166,255,0)}}
+.card-item.flash{animation:detailFlash 1.5s ease-out}
+/* 跳转定位时预留吸顶条高度，避免卡片顶部被遮住 */
+#detailList .card-item{scroll-margin-top:140px}
+@media(max-width:900px){.subtabs{position:static}.subtab-tools{width:100%;justify-content:flex-end}.subtab-tools select{flex:1;max-width:none}}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
 .card>.head{display:flex;align-items:center;gap:8px;padding:12px 18px;background:var(--panel2);border-bottom:1px solid var(--border);font-weight:600;font-size:14px}
 .card>.head .hint{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);text-align:right}
@@ -281,95 +303,127 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
     </div>
 
     <div class="panel" id="tab-model">
-      <div class="card">
-        <div class="head" data-i18n="modelDisplay">🧩 模型显示 <span class="hint" data-i18n="modelDisplayHint">仅影响客户端看到的模型名称</span></div>
-        <div class="body">
-          <div class="grid2">
-            <div class="row"><label data-i18n="lblPrefix">模型名前缀 OpenAI_Prefix</label><input type="text" id="OpenAI_Prefix" placeholder="[VC反代] "></div>
-            <div class="row"><label data-i18n="lblSuffix">模型名后缀 OpenAI_Suffix</label><input type="text" id="OpenAI_Suffix"></div>
-          </div>
-          <div class="grid2">
-            <div class="row">
-              <label data-i18n="lblStreamMode">流式策略 StreamMode</label>
-              <select id="StreamMode">
-                <option value="preserve" data-i18n="smPreserve">preserve · 不覆写（默认）</option>
-                <option value="force_stream" data-i18n="smForceStream">force_stream · 强制流式</option>
-                <option value="force_close" data-i18n="smForceClose">force_close · 强制关闭</option>
-              </select>
+      <div class="subtabs" role="tablist">
+        <div class="subtab active" data-subtab="display" onclick="switchSubTab('model','display')" data-i18n="subModelDisplay">🧩 显示</div>
+        <div class="subtab" data-subtab="vision" onclick="switchSubTab('model','vision')" data-i18n="subModelVision">🖼 视觉</div>
+        <div class="subtab" data-subtab="ctx" onclick="switchSubTab('model','ctx')" data-i18n="subModelCtx">🧭 上下文</div>
+        <div class="subtab" data-subtab="dlp" onclick="switchSubTab('model','dlp')" data-i18n="subModelDlp">🚨 防护</div>
+        <div class="subtab" data-subtab="alias" onclick="switchSubTab('model','alias')" data-i18n="subModelAlias">🔖 别名</div>
+        <div class="subtab" data-subtab="detail" onclick="switchSubTab('model','detail')" data-i18n="subModelDetail">📐 详细设置</div>
+        <div class="subtab-tools" id="detailTools">
+          <select id="detailJump" onchange="jumpToDetail(this.value)"></select>
+          <span class="badge" id="detailCount">0</span>
+        </div>
+      </div>
+
+      <div class="subpanel active" id="sub-model-display">
+        <div class="card">
+          <div class="head" data-i18n="modelDisplay">🧩 模型显示 <span class="hint" data-i18n="modelDisplayHint">仅影响客户端看到的模型名称</span></div>
+          <div class="body">
+            <div class="grid2">
+              <div class="row"><label data-i18n="lblPrefix">模型名前缀 OpenAI_Prefix</label><input type="text" id="OpenAI_Prefix" placeholder="[VC反代] "></div>
+              <div class="row"><label data-i18n="lblSuffix">模型名后缀 OpenAI_Suffix</label><input type="text" id="OpenAI_Suffix"></div>
             </div>
-            <div class="row"><label data-i18n="lblCaps">能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
-          </div>
-          <div class="row"><label data-i18n="lblVisionPrompt">全局视觉代理提示词 VisionProxyPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionPromptHint">模型未自定义提示词时使用；留空=内置默认提示词</span></label><textarea rows="3" id="VisionProxyPrompt" data-i18n-ph="visionPromptPh" placeholder="请仔细查看这张图片，用简体中文详细描述图片中的全部内容..."></textarea></div>
-          <div class="grid2">
-            <div class="row">
-              <label data-i18n="lblVisionQuality">全局图片质量 VisionImageQuality <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionQualityHint">模型单独的图片质量优先</span></label>
-              <select id="VisionImageQuality" onchange="toggleVisionQualityInputs()">
-                <option value="original" data-i18n="vqOriginal">原图 · 不压缩</option>
-                <option value="high" data-i18n="vqHigh">高质量 · JPEG 90%</option>
-                <option value="balanced" data-i18n="vqBalanced">平衡 · JPEG 70%（默认）</option>
-                <option value="eco" data-i18n="vqEco">节省流量 · JPEG 40% + 最长边 1024</option>
-                <option value="custom" data-i18n="vqCustom">自定义 · 压缩质量百分比</option>
-              </select>
+            <div class="grid2">
+              <div class="row">
+                <label data-i18n="lblStreamMode">流式策略 StreamMode</label>
+                <select id="StreamMode">
+                  <option value="preserve" data-i18n="smPreserve">preserve · 不覆写（默认）</option>
+                  <option value="force_stream" data-i18n="smForceStream">force_stream · 强制流式</option>
+                  <option value="force_close" data-i18n="smForceClose">force_close · 强制关闭</option>
+                </select>
+              </div>
+              <div class="row"><label data-i18n="lblCaps">能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
             </div>
-            <div class="row" id="rowVisionCustomPercent">
-              <label data-i18n="lblVisionCustomPercent">自定义压缩质量百分比 CustomPercent（1-100）</label>
-              <div class="vq-slider-row">
-                <input type="range" id="VisionCustomRange" min="1" max="100" value="70" oninput="syncVqPercent('VisionCustomRange','VisionCustomPercent','vqValGlobal')">
-                <input type="number" id="VisionCustomPercent" min="1" max="100" value="70" placeholder="70" oninput="syncVqPercent('VisionCustomPercent','VisionCustomRange','vqValGlobal')">
-                <span class="vq-percent-val" id="vqValGlobal">70%</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="subpanel" id="sub-model-vision">
+        <div class="card">
+          <div class="head" data-i18n="visionTitle">🖼️ 视觉代理 Vision <span class="hint" data-i18n="visionHint">主模型不支持图片时用代理模型识别；识别结果按「图片+提示词」缓存到本地，重复图片零消耗</span></div>
+          <div class="body">
+            <div class="row"><label data-i18n="lblVisionPrompt">全局视觉代理提示词 VisionProxyPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionPromptHint">模型未自定义提示词时使用；留空=内置默认提示词</span></label><textarea rows="3" id="VisionProxyPrompt" data-i18n-ph="visionPromptPh" placeholder="请仔细查看这张图片，用简体中文详细描述图片中的全部内容..."></textarea></div>
+            <div class="grid2">
+              <div class="row">
+                <label data-i18n="lblVisionQuality">全局图片质量 VisionImageQuality <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionQualityHint">模型单独的图片质量优先</span></label>
+                <select id="VisionImageQuality" onchange="toggleVisionQualityInputs()">
+                  <option value="original" data-i18n="vqOriginal">原图 · 不压缩</option>
+                  <option value="high" data-i18n="vqHigh">高质量 · JPEG 90%</option>
+                  <option value="balanced" data-i18n="vqBalanced">平衡 · JPEG 70%（默认）</option>
+                  <option value="eco" data-i18n="vqEco">节省流量 · JPEG 40% + 最长边 1024</option>
+                  <option value="custom" data-i18n="vqCustom">自定义 · 压缩质量百分比</option>
+                </select>
+              </div>
+              <div class="row" id="rowVisionCustomPercent">
+                <label data-i18n="lblVisionCustomPercent">自定义压缩质量百分比 CustomPercent（1-100）</label>
+                <div class="vq-slider-row">
+                  <input type="range" id="VisionCustomRange" min="1" max="100" value="70" oninput="syncVqPercent('VisionCustomRange','VisionCustomPercent','vqValGlobal')">
+                  <input type="number" id="VisionCustomPercent" min="1" max="100" value="70" placeholder="70" oninput="syncVqPercent('VisionCustomPercent','VisionCustomRange','vqValGlobal')">
+                  <span class="vq-percent-val" id="vqValGlobal">70%</span>
+                </div>
               </div>
             </div>
-          </div>
-          <div class="row"><label data-i18n="lblVisionProxyMemCacheSize">视觉代理图片内存缓存大小 VisionProxyMemCacheSize <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionProxyMemCacheSizeHint">视觉代理识别成功保存本地后同时放入内存，再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命；0=禁用；启动时预加载最近的 N 条</span></label><input type="number" id="VisionProxyMemCacheSize" min="0" max="10000" value="200" placeholder="200"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="head" data-i18n="ctxTitle">🧭 模型上下文信息注入 ModelContextPrompt <span class="hint" data-i18n="ctxHint">在提示词中附加当前模型信息（模型ID/上下文长度/最大输出），帮助模型自我认知</span></div>
-        <div class="body">
-          <div class="row"><label class="switch"><input type="checkbox" id="CtxEnable"><span class="track"></span><span class="lbl" data-i18n="ctxEnable">启用：对话时自动注入当前位置模型信息</span></label></div>
-          <div class="row"><label data-i18n="ctxPos">插入位置 Position</label>
-            <select id="CtxPos">
-              <option value="prepend" data-i18n="ctxPosPrepend">prepend · 插入到首条 system 消息开头（无 system 则新建）</option>
-              <option value="append" data-i18n="ctxPosAppend">append · 追加到消息末尾</option>
-            </select>
-          </div>
-          <div class="row"><label data-i18n="ctxTemplate">模板 Template <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="ctxTemplateHint">占位符：{model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉说明（原生/代理/不支持）</span></label><textarea rows="3" id="CtxTemplate" data-i18n-ph="ctxTemplatePh" placeholder="当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。"></textarea></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="head" data-i18n="dlpTitle">🚨 末日循环保护 DoomLoopProtection <span class="hint" data-i18n="dlpHint">检测上游内容重复并熔断，防止客户端陷入重试死循环</span></div>
-        <div class="body">
-          <div class="row"><label class="switch"><input type="checkbox" id="DlpThinkTag"><span class="track"></span><span class="lbl" data-i18n="dlpThinkTag">思考标签消毒：裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]（ollama cloud 死循环根因防护，独立于总开关生效）</span></label></div>
-          <div class="dlp-group">
-          <div class="row"><label class="switch"><input type="checkbox" id="DlpEnable" onchange="toggleDlpInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpEnable">启用：检测上游重复内容并熔断</span></label></div>
-          <div class="row sub-row" id="rowDlpDedup"><label class="switch"><input type="checkbox" id="DlpDedup"><span class="track"></span><span class="lbl" data-i18n="dlpDedup">内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段</span></label></div>
-          <div class="row sub-row" id="rowDlpRepeatCheck"><label class="switch"><input type="checkbox" id="DlpRepeatCheck"><span class="track"></span><span class="lbl" data-i18n="dlpRepeatCheck">跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）</span></label></div>
-          <div class="row sub-row" id="rowDlpWarn"><label class="switch"><input type="checkbox" id="DlpWarn"><span class="track"></span><span class="lbl" data-i18n="dlpWarn">跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label></div>
-          <div class="row sub-row" id="rowDlpMaxRepeat"><label data-i18n="dlpMaxRepeat">连续重复熔断阈值 MaxRepeat（≥2，默认 3）</label><input type="number" id="DlpMaxRepeat" min="2" max="20" value="3" placeholder="3"></div>
-          <div class="row sub-row" id="rowDlpRepeatEntries"><label class="switch"><input type="checkbox" id="DlpLimitRepeatEntries" onchange="toggleRepeatInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpLimitRepeatEntries">限制复读记录条数（关闭 = 不限条数）</span></label></div>
-          <div class="row sub-row" id="rowDlpRepeatEntriesVal"><label data-i18n="dlpRepeatEntries">复读记录会话数上限 RepeatMaxEntries（默认 256，仅占内存，不影响判断精度）</label><input type="number" id="DlpRepeatEntries" min="1" max="10000" placeholder="256"></div>
-          <div class="row sub-row" id="rowDlpRepeatTTL"><label class="switch"><input type="checkbox" id="DlpLimitRepeatTTL" onchange="toggleRepeatInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpLimitRepeatTTL">限制复读记录有效期（关闭 = 永不过期）</span></label></div>
-          <div class="row sub-row" id="rowDlpRepeatTTLVal"><label data-i18n="dlpRepeatTTL">复读记录保留分钟 RepeatTTLMin（默认 30）</label><input type="number" id="DlpRepeatTTL" min="1" max="1440" placeholder="30"></div>
-          <div class="row sub-row" id="rowDlpWarnPrompt"><label data-i18n="dlpWarnPrompt">跨请求警告提示词 WarnPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="dlpWarnHint">熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label><textarea rows="3" id="DlpWarnPrompt" data-i18n-ph="dlpWarnPh" placeholder="【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"></textarea></div>
+            <div class="row"><label data-i18n="lblVisionProxyMemCacheSize">视觉代理图片内存缓存大小 VisionProxyMemCacheSize <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionProxyMemCacheSizeHint">视觉代理识别成功保存本地后同时放入内存，再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命；0=禁用；启动时预加载最近的 N 条</span></label><input type="number" id="VisionProxyMemCacheSize" min="0" max="10000" value="200" placeholder="200"></div>
+            <div class="row"><label class="switch"><input type="checkbox" id="GifNormalize"><span class="track"></span><span class="lbl" data-i18n="gifNormalize">直连路径 GIF 转换：把 GIF 动图转换为 PNG 首帧再转发（部分上游不接受 GIF 会报 400 invalid image input；默认关闭；视觉代理路径始终转换）</span></label></div>
           </div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="head" data-i18n="modelAlias">🔖 模型别名 ModelAlias <span class="hint" data-i18n="modelAliasHint">将上游模型 ID 显示为友好名称</span></div>
-        <div class="body">
-          <div id="aliasList" class="dtable"></div>
-          <div><button class="btn small" onclick="addAlias()" data-i18n="btnAddAlias">＋ 添加别名</button></div>
+      <div class="subpanel" id="sub-model-ctx">
+        <div class="card">
+          <div class="head" data-i18n="ctxTitle">🧭 模型上下文信息注入 ModelContextPrompt <span class="hint" data-i18n="ctxHint">在提示词中附加当前模型信息（模型ID/上下文长度/最大输出），帮助模型自我认知</span></div>
+          <div class="body">
+            <div class="row"><label class="switch"><input type="checkbox" id="CtxEnable"><span class="track"></span><span class="lbl" data-i18n="ctxEnable">启用：对话时自动注入当前位置模型信息</span></label></div>
+            <div class="row"><label data-i18n="ctxPos">插入位置 Position</label>
+              <select id="CtxPos">
+                <option value="prepend" data-i18n="ctxPosPrepend">prepend · 插入到首条 system 消息开头（无 system 则新建）</option>
+                <option value="append" data-i18n="ctxPosAppend">append · 追加到消息末尾</option>
+              </select>
+            </div>
+            <div class="row"><label data-i18n="ctxTemplate">模板 Template <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="ctxTemplateHint">占位符：{model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉说明（原生/代理/不支持）</span></label><textarea rows="3" id="CtxTemplate" data-i18n-ph="ctxTemplatePh" placeholder="当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。"></textarea></div>
+          </div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="head" data-i18n="modelDetail">📐 模型详细设置 ModelDetailedSettings <span class="hint" data-i18n="modelDetailHint">覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理</span></div>
-        <div class="body">
-          <div id="detailList"></div>
-          <div><button class="btn small" onclick="addDetail()" data-i18n="btnAddDetail">＋ 添加模型设置</button></div>
+      <div class="subpanel" id="sub-model-dlp">
+        <div class="card">
+          <div class="head" data-i18n="dlpTitle">🚨 末日循环保护 DoomLoopProtection <span class="hint" data-i18n="dlpHint">检测上游内容重复并熔断，防止客户端陷入重试死循环</span></div>
+          <div class="body">
+            <div class="row"><label class="switch"><input type="checkbox" id="DlpThinkTag"><span class="track"></span><span class="lbl" data-i18n="dlpThinkTag">思考标签消毒：裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]（ollama cloud 死循环根因防护，独立于总开关生效）</span></label></div>
+            <div class="dlp-group">
+            <div class="row"><label class="switch"><input type="checkbox" id="DlpEnable" onchange="toggleDlpInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpEnable">启用：检测上游重复内容并熔断</span></label></div>
+            <div class="row sub-row" id="rowDlpDedup"><label class="switch"><input type="checkbox" id="DlpDedup"><span class="track"></span><span class="lbl" data-i18n="dlpDedup">内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段</span></label></div>
+            <div class="row sub-row" id="rowDlpRepeatCheck"><label class="switch"><input type="checkbox" id="DlpRepeatCheck"><span class="track"></span><span class="lbl" data-i18n="dlpRepeatCheck">跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）</span></label></div>
+            <div class="row sub-row" id="rowDlpWarn"><label class="switch"><input type="checkbox" id="DlpWarn"><span class="track"></span><span class="lbl" data-i18n="dlpWarn">跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label></div>
+            <div class="row sub-row" id="rowDlpMaxRepeat"><label data-i18n="dlpMaxRepeat">连续重复熔断阈值 MaxRepeat（≥2，默认 3）</label><input type="number" id="DlpMaxRepeat" min="2" max="20" value="3" placeholder="3"></div>
+            <div class="row sub-row" id="rowDlpRepeatEntries"><label class="switch"><input type="checkbox" id="DlpLimitRepeatEntries" onchange="toggleRepeatInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpLimitRepeatEntries">限制复读记录条数（关闭 = 不限条数）</span></label></div>
+            <div class="row sub-row" id="rowDlpRepeatEntriesVal"><label data-i18n="dlpRepeatEntries">复读记录会话数上限 RepeatMaxEntries（默认 256，仅占内存，不影响判断精度）</label><input type="number" id="DlpRepeatEntries" min="1" max="10000" placeholder="256"></div>
+            <div class="row sub-row" id="rowDlpRepeatTTL"><label class="switch"><input type="checkbox" id="DlpLimitRepeatTTL" onchange="toggleRepeatInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpLimitRepeatTTL">限制复读记录有效期（关闭 = 永不过期）</span></label></div>
+            <div class="row sub-row" id="rowDlpRepeatTTLVal"><label data-i18n="dlpRepeatTTL">复读记录保留分钟 RepeatTTLMin（默认 30）</label><input type="number" id="DlpRepeatTTL" min="1" max="1440" placeholder="30"></div>
+            <div class="row sub-row" id="rowDlpWarnPrompt"><label data-i18n="dlpWarnPrompt">跨请求警告提示词 WarnPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="dlpWarnHint">熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label><textarea rows="3" id="DlpWarnPrompt" data-i18n-ph="dlpWarnPh" placeholder="【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"></textarea></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="subpanel" id="sub-model-alias">
+        <div class="card">
+          <div class="head" data-i18n="modelAlias">🔖 模型别名 ModelAlias <span class="hint" data-i18n="modelAliasHint">将上游模型 ID 显示为友好名称</span></div>
+          <div class="body">
+            <div id="aliasList" class="dtable"></div>
+            <div><button class="btn small" onclick="addAlias()" data-i18n="btnAddAlias">＋ 添加别名</button></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="subpanel" id="sub-model-detail">
+        <div class="card">
+          <div class="head" data-i18n="modelDetail">📐 模型详细设置 ModelDetailedSettings <span class="hint" data-i18n="modelDetailHint">覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理</span></div>
+          <div class="body">
+            <div id="detailList"></div>
+            <div><button class="btn small" onclick="addDetail()" data-i18n="btnAddDetail">＋ 添加模型设置</button></div>
+          </div>
         </div>
       </div>
     </div>
@@ -473,6 +527,7 @@ var I18N = {
     rtProt_repeat_internal: '响应内部重复', rtProt_repeat_cross: '跨请求复读',
     rtProt_warn_inject: '注入复读警告', rtProt_assistant_loop: 'assistant 循环检测',
     rtProt_vision_proxy: '视觉代理识别', rtProt_ctx_inject: '模型上下文注入',
+    rtProt_gif_normalize: 'GIF 直连转换',
     rtProt_prompt_replace: '提示词替换', rtProt_model_alias: '模型名还原',
     connListen: '🖥️ 监听设置', connListenHint: '修改 IP / PORT 需重启程序生效',
     lblIP: '监听地址 IP', lblPort: '监听端口 PORT',
@@ -506,6 +561,8 @@ var I18N = {
     logTitle: '📜 日志设置', lblLogLimit: '终端日志清理阈值 Log_Limit',
     lblLogResp: '打印响应内容', lblLogHeaders: '打印请求头', lblLogBody: '打印请求体',
     modelDisplay: '🧩 模型显示', modelDisplayHint: '仅影响客户端看到的模型名称',
+    subModelDisplay: '🧩 显示', subModelVision: '🖼 视觉', subModelCtx: '🧭 上下文', subModelDlp: '🚨 防护', subModelAlias: '🔖 别名', subModelDetail: '📐 详细设置',
+    visionTitle: '🖼️ 视觉代理 Vision', visionHint: '主模型不支持图片时用代理模型识别；识别结果按「图片+提示词」缓存到本地，重复图片零消耗',
     lblPrefix: '模型名前缀 OpenAI_Prefix', lblSuffix: '模型名后缀 OpenAI_Suffix',
     lblStreamMode: '流式策略 StreamMode', smPreserve: 'preserve · 不覆写（默认）', smForceStream: 'force_stream · 强制流式', smForceClose: 'force_close · 强制关闭',
     lblCaps: '能力声明 Capabilities（逗号分隔）',
@@ -513,8 +570,10 @@ var I18N = {
     lblVisionQuality: '全局图片质量 VisionImageQuality', visionQualityHint: '模型单独的图片质量优先；识别前统一压缩图片', vqOriginal: '原图 · 不压缩', vqHigh: '高质量 · JPEG 90%', vqBalanced: '平衡 · JPEG 70%（默认）', vqEco: '节省流量 · JPEG 40% + 最长边 1024', vqCustom: '自定义 · 压缩质量百分比',
     lblVisionCustomPercent: '自定义压缩质量百分比 CustomPercent（1-100）',
     lblVisionProxyMemCacheSize: '视觉代理图片内存缓存大小 VisionProxyMemCacheSize', visionProxyMemCacheSizeHint: '视觉代理识别成功保存本地后同时放入内存，再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命；0=禁用；启动时预加载最近的 N 条',
+    gifNormalize: '主模型 GIF 转换：把 GIF 动图转换为 PNG 首帧再转发（部分上游不接受 GIF 会报 400 invalid image input；默认关闭；视觉代理路径始终转换）',
     modelAlias: '🔖 模型别名 ModelAlias', modelAliasHint: '将上游模型 ID 显示为友好名称', btnAddAlias: '＋ 添加别名',
     modelDetail: '📐 模型详细设置 ModelDetailedSettings', modelDetailHint: '覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理', btnAddDetail: '＋ 添加模型设置',
+    detailJumpPh: '快速跳转模型…', detailJumpHint: '选择一个模型，自动滚动到它的设置卡片', detailCountHint: '已配置的模型数量',
     ctxTitle: '🧭 模型上下文信息注入 ModelContextPrompt', ctxHint: '在提示词中附加当前模型信息（模型ID/上下文长度/最大输出），帮助模型自我认知', ctxEnable: '启用：对话时自动注入当前位置模型信息',
     ctxPos: '插入位置 Position', ctxPosPrepend: 'prepend · 插入到首条 system 消息开头（无 system 则新建）', ctxPosAppend: 'append · 追加到消息末尾',
     ctxTemplate: '模板 Template', ctxTemplateHint: '占位符：{model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉说明（原生/代理/不支持）', ctxTemplatePh: '当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。',
@@ -537,6 +596,7 @@ var I18N = {
     lblModel: '模型', lblContextLength: '上下文长度 ContextLength', lblMaxOutput: '最大输出 MaxOutputTokens',
     lblCapsShort: '能力 Capabilities（逗号分隔）', lblVisionProxyModel: '视觉代理模型 VisionProxyModel（主模型不支持图片时，用此模型识别图片）',
     lblVisionProxyPrompt: '视觉代理提示词 VisionProxyPrompt（留空=默认提示词）', visionProxyPh: '请仔细查看这张图片，用简体中文详细描述图片中的全部内容...',
+    lblGifNormalizeShort: '主模型 GIF 转换（留空=全局）', gifFollowGlobal: '跟随全局（默认）', gifOn: '开启 · 转 PNG 首帧', gifOff: '关闭 · 原样转发',
     lblVqShort: '图片质量（留空=全局）', vqDefault: '跟随全局（默认）',
     lblEnable: '启用', lblRuleName: '规则名', ruleNamePh: '规则名称（唯一）',
     lblMode: '替换模式（互斥，只能选一种）', modeNormal: '📄 普通替换', modeWhole: '📝 匹配整段替换', modeForce: '⚡ 强制替换',
@@ -578,6 +638,7 @@ var I18N = {
     rtProt_repeat_internal: 'Internal repeat', rtProt_repeat_cross: 'Cross-request repeat',
     rtProt_warn_inject: 'Repeat warning injected', rtProt_assistant_loop: 'Assistant loop detected',
     rtProt_vision_proxy: 'Vision proxy', rtProt_ctx_inject: 'Model context injected',
+    rtProt_gif_normalize: 'GIF direct conversion',
     rtProt_prompt_replace: 'Prompt replaced', rtProt_model_alias: 'Model name restored',
     connListen: '🖥️ Listen Settings', connListenHint: 'IP / PORT changes require restart',
     lblIP: 'Listen IP', lblPort: 'Listen Port',
@@ -611,6 +672,8 @@ var I18N = {
     logTitle: '📜 Logging', lblLogLimit: 'Terminal log limit Log_Limit',
     lblLogResp: 'Print response', lblLogHeaders: 'Print headers', lblLogBody: 'Print body',
     modelDisplay: '🧩 Model Display', modelDisplayHint: 'Only affects model names seen by client',
+    subModelDisplay: '🧩 Display', subModelVision: '🖼 Vision', subModelCtx: '🧭 Context', subModelDlp: '🚨 Protection', subModelAlias: '🔖 Alias', subModelDetail: '📐 Details',
+    visionTitle: '🖼️ Vision Proxy', visionHint: 'Recognizes images with a proxy model when the main model lacks vision; results are cached locally by image + prompt',
     lblPrefix: 'Model name prefix OpenAI_Prefix', lblSuffix: 'Model name suffix OpenAI_Suffix',
     lblStreamMode: 'Stream mode StreamMode', smPreserve: 'preserve · no override (default)', smForceStream: 'force_stream · force streaming', smForceClose: 'force_close · force close',
     lblCaps: 'Capabilities (comma separated)',
@@ -618,8 +681,10 @@ var I18N = {
     lblVisionQuality: 'Global image quality VisionImageQuality', visionQualityHint: 'Per-model quality takes priority; images are compressed before recognition', vqOriginal: 'Original · no compression', vqHigh: 'High · JPEG 90%', vqBalanced: 'Balanced · JPEG 70% (default)', vqEco: 'Eco · JPEG 40% + max edge 1024', vqCustom: 'Custom · compression quality %',
     lblVisionCustomPercent: 'Custom compression quality CustomPercent (1-100)',
     lblVisionProxyMemCacheSize: 'Vision proxy image memory cache size VisionProxyMemCacheSize', visionProxyMemCacheSizeHint: 'After vision proxy recognition, results are also kept in memory; the same image hits memory instantly (ms), reducing disk reads and extending SSD life; 0 = disabled; preloads the latest N entries at startup',
+    gifNormalize: 'Main-model GIF conversion: convert animated GIFs to their first PNG frame before forwarding (some upstreams reject GIF with 400 invalid image input; off by default; the vision proxy path always converts)',
     modelAlias: '🔖 Model Alias ModelAlias', modelAliasHint: 'Show friendly names for upstream model IDs', btnAddAlias: '＋ Add Alias',
     modelDetail: '📐 Model Detailed Settings ModelDetailedSettings', modelDetailHint: 'Override upstream values; VisionProxyModel sets a vision proxy for the main model', btnAddDetail: '＋ Add Model Setting',
+    detailJumpPh: 'Jump to model…', detailJumpHint: 'Pick a model to scroll to its settings card', detailCountHint: 'Number of configured models',
     ctxTitle: '🧭 Model Context Injection ModelContextPrompt', ctxHint: 'Appends current model info (ID/context length/max output) to the prompt, helping the model understand itself', ctxEnable: 'Enable: inject current model info into prompts on every request',
     ctxPos: 'Insert position Position', ctxPosPrepend: 'prepend · Insert at the start of the first system message (create one if none)', ctxPosAppend: 'append · Append to the end of messages',
     ctxTemplate: 'Template Template', ctxTemplateHint: 'Placeholders: {model} ID · {context_length} context length · {max_output_tokens} max output · {capabilities} capabilities · {vision} vision note (native/proxy/none)', ctxTemplatePh: 'You are running on the {model} model with a context window of {context_length} tokens, a max output of {max_output_tokens} tokens, and capabilities: {capabilities}. {vision}. Allocate your thinking and output length accordingly.',
@@ -641,6 +706,7 @@ var I18N = {
     lblModel: 'Model', lblContextLength: 'Context Length', lblMaxOutput: 'Max Output Tokens',
     lblCapsShort: 'Capabilities (comma separated)', lblVisionProxyModel: 'Vision proxy model VisionProxyModel (used to recognize images when main model lacks vision)',
     lblVisionProxyPrompt: 'Vision proxy prompt VisionProxyPrompt (empty = default)', visionProxyPh: 'Please look at this image carefully and describe all its contents in detail...',
+    lblGifNormalizeShort: 'Main-model GIF conversion (empty = global)', gifFollowGlobal: 'Follow global (default)', gifOn: 'On · convert to PNG first frame', gifOff: 'Off · forward as-is',
     lblVqShort: 'Image quality (empty = global)', vqDefault: 'Follow global (default)',
     lblEnable: 'Enable', lblRuleName: 'Rule name', ruleNamePh: 'Rule name (unique)',
     lblMode: 'Replace mode (mutually exclusive)', modeNormal: '📄 Normal replace', modeWhole: '📝 Whole-match replace', modeForce: '⚡ Force replace',
@@ -732,6 +798,66 @@ function switchTab(name){
   });
   // 切到实时请求页时启动 SSE 实时推送，离开时断开（省资源）
   if(name === 'realtime'){ rtStart(); } else { rtStop(); }
+}
+
+// -------- 二级子页（模型设置内部）--------
+// 状态保存在 DOM class 上；同时写 localStorage，刷新后恢复到上次停留的子页
+function switchSubTab(panel, name){
+  document.querySelectorAll('.subpanel').forEach(function(p){
+    p.classList.toggle('active', p.id === 'sub-' + panel + '-' + name);
+  });
+  document.querySelectorAll('#tab-' + panel + ' .subtab').forEach(function(s){
+    s.classList.toggle('active', s.getAttribute('data-subtab') === name);
+  });
+  // 快速跳转工具栏：仅「详细设置」子页显示（位于吸顶的 Tab 条右侧，滚动时始终可见）
+  var tools = $('detailTools');
+  if(tools){ tools.classList.toggle('show', panel === 'model' && name === 'detail'); }
+  try{ localStorage.setItem('cfg_sub_' + panel, name); }catch(e){}
+}
+
+// -------- 模型详细设置：快速跳转 --------
+// 重建跳转下拉（模型名变化/增删时调用）；保留当前选中项
+function renderDetailJump(){
+  var sel = $('detailJump');
+  if(!sel){ return; }
+  var cur = sel.value;
+  var opts = ['<option value="">' + esc(t('detailJumpPh')) + '</option>'];
+  state.details.forEach(function(d, i){
+    var name = (d.model || '').trim() || ('#' + (i + 1));
+    opts.push('<option value="' + i + '">' + esc(name) + '</option>');
+  });
+  sel.innerHTML = opts.join('');
+  sel.title = t('detailJumpHint');
+  if(cur !== '' && state.details[Number(cur)]){ sel.value = cur; }
+  var cnt = $('detailCount');
+  if(cnt){ cnt.textContent = state.details.length; cnt.title = t('detailCountHint'); }
+}
+
+// 跳到指定模型卡片：先切到「详细设置」子页，再滚动定位并高亮
+function jumpToDetail(v){
+  if(v === '' || v == null){ return; }
+  var idx = Number(v);
+  switchSubTab('model', 'detail');
+  var el = document.getElementById('detailCard_' + idx);
+  if(!el){ return; }
+  // 子页刚切换完成，稍等一帧再滚动才能拿到正确坐标
+  setTimeout(function(){
+    // block:'start' + 卡片上的 scroll-margin-top，让卡片顶部正好落在吸顶条下方
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    el.classList.remove('flash');
+    void el.offsetWidth; // 强制回流，重新触发动画
+    el.classList.add('flash');
+    setTimeout(function(){ el.classList.remove('flash'); }, 1600);
+  }, 60);
+  var sel = $('detailJump');
+  if(sel){ sel.value = ''; } // 复位，方便下次重复选中同一项
+}
+
+// 模型名输入时只更新状态（不重建 DOM，避免光标跳动），单独刷新跳转列表
+function onDetailModelInput(i, v){
+  if(!state.details[i]){ return; }
+  state.details[i].model = v;
+  renderDetailJump();
 }
 
 function esc(s){
@@ -884,6 +1010,8 @@ async function loadCfg(notify){
     toggleVisionQualityInputs();
     // 视觉代理图片内存缓存大小（0=禁用）
     $('VisionProxyMemCacheSize').value = c.VisionProxyMemCacheSize != null ? c.VisionProxyMemCacheSize : 200;
+    // 直连路径 GIF 转换（默认关闭）
+    $('GifNormalize').checked = !!c.GifNormalize;
 
     // 实时请求查看（RealtimeLog）
     var rl = c.RealtimeLog || {};
@@ -955,7 +1083,7 @@ async function loadCfg(notify){
     if(c.ModelDetailedSettings){
       Object.keys(c.ModelDetailedSettings).forEach(function(k){
         var s = c.ModelDetailedSettings[k] || {};
-        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', '), vpm: s.VisionProxyModel || '', vpp: s.VisionProxyPrompt || '', vq: (s.VisionImageQuality || {}).Quality || '', vqp: (s.VisionImageQuality || {}).CustomPercent || '' });
+        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', '), vpm: s.VisionProxyModel || '', vpp: s.VisionProxyPrompt || '', vq: (s.VisionImageQuality || {}).Quality || '', vqp: (s.VisionImageQuality || {}).CustomPercent || '', gif: s.GifNormalize === true ? 'on' : (s.GifNormalize === false ? 'off' : '') });
       });
     }
     renderDetails();
@@ -1003,9 +1131,10 @@ function renderDetails(){
   state.details.forEach(function(d, i){
     var el = document.createElement('div');
     el.className = 'card-item';
+    el.id = 'detailCard_' + i; // 快速跳转定位用
     el.innerHTML =
       '<div class="item-head"><span class="name">' + t('lblModel') + '</span>' +
-      '<input type="text" class="mono" style="flex:1" value="' + esc(d.model) + '" placeholder="' + t('upModelIdPh2') + '" oninput="state.details[' + i + '].model=this.value">' +
+      '<input type="text" class="mono" style="flex:1" value="' + esc(d.model) + '" placeholder="' + t('upModelIdPh2') + '" oninput="onDetailModelInput(' + i + ',this.value)">' +
       '<button class="btn danger" onclick="removeAt(state.details,' + i + ',renderDetails)" title="' + t('btnDelete') + '">✕</button></div>' +
       '<div class="grid3">' +
       '<div class="row"><label>' + t('lblContextLength') + '</label><input type="number" min="0" value="' + esc(d.cl) + '" placeholder="1000000" oninput="state.details[' + i + '].cl=this.value"></div>' +
@@ -1014,6 +1143,12 @@ function renderDetails(){
       '</div>' +
       '<div class="row"><label>' + t('lblVisionProxyModel') + '</label><input type="text" class="mono" value="' + esc(d.vpm) + '" placeholder="gpt-4o" oninput="state.details[' + i + '].vpm=this.value"></div>' +
       '<div class="row"><label>' + t('lblVisionProxyPrompt') + '</label><textarea rows="2" placeholder="' + t('visionProxyPh') + '" oninput="state.details[' + i + '].vpp=this.value">' + esc(d.vpp) + '</textarea></div>' +
+      '<div class="row"><label>' + t('lblGifNormalizeShort') + '</label>' +
+      '<select onchange="state.details[' + i + '].gif=this.value">' +
+      '<option value=""' + (d.gif === '' ? ' selected' : '') + '>' + t('gifFollowGlobal') + '</option>' +
+      '<option value="on"' + (d.gif === 'on' ? ' selected' : '') + '>' + t('gifOn') + '</option>' +
+      '<option value="off"' + (d.gif === 'off' ? ' selected' : '') + '>' + t('gifOff') + '</option>' +
+      '</select></div>' +
       '<div class="grid2">' +
       '<div class="row"><label>' + t('lblVqShort') + '</label>' +
       '<select onchange="state.details[' + i + '].vq=this.value;syncVqInput(' + i + ')">' +
@@ -1033,6 +1168,8 @@ function renderDetails(){
       '</div>';
     box.appendChild(el);
   });
+  // 同步快速跳转下拉（模型名/数量变化后立即生效）
+  renderDetailJump();
 }
 
 function renderRules(){
@@ -1160,6 +1297,9 @@ function collectCfg(){
     if(dc.length){ o.Capabilities = dc; }
     if(d.vpm && d.vpm.trim()){ o.VisionProxyModel = d.vpm.trim(); }
     if(d.vpp && d.vpp.trim()){ o.VisionProxyPrompt = d.vpp.trim(); }
+    // 模型级 GIF 转换：留空=跟随全局；on/off=显式覆盖
+    if(d.gif === 'on'){ o.GifNormalize = true; }
+    else if(d.gif === 'off'){ o.GifNormalize = false; }
     // 模型级图片质量：留空=跟随全局；custom 档位带上自定义百分比（夹取 1-100）
     if(d.vq && d.vq.trim()){
       var vqo = { Quality: d.vq.trim() };
@@ -1203,6 +1343,7 @@ function collectCfg(){
       CustomPercent: $('VisionImageQuality').value === 'custom' ? (parseInt($('VisionCustomPercent').value, 10) || 0) : 0
     },
     VisionProxyMemCacheSize: parseInt($('VisionProxyMemCacheSize').value, 10) || 0,
+    GifNormalize: $('GifNormalize').checked,
     RealtimeLog: {
       Enable: $('RtEnable').checked,
       MaxEntries: parseInt($('RtMaxEntries').value, 10) || 100,
@@ -1523,6 +1664,7 @@ var RT_PROT_META = {
   'warn-inject': { cls: 'trip', icon: '🚨' },
   'assistant-loop': { cls: 'trip', icon: '🚨' },
   'vision-proxy': { cls: 'proc', icon: '🖼' },
+  'gif-normalize': { cls: 'proc', icon: '🎞' },
   'ctx-inject': { cls: 'proc', icon: '🧭' },
   'prompt-replace': { cls: 'proc', icon: '✂' },
   'model-alias': { cls: 'proc', icon: '🔧' }
@@ -1770,6 +1912,11 @@ window.addEventListener('DOMContentLoaded', function(){
     if(localStorage.getItem('rt_fmt') === '0' && $('rtFormat')){ $('rtFormat').checked = false; }
   }catch(e){}
   applyI18n();
+  // 恢复模型设置上次停留的二级子页
+  try{
+    var lastSub = localStorage.getItem('cfg_sub_model');
+    if(lastSub){ switchSubTab('model', lastSub); }
+  }catch(e){}
   initAuth();
 });
 </script>

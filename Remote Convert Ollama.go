@@ -58,6 +58,9 @@ type ModelDetailedSetting struct {
 	VisionProxyPrompt string `json:"VisionProxyPrompt,omitempty"`
 	// VisionImageQuality 本模型图片质量配置：优先于全局 VisionImageQuality（留空=使用全局）
 	VisionImageQuality *VisionQuality `json:"VisionImageQuality,omitempty"`
+	// GifNormalize 本模型是否把 GIF 动图转换为 PNG 首帧再转发给主模型（部分上游不接受 GIF）
+	// 三态：nil=跟随全局 Config.GifNormalize（默认关闭）/ true=开启 / false=关闭
+	GifNormalize *bool `json:"GifNormalize,omitempty"`
 }
 
 // PromptReplaceRule 定义请求提示词替换规则
@@ -374,6 +377,11 @@ type Config struct {
 	// 再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命。
 	// 0=禁用内存缓存（仅磁盘缓存）；启动时按修改时间预加载最近的 N 条到内存。
 	VisionProxyMemCacheSize int `json:"VisionProxyMemCacheSize,omitempty"`
+	// GifNormalize 主模型 GIF 转换开关（默认关闭）：主模型原生支持视觉、或未配置视觉代理时，
+	// 请求体里的 GIF 动图会原样转发；部分上游/中转网关不接受 GIF（返回 400 invalid image input），
+	// 开启后在转发前统一转为 PNG 首帧。可用 ModelDetailedSettings[模型].GifNormalize 单独覆盖。
+	// ⚠️ bool 字段不能加 omitempty（false 是零值会被静默丢弃，导致"关不掉"类 bug）
+	GifNormalize bool `json:"GifNormalize"`
 	// ModelContextPrompt 模型上下文信息注入：自动附加当前模型信息到提示词，帮助模型自我认知
 	ModelContextPrompt ModelContextPrompt `json:"ModelContextPrompt,omitempty"`
 	// DoomLoopProtection 末日循环保护：上游内容重复检测 + 熔断 + 跨请求提醒 AI
@@ -1653,13 +1661,10 @@ func normalizeVisionImage(img visionImage) (visionImage, bool) {
 		// 解码失败（可能 GIF 有特殊帧/格式），交给上游判断
 		return img, false
 	}
-	// 提取第一帧（gif.Decode 返回 image.Image 即首帧）并转为 RGBA 保证 PNG 编码完整
+	// 提取第一帧（gif.Decode 返回 image.Image 即首帧）并转为 RGBA 保证 PNG 编码完整。
+	// 用 draw.Draw 整体拷贝（比逐像素 At/Set 快一个数量级，带图高并发下差异明显）
 	rgba := image.NewRGBA(frame.Bounds())
-	for i := 0; i < rgba.Bounds().Dx(); i++ {
-		for j := 0; j < rgba.Bounds().Dy(); j++ {
-			rgba.Set(i, j, frame.At(i, j))
-		}
-	}
+	draw.Draw(rgba, rgba.Bounds(), frame, frame.Bounds().Min, draw.Src)
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, rgba); err != nil {
 		return img, false
@@ -1668,6 +1673,152 @@ func normalizeVisionImage(img visionImage) (visionImage, bool) {
 		Base64: base64.StdEncoding.EncodeToString(buf.Bytes()),
 		MIME:   "image/png",
 	}, true
+}
+
+// ==================== 主模型 GIF 转换（可选，默认关闭） ====================
+//
+// 背景：视觉代理路径（applyVisionProxy）本来就会把 GIF 转成 PNG 首帧，
+// 但「主模型直收图片」的路径——主模型声明支持 vision、或没有配置 VisionProxyModel 时——
+// 图片会被原样转发，GIF 也就裸奔到上游。部分中转网关/视觉模型不接受 GIF，
+// 直接返回 400 invalid image input。
+//
+// 是否转换由两层配置决定（默认都关闭，保持透明转发）：
+//   - Config.GifNormalize                        全局开关
+//   - ModelDetailedSettings[model].GifNormalize  模型级覆盖（nil=跟随全局）
+//
+// 只处理主模型直收图片的请求，视觉代理路径不受本开关影响（它始终转换）。
+
+// gifNormalizeEnabled 判断指定模型是否启用「主模型 GIF 转换」：
+// 模型级配置优先，未指定则跟随全局开关。
+func gifNormalizeEnabled(modelID string) bool {
+	if setting, ok := cfg.ModelDetailedSettings[modelID]; ok && setting.GifNormalize != nil {
+		return *setting.GifNormalize
+	}
+	return cfg.GifNormalize
+}
+
+// normalizeGifInBody 把请求体中的 GIF 动图统一转换为 PNG 首帧（主模型直收图片时生效）。
+// 支持四种图片载体：
+//  1. Ollama images 数组（裸 base64 字符串）
+//  2. Ollama image 块   {"type":"image","image_base64":"..."}
+//  3. Anthropic image 块 {"type":"image","source":{"media_type":"...","data":"..."}}
+//  4. OpenAI image_url 块 {"type":"image_url","image_url":{"url":"data:image/gif;base64,..."}}
+//
+// 返回 (处理后的请求体, 是否发生了转换)。
+// [高并发内存安全] 先用字节标记预检，请求体里没有 GIF 特征时直接返回，不做整体反序列化。
+func normalizeGifInBody(body []byte, modelID string) ([]byte, bool) {
+	if len(body) == 0 || modelID == "" || !gifNormalizeEnabled(modelID) {
+		return body, false
+	}
+	// base64 编码的 GIF 一定以 "R0lG" 开头（"GIF8" 的 base64 前缀）；
+	// data URI 里则带 image/gif。两者任一命中才需要进一步解析。
+	if !bytes.Contains(body, []byte("image/gif")) && !bytes.Contains(body, []byte(`"R0lG`)) {
+		return body, false
+	}
+
+	var req map[string]interface{}
+	if json.Unmarshal(body, &req) != nil {
+		return body, false
+	}
+	messages, ok := req["messages"].([]interface{})
+	if !ok {
+		return body, false
+	}
+
+	converted := 0
+	// convertOne 就地转换一张 base64 图片，返回新的 (base64, mime)；未转换时原样返回
+	convertOne := func(b64, mime string) (string, string) {
+		if b64 == "" {
+			return b64, mime
+		}
+		if mime == "" {
+			mime = detectImageMIME(b64)
+		}
+		if mime != "image/gif" && !strings.HasPrefix(b64, "R0lG") {
+			return b64, mime
+		}
+		out, done := normalizeVisionImage(visionImage{Base64: b64, MIME: "image/gif"})
+		if !done {
+			return b64, mime
+		}
+		converted++
+		return out.Base64, out.MIME
+	}
+
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// 载体 1：Ollama images 数组（裸 base64 字符串，无 MIME 字段）
+		if imgs, ok := msg["images"].([]interface{}); ok && len(imgs) > 0 {
+			for i, v := range imgs {
+				s, ok := v.(string)
+				if !ok || s == "" {
+					continue
+				}
+				if nb, _ := convertOne(s, detectImageMIME(s)); nb != s {
+					imgs[i] = nb
+				}
+			}
+		}
+
+		// 载体 2～4：content 数组中的图片块
+		blocks, ok := msg["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, b := range blocks {
+			bm, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch bm["type"] {
+			case "image":
+				// Ollama：{"type":"image","image_base64":"..."}
+				if b64, ok := bm["image_base64"].(string); ok && b64 != "" {
+					if nb, _ := convertOne(b64, detectImageMIME(b64)); nb != b64 {
+						bm["image_base64"] = nb
+					}
+					continue
+				}
+				// Anthropic：{"type":"image","source":{"type":"base64","media_type":"...","data":"..."}}
+				if src, ok := bm["source"].(map[string]interface{}); ok {
+					data, _ := src["data"].(string)
+					mt, _ := src["media_type"].(string)
+					if nb, nmt := convertOne(data, mt); nb != data {
+						src["data"] = nb
+						src["media_type"] = nmt
+					}
+				}
+			case "image_url":
+				// OpenAI：{"type":"image_url","image_url":{"url":"data:image/gif;base64,..."}}
+				if iu, ok := bm["image_url"].(map[string]interface{}); ok {
+					urlStr, _ := iu["url"].(string)
+					idx := strings.Index(urlStr, ";base64,")
+					if idx < 0 {
+						continue
+					}
+					mime := strings.TrimPrefix(urlStr[:idx], "data:")
+					b64 := urlStr[idx+len(";base64,"):]
+					if nb, nmt := convertOne(b64, mime); nb != b64 {
+						iu["url"] = "data:" + nmt + ";base64," + nb
+					}
+				}
+			}
+		}
+	}
+
+	if converted == 0 {
+		return body, false
+	}
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	fmt.Printf("🎞️ 主模型 GIF 转换 [%s]: 已把 %d 张 GIF 动图转换为 PNG 首帧\n", modelID, converted)
+	return newBody, true
 }
 
 // ==================== 视觉代理模型（Vision Proxy） ====================
@@ -2451,6 +2602,7 @@ func getDefaultConfig() Config {
 		VisionProxyPrompt:       defaultVisionProxyPrompt,                       // 全局默认视觉代理提示词
 		VisionImageQuality:      &VisionQuality{Quality: visionQualityBalanced}, // 全局图片质量配置（默认平衡）
 		VisionProxyMemCacheSize: 200,                                            // 视觉代理图片内存缓存大小（默认 200，0=禁用）
+		GifNormalize:            false,                                          // 直连路径 GIF→PNG 首帧转换（默认关闭，保持透明转发）
 		ModelContextPrompt: ModelContextPrompt{
 			Enable:   false,
 			Position: ctxPosPrepend,
@@ -2509,6 +2661,7 @@ func printConfigHelp() {
 	fmt.Println("                     VisionProxyPrompt: 视觉代理自定义提示词(留空=使用全局 VisionProxyPrompt)")
 	fmt.Println("                     VisionImageQuality: 本模型图片质量配置(留空=使用全局 VisionImageQuality)")
 	fmt.Println("                       格式: {Quality: 枚举, CustomPercent: 自定义质量百分比}")
+	fmt.Println("                     GifNormalize: 主模型 GIF 转换(本模型) true=转换/false=不转换/缺省跟随全局 GifNormalize")
 	fmt.Println("                     识别结果按图片内容+提示词哈希缓存到 vision_cache/ 目录,重复图片直接命中缓存,不浪费 token")
 	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384}}")
 	fmt.Println("                     示例: {\"deepseek-chat\": {\"VisionProxyModel\": \"gpt-4o\", \"VisionProxyPrompt\": \"请描述图片内容\"}}")
@@ -2522,6 +2675,10 @@ func printConfigHelp() {
 	fmt.Println(" ▼ VisionProxyMemCacheSize : 视觉代理图片内存缓存大小(0=禁用,默认200)")
 	fmt.Println("                     识别成功保存本地后同时放入内存,再次遇到相同图片直接命中内存(毫秒级),")
 	fmt.Println("                     减少磁盘读取、延长固态寿命;启动时按修改时间预加载最近的 N 条到内存")
+	fmt.Println(" ▼ GifNormalize    : 主模型 GIF 转换开关(默认关闭):主模型原生支持视觉/未配置视觉代理时,")
+	fmt.Println("                     请求体里的 GIF 动图将被转换为 PNG 首帧再转发(仅保留首帧)")
+	fmt.Println("                     部分上游/中转网关不接受 GIF(返回 400 invalid image input),开启可规避")
+	fmt.Println("                     视觉代理路径不受此开关影响(它始终转换);模型级可用 ModelDetailedSettings 的 GifNormalize 覆盖(true/false,缺省跟随全局)")
 	fmt.Println(" ▼ RequestPromptReplace: 请求提示词替换规则,自动替换请求中的指定文本")
 	fmt.Println("                     格式: {规则名称: {enable, role, index, prompt, replace}}")
 	fmt.Println("                     优先级:")
@@ -2755,6 +2912,10 @@ func loadConfig() {
 	} else if stored.VisionProxyMemCacheSize < 0 {
 		stored.VisionProxyMemCacheSize = 0
 		needSave = true
+	}
+	// 直连路径 GIF 转换开关（默认关闭；字段缺失按默认 false，语义一致，无需强制回写）
+	if _, ok := rawMap["GifNormalize"]; !ok {
+		stored.GifNormalize = defaultCfg.GifNormalize
 	}
 	if _, ok := rawMap["ModelContextPrompt"]; !ok {
 		stored.ModelContextPrompt = defaultCfg.ModelContextPrompt
@@ -3301,6 +3462,7 @@ const (
 	rtProtWarnInject    = "warn-inject"     // 跨请求警告注入
 	rtProtAssistantLoop = "assistant-loop"  // assistant 消息重复（自问自答循环）
 	rtProtVisionProxy   = "vision-proxy"    // 视觉代理识别
+	rtProtGifNormalize  = "gif-normalize"   // 主模型 GIF 转换（GIF→PNG 首帧）
 	rtProtCtxInject     = "ctx-inject"      // 模型上下文注入
 	rtProtPromptReplace = "prompt-replace"  // 提示词替换
 	rtProtModelAlias    = "model-alias"     // 模型名还原
@@ -4374,6 +4536,8 @@ func applyConfigToRuntime(newCfg Config) {
 	}
 	cfg.VisionProxyMemCacheSize = newCfg.VisionProxyMemCacheSize
 	setVisionMemCacheCap(newCfg.VisionProxyMemCacheSize)
+	// 直连路径 GIF 转换开关（立即生效）
+	cfg.GifNormalize = newCfg.GifNormalize
 	// 规范化插入位置并应用
 	newCfg.ModelContextPrompt.Position = normalizeCtxPos(newCfg.ModelContextPrompt.Position)
 	cfg.ModelContextPrompt = newCfg.ModelContextPrompt
@@ -8382,6 +8546,18 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 				if r.Context().Err() != nil {
 					return
 				}
+			}
+		}
+	}
+
+	// 主模型 GIF 转换（可选）：视觉代理路径已在 applyVisionProxy 内部完成 GIF→PNG 转换，
+	// 这里只处理仍然带图片的请求（主模型原生支持视觉 / 未配置视觉代理）。
+	// 部分上游不接受 GIF（400 invalid image input），按配置在转发前统一转为 PNG 首帧。
+	if curModel.Model != "" {
+		if newBody, changed := normalizeGifInBody(body, curModel.Model); changed {
+			body = newBody
+			if rec != nil {
+				rec.addProtection(rtProtGifNormalize)
 			}
 		}
 	}
