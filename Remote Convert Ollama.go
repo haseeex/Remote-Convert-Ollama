@@ -98,7 +98,8 @@ type ModelContextPrompt struct {
 //     客户端把含裸 </thinking> 的 assistant 消息回放给上游后，上游 prompt 渲染器会在裸
 //     </thinking> 处截断该消息历史 → 模型丢上下文 → 复现垃圾输出 → 死循环。
 //     本开关在转发边界把裸标签替换为 [THINK-START]/[THINK-END]：响应侧防脏历史进入客户端，
-//     请求侧防上游截断历史。只处理"裸"标签（计数不配对），配对的教学示例不误伤。
+//     请求侧防上游截断历史。只处理裸闭标签（无配对开标签的 </thinking>），
+//     裸开标签与配对完整的 <thinking>...</thinking> 不影响上游渲染，无需处理。
 //     （独立于 Enable 生效，默认开启：正常对话零影响，只替换异常泄漏）
 type DoomLoopProtection struct {
 	Enable      bool   `json:"Enable"`               // 总开关
@@ -107,12 +108,29 @@ type DoomLoopProtection struct {
 	Warn        bool   `json:"Warn"`                 // 跨请求警告注入（C 方案）：熔断/复读后下一轮注入 system 警告
 	MaxRepeat   int    `json:"MaxRepeat,omitempty"`  // 连续重复熔断阈值（>=2 生效，默认 3）
 	WarnPrompt  string `json:"WarnPrompt,omitempty"` // 跨请求注入的警告提示词（留空=内置默认）
-	// ThinkTag 思考标签消毒：裸 <thinking>/</thinking> 泄漏替换为 [THINK-START]/[THINK-END]
+	// ThinkTag 思考标签消毒总开关：裸 <thinking>/</thinking> 泄漏替换为 [THINK-START]/[THINK-END]
 	// （ollama cloud 死循环防护，独立于 Enable 生效，默认开启）
 	// ⚠️ 不能用 omitempty：bool 零值 false 会被省略 → 用户关闭后保存，
 	// config.json 里没有该字段 → 前端重新加载拿到 undefined 被 "!== false" 误判为开启
 	// （开关"关不掉"），且重启时"旧配置升级"逻辑还会把缺失字段补回默认开启
 	ThinkTag bool `json:"ThinkTag"`
+	// ThinkTagRequest 请求侧消毒开关（客户端历史 → 上游）。
+	// 作用：客户端把已污染的裸标签回放给上游前替换掉，防止上游 prompt 渲染器截断 assistant 历史。
+	// 关掉它可避免「客户端历史里本来就有裸标签」时每轮都被处理（只保留响应侧根治）。
+	ThinkTagRequest bool `json:"ThinkTagRequest"`
+	// ThinkTagResponse 响应侧消毒开关（上游 → 客户端）。
+	// 作用：上游泄漏的裸标签在进入客户端会话前替换掉，阻止脏数据污染历史（根治源头）。
+	ThinkTagResponse bool `json:"ThinkTagResponse"`
+	// 请求侧消毒的生效角色（仅 ThinkTagRequest=true 时有效）。
+	// 为什么可配：死循环的真正污染源是 assistant 历史被回放后遭上游截断；
+	// 而 tool（工具输出）/user（用户提问）/system 里出现的裸标签多属内容的一部分
+	// （如技术文档、功能说明、读取源码时工具返回的文本），
+	// 一并处理会频繁误触发。
+	// 默认只处理 assistant，需要彻底清扫时再勾选其他角色。
+	ThinkTagRoleAssistant bool `json:"ThinkTagRoleAssistant"` // 只清 AI 自己回放的历史（默认开启）
+	ThinkTagRoleUser      bool `json:"ThinkTagRoleUser"`      // 用户消息（默认关闭）
+	ThinkTagRoleSystem    bool `json:"ThinkTagRoleSystem"`    // system 消息（含 Anthropic 顶层 system，默认关闭）
+	ThinkTagRoleTool      bool `json:"ThinkTagRoleTool"`      // tool / function 工具结果（默认关闭）
 	// RepeatMaxEntries 跨请求复读记录的会话数上限（LimitRepeatEntries=true 时生效）
 	LimitRepeatEntries bool `json:"LimitRepeatEntries"` // true=限制条数 / false=不限条数（map 可无限增长）
 	RepeatMaxEntries   int  `json:"RepeatMaxEntries"`   // 会话数上限（0=默认 256，上限 10000；记录只存 SHA-256 摘要）
@@ -138,6 +156,9 @@ func normalizeDoomLoop(d DoomLoopProtection) DoomLoopProtection {
 	if d.MaxRepeat < 2 || d.MaxRepeat > 20 {
 		d.MaxRepeat = 3
 	}
+	// 请求侧角色不做强制回退：若用户把四个角色全关，等于主动放弃请求侧消毒
+	// （仍有 ThinkTagRequest 总开关兜底），尊重用户的显式选择；
+	// 旧配置缺字段的情况在 loadConfig 的迁移逻辑里补默认（assistant）。
 	// 旧版用 -1 表示不限制（负数），迁移为布尔开关
 	if d.RepeatMaxEntries < 0 {
 		d.LimitRepeatEntries = false
@@ -152,6 +173,50 @@ func normalizeDoomLoop(d DoomLoopProtection) DoomLoopProtection {
 		d.RepeatTTLMin = defaultRepeatTTLMin
 	}
 	return d
+}
+
+// thinkTagRequestEnabled 请求侧思考标签消毒是否生效（总开关 + 请求侧子开关）。
+func thinkTagRequestEnabled() bool {
+	return cfg.DoomLoopProtection.ThinkTag && cfg.DoomLoopProtection.ThinkTagRequest
+}
+
+// thinkTagResponseEnabled 响应侧思考标签消毒是否生效（总开关 + 响应侧子开关）。
+func thinkTagResponseEnabled() bool {
+	return cfg.DoomLoopProtection.ThinkTag && cfg.DoomLoopProtection.ThinkTagResponse
+}
+
+// thinkTagRoles 请求侧消毒的生效角色集合（运行时读配置）。
+type thinkTagRoles struct {
+	Assistant bool
+	User      bool
+	System    bool
+	Tool      bool
+}
+
+// currentThinkTagRoles 读取当前配置的生效角色。
+func currentThinkTagRoles() thinkTagRoles {
+	d := cfg.DoomLoopProtection
+	return thinkTagRoles{
+		Assistant: d.ThinkTagRoleAssistant,
+		User:      d.ThinkTagRoleUser,
+		System:    d.ThinkTagRoleSystem,
+		Tool:      d.ThinkTagRoleTool,
+	}
+}
+
+// allows 判断某 role 的消息是否参与请求侧消毒。
+// role 缺失（异常客户端）按 assistant 处理——那是最需要防护的对象，宁可多清一次。
+func (t thinkTagRoles) allows(role string) bool {
+	switch role {
+	case "user":
+		return t.User
+	case "system":
+		return t.System
+	case "tool", "function":
+		return t.Tool
+	default: // assistant / developer / 空 role
+		return t.Assistant
+	}
 }
 
 // repeatEntryLimit 复读记录会话数上限（运行时读配置）。
@@ -2617,11 +2682,19 @@ func getDefaultConfig() Config {
 			WarnPrompt:  defaultDoomLoopWarnPrompt,
 			// 思考标签消毒默认开启（独立于 Enable 生效）：ollama cloud 死循环根因防护，
 			// 只替换异常泄漏的裸标签，正常对话零影响
-			ThinkTag:           true,
-			LimitRepeatEntries: true,
-			RepeatMaxEntries:   defaultRepeatMaxEntries,
-			LimitRepeatTTL:     true,
-			RepeatTTLMin:       defaultRepeatTTLMin,
+			ThinkTag:         true,
+			ThinkTagRequest:  true, // 请求侧兜底：防止上游截断历史
+			ThinkTagResponse: true, // 响应侧根治：防止脏标签污染客户端历史
+			// 请求侧默认只清 assistant 历史（真正的死循环污染源），
+			// tool/user/system 里的裸标签多属内容的一部分，默认不碰以免误触发
+			ThinkTagRoleAssistant: true,
+			ThinkTagRoleUser:      false,
+			ThinkTagRoleSystem:    false,
+			ThinkTagRoleTool:      false,
+			LimitRepeatEntries:    true,
+			RepeatMaxEntries:      defaultRepeatMaxEntries,
+			LimitRepeatTTL:        true,
+			RepeatTTLMin:          defaultRepeatTTLMin,
 		},
 		ConnPool:      defaultConnPool,
 		ProxyLimit:    defaultProxyLimit,    // 过载保护（并发闸门 + 请求体上限），默认关闭
@@ -2699,11 +2772,14 @@ func printConfigHelp() {
 	fmt.Println("                     检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),")
 	fmt.Println("                     Warn 开启时在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)")
 	fmt.Println("                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭")
-	fmt.Println("                     ThinkTag 思考标签消毒(独立于 Enable 生效,默认开启): ollama cloud 死循环根因防护——")
+	fmt.Println("                     ThinkTag 思考标签消毒总开关(独立于 Enable 生效,默认开启): ollama cloud 死循环根因防护——")
 	fmt.Println("                       deepseek 系思考模型长上下文退化时会把字面 </thinking> 泄漏进正文,客户端回放该历史后")
 	fmt.Println("                       上游渲染器会在裸 </thinking> 处截断消息历史导致死循环(ollama/ollama#17617)。")
-	fmt.Println("                       本开关在转发边界把裸标签替换为 [THINK-START]/[THINK-END]: 响应侧防脏历史进入客户端,")
-	fmt.Println("                       请求侧防上游截断历史; 只处理计数不配对的裸标签,教学示例等配对标签原样保留")
+	fmt.Println("                       本开关在转发边界把裸标签替换为 [THINK-START]/[THINK-END], 只处理裸闭标签(无配对开标签), 裸开标签与配对标签不影响上游渲染")
+	fmt.Println("                     ThinkTagRequest 请求侧消毒(默认开启): 客户端历史 → 上游, 防上游截断 assistant 历史")
+	fmt.Println("                     ThinkTagResponse 响应侧消毒(默认开启): 上游 → 客户端, 防脏标签污染客户端历史(根治)")
+	fmt.Println("                     ThinkTagRoleAssistant/User/System/Tool 请求侧生效角色: 默认只处理 assistant(真正的污染源),")
+	fmt.Println("                       其余默认关闭——工具输出(如阅读源码)里的字面标签多属内容的一部分,一并处理会反复误触发徽章")
 	fmt.Println("                     示例: {\"Enable\": true, \"Dedup\": true, \"RepeatCheck\": false, \"Warn\": true, \"MaxRepeat\": 3, \"WarnPrompt\": \"请勿重复输出\"}")
 	fmt.Println(" ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启")
 	fmt.Println("                     格式: {MaxIdleConns: 全局最大空闲连接数, MaxIdleConnsPerHost: 每上游主机最大空闲连接数, MaxConnsPerHost: 每上游主机最大并发连接数,")
@@ -2935,6 +3011,34 @@ func loadConfig() {
 		if rawDlp, ok := rawMap["DoomLoopProtection"].(map[string]interface{}); ok {
 			if _, hasThinkTag := rawDlp["ThinkTag"]; !hasThinkTag {
 				stored.DoomLoopProtection.ThinkTag = defaultCfg.DoomLoopProtection.ThinkTag
+				needSave = true
+			}
+			// 旧配置升级：请求侧/响应侧是新增的拆分开关，旧配置只有总开关 ThinkTag。
+			// 缺失时两个方向都跟随总开关 → 升级后行为与旧版完全一致（不会突然放开或收紧防护）
+			if _, has := rawDlp["ThinkTagRequest"]; !has {
+				stored.DoomLoopProtection.ThinkTagRequest = stored.DoomLoopProtection.ThinkTag
+				needSave = true
+			}
+			if _, has := rawDlp["ThinkTagResponse"]; !has {
+				stored.DoomLoopProtection.ThinkTagResponse = stored.DoomLoopProtection.ThinkTag
+				needSave = true
+			}
+			// 旧配置升级：请求侧生效角色是新增字段，默认只处理 assistant（真正的死循环污染源），
+			// 其余角色默认关闭——避免工具输出里的字面标签造成误报
+			if _, has := rawDlp["ThinkTagRoleAssistant"]; !has {
+				stored.DoomLoopProtection.ThinkTagRoleAssistant = defaultCfg.DoomLoopProtection.ThinkTagRoleAssistant
+				needSave = true
+			}
+			if _, has := rawDlp["ThinkTagRoleUser"]; !has {
+				stored.DoomLoopProtection.ThinkTagRoleUser = defaultCfg.DoomLoopProtection.ThinkTagRoleUser
+				needSave = true
+			}
+			if _, has := rawDlp["ThinkTagRoleSystem"]; !has {
+				stored.DoomLoopProtection.ThinkTagRoleSystem = defaultCfg.DoomLoopProtection.ThinkTagRoleSystem
+				needSave = true
+			}
+			if _, has := rawDlp["ThinkTagRoleTool"]; !has {
+				stored.DoomLoopProtection.ThinkTagRoleTool = defaultCfg.DoomLoopProtection.ThinkTagRoleTool
 				needSave = true
 			}
 			// 旧配置升级：复读记录上限字段缺失时补默认
@@ -4367,9 +4471,28 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	migrateRequestPromptReplace(&newCfg, rawCfg)
 
 	// 思考标签消毒：旧版配置页未携带 ThinkTag 字段时保持当前运行值（防误关防护）
+	// 请求侧/响应侧/角色同理：缺失即沿用当前运行值，避免老页面保存后子开关被静默清零
 	if rawDlp, ok := rawCfg["DoomLoopProtection"].(map[string]interface{}); ok {
 		if _, hasThinkTag := rawDlp["ThinkTag"]; !hasThinkTag {
 			newCfg.DoomLoopProtection.ThinkTag = cfg.DoomLoopProtection.ThinkTag
+		}
+		if _, has := rawDlp["ThinkTagRequest"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRequest = cfg.DoomLoopProtection.ThinkTagRequest
+		}
+		if _, has := rawDlp["ThinkTagResponse"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagResponse = cfg.DoomLoopProtection.ThinkTagResponse
+		}
+		if _, has := rawDlp["ThinkTagRoleAssistant"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRoleAssistant = cfg.DoomLoopProtection.ThinkTagRoleAssistant
+		}
+		if _, has := rawDlp["ThinkTagRoleUser"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRoleUser = cfg.DoomLoopProtection.ThinkTagRoleUser
+		}
+		if _, has := rawDlp["ThinkTagRoleSystem"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRoleSystem = cfg.DoomLoopProtection.ThinkTagRoleSystem
+		}
+		if _, has := rawDlp["ThinkTagRoleTool"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRoleTool = cfg.DoomLoopProtection.ThinkTagRoleTool
 		}
 	}
 
@@ -4659,10 +4782,12 @@ const dedupMinLen = 20
 // 官方仅修复本地渲染路径（PR #18260），cloud 端至今未修，本网关在转发边界做消毒兜底：
 //   - 响应侧：上游泄漏的裸标签在发给客户端前替换，防止脏历史进入客户端会话
 //   - 请求侧：客户端历史里已污染的裸标签在转发上游前替换，防止上游渲染器截断历史
-// 只替换"裸"标签（计数不配对的多余标签），配对的 <thinking>...</thinking> 原样保留
-// （可能是教学示例，不误伤）。
+// 只替换"裸闭标签"（无配对开标签的 </thinking>）：这才是真正会让上游截断历史的形态。
+// 裸 <thinking> 与配对完整的 <thinking>...</thinking> 一律原样保留（不影响上游渲染，无需处理）。
 
 // 思考标签常量：原始标签与安全替代文本
+// 注意：thinkTagSafeOpen 仅用于历史兼容/潜在扩展，当前消毒流程只产出 thinkTagSafeClose
+// （裸开标签无害，见 sanitizeThinkTags 注释）
 const (
 	thinkTagOpen      = "<thinking>"
 	thinkTagClose     = "</thinking>"
@@ -4682,9 +4807,10 @@ type thinkTagState struct {
 // 从左到右扫描片段，维护跨片段配对状态 st，只替换"裸"标签（无配对的）：
 //
 //	裸 </thinking>    → [THINK-END]
-//	（裸 <thinking> 由非流式入口在收尾时统一处理）
 //
-// 配对完整的 <thinking>...</thinking> 原样保留（可能是教学示例，不误伤）。
+// 裸 <thinking> 一律原样保留（它不会导致上游截断历史，本身无害；
+// 无差别替换会让包含该字面文本的正常对话反复误报）。
+// 配对完整的 <thinking>...</thinking> 同样原样保留（配对标签不触发上游截断）。
 // 返回 (处理后的片段, 是否发生了替换)。
 func sanitizeThinkTagsInc(st *thinkTagState, s string) (string, bool) {
 	if strings.Index(s, thinkTagOpen) < 0 && strings.Index(s, thinkTagClose) < 0 {
@@ -4725,23 +4851,19 @@ func sanitizeThinkTagsInc(st *thinkTagState, s string) (string, bool) {
 }
 
 // sanitizeThinkTags 非流式思考标签消毒（一次性处理完整文本）：
-// 先按配对状态机处理，收尾时把仍未配对的 <thinking>（反向泄漏，如教学示例
-// "<thinking>xxx" 无闭标签）从右往左替换为 [THINK-START]。
+// 与流式路径 sanitizeThinkTagsInc 保持完全一致——**只替换裸闭标签**。
+//
+// 为什么不再处理裸开标签（早期版本会用 LastIndex 反向替换）：
+//   - 上游渲染器只在裸 </thinking> 处截断历史（deepseek3.go 的 SplitN(content,"</thinking>",2)），
+//     裸 <thinking> 只是普通文本，不会造成上下文丢失，本身无害
+//   - 但正常对话中出现单独 <thinking> 字面量的场景极为常见
+//     （如技术文档、功能说明、读取源码时工具返回的内容），无差别替换会让实时记录每轮都亮
+//     「请求侧思考标签消毒」徽章，掩盖真正的异常信号
+//   - 流式路径本来就不处理裸开标签，两侧保持一致才能避免"流式漏进去 → 请求侧反复命中"的循环
+//
 // 返回 (处理后的文本, 是否发生了替换)。
 func sanitizeThinkTags(s string) (string, bool) {
-	st := &thinkTagState{}
-	out, modified := sanitizeThinkTagsInc(st, s)
-	// 反向泄漏：结尾有未配对的 <thinking>，从右往左替换最后的 openBalance 个
-	for st.openBalance > 0 {
-		idx := strings.LastIndex(out, thinkTagOpen)
-		if idx < 0 {
-			break
-		}
-		out = out[:idx] + thinkTagSafeOpen + out[idx+len(thinkTagOpen):]
-		st.openBalance--
-		modified = true
-	}
-	return out, modified
+	return sanitizeThinkTagsInc(&thinkTagState{}, s)
 }
 
 // sanitizeContentField 对消息的 content/system 字段做思考标签消毒：
@@ -4775,10 +4897,15 @@ func sanitizeContentField(msg map[string]interface{}, field string) bool {
 }
 
 // sanitizeMessagesThinkTags 对请求体做思考标签消毒（请求侧防护）：
-// 遍历 messages 数组（OpenAI/Ollama/Anthropic 三种格式通用）与 Anthropic 顶层 system 字段，
-// 把客户端历史里已污染的裸 </thinking> 替换为安全文本，防止上游 prompt 渲染器截断
+// 按 roles 指定的角色遍历 messages 数组（OpenAI/Ollama/Anthropic 三种格式通用），
+// 以及（roles.System 开启时的）Anthropic 顶层 system 字段，
+// 把客户端历史里已污染的裸标签替换为安全文本，防止上游 prompt 渲染器截断
 // assistant 历史导致死循环。返回 (处理后的请求体, 是否发生了替换)。
-func sanitizeMessagesThinkTags(body []byte) ([]byte, bool) {
+//
+// 为什么要按角色过滤：死循环的真正污染源是 assistant 历史被回放后遭上游截断；
+// tool（工具输出）/user/system 里的裸标签多属内容的一部分（如读取源码时工具返回的文本），
+// 无差别处理会让实时记录每轮都亮「请求侧思考标签消毒」徽章，掩盖真正的异常信号。
+func sanitizeMessagesThinkTags(body []byte, roles thinkTagRoles) ([]byte, bool) {
 	// [高并发内存安全] 预检门禁：请求体里根本没有裸思考标签时直接返回，
 	// 不做整体反序列化。带图片的请求体极大，每省一次 map 物化就省一整份 base64 副本。
 	if !bytes.Contains(body, []byte(thinkTagOpen)) && !bytes.Contains(body, []byte(thinkTagClose)) {
@@ -4795,13 +4922,17 @@ func sanitizeMessagesThinkTags(body []byte) ([]byte, bool) {
 			if !ok {
 				continue
 			}
+			role, _ := msg["role"].(string)
+			if !roles.allows(role) {
+				continue
+			}
 			if sanitizeContentField(msg, "content") {
 				modified = true
 			}
 		}
 	}
-	// Anthropic 顶层 system 字段（string 或数组块）
-	if sanitizeContentField(req, "system") {
+	// Anthropic 顶层 system 字段（string 或数组块）——属于 system 角色
+	if roles.System && sanitizeContentField(req, "system") {
 		modified = true
 	}
 	if !modified {
@@ -4811,8 +4942,29 @@ func sanitizeMessagesThinkTags(body []byte) ([]byte, bool) {
 	if err != nil {
 		return body, false
 	}
-	fmt.Println("🛡️ 思考标签消毒: 请求历史含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])")
+	fmt.Printf("🛡️ 思考标签消毒: 请求历史(角色 %s)含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n", roles.describe())
 	return newBody, true
+}
+
+// describe 生成角色列表文案，用于日志（如 "assistant,tool"）。
+func (t thinkTagRoles) describe() string {
+	parts := make([]string, 0, 4)
+	if t.Assistant {
+		parts = append(parts, "assistant")
+	}
+	if t.User {
+		parts = append(parts, "user")
+	}
+	if t.System {
+		parts = append(parts, "system")
+	}
+	if t.Tool {
+		parts = append(parts, "tool")
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
 }
 
 // dedupStreamContent 对单个流式内容块做去重处理。
@@ -5451,7 +5603,7 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 	// 上游泄漏的裸 <thinking>/</thinking> 标签在发给客户端前替换为安全文本，
 	// 防止脏标签进入客户端历史后回放给上游导致渲染器截断历史
-	if cfg.DoomLoopProtection.ThinkTag && content != "" {
+	if thinkTagResponseEnabled() && content != "" {
 		if s, ok := sanitizeThinkTags(content); ok {
 			fmt.Printf("🛡️ 思考标签消毒: 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
 			content = s
@@ -5770,7 +5922,7 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 			// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
 			// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
-			if cfg.DoomLoopProtection.ThinkTag {
+			if thinkTagResponseEnabled() {
 				if s, ok := sanitizeThinkTagsInc(ttState, content); ok {
 					content = s
 					ttCleaned = true
@@ -5935,7 +6087,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 	// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 	// 上游泄漏的裸 <thinking>/</thinking> 标签在发给客户端前替换为安全文本，
 	// 防止脏标签进入客户端历史后回放给上游导致渲染器截断历史
-	if cfg.DoomLoopProtection.ThinkTag {
+	if thinkTagResponseEnabled() {
 		var ttResp map[string]interface{}
 		if err := json.Unmarshal(raw, &ttResp); err == nil {
 			if choices, ok := ttResp["choices"].([]interface{}); ok && len(choices) > 0 {
@@ -6255,7 +6407,7 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 						// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 						// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
 						// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
-						if cfg.DoomLoopProtection.ThinkTag {
+						if thinkTagResponseEnabled() {
 							if s, ok2 := sanitizeThinkTagsInc(ttState, c); ok2 {
 								c = s
 								ttCleaned = true
@@ -6838,7 +6990,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 			// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
 			// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
-			if cfg.DoomLoopProtection.ThinkTag {
+			if thinkTagResponseEnabled() {
 				if s, ok := sanitizeThinkTagsInc(ttState, deltaContent); ok {
 					deltaContent = s
 					ttCleaned = true
@@ -7404,7 +7556,7 @@ func convertOpenAIToAnthropic(r *http.Request, raw []byte, model string, reqBody
 
 			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 			// 上游泄漏的裸思考标签在 Anthropic 转换前替换为安全文本
-			if cfg.DoomLoopProtection.ThinkTag && textContent != "" {
+			if thinkTagResponseEnabled() && textContent != "" {
 				if s, ok := sanitizeThinkTags(textContent); ok {
 					fmt.Printf("🛡️ 思考标签消毒: Anthropic 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
 					textContent = s
@@ -8477,8 +8629,10 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	// 末日循环保护：思考标签消毒（请求侧，ollama cloud 死循环根因防护）
 	// 客户端历史里已污染的裸 <thinking>/</thinking> 标签在转发上游前替换为安全文本，
 	// 防止上游 prompt 渲染器在裸 </thinking> 处截断 assistant 历史导致死循环
-	if cfg.DoomLoopProtection.ThinkTag {
-		if newBody, changed := sanitizeMessagesThinkTags(body); changed {
+	// 按配置的生效角色过滤（默认只处理 assistant），避免工具输出/用户消息里的
+	// 字面标签被反复处理造成误报。
+	if thinkTagRequestEnabled() {
+		if newBody, changed := sanitizeMessagesThinkTags(body, currentThinkTagRoles()); changed {
 			body = newBody
 			if rec != nil {
 				rec.addProtection(rtProtThinkTagReq)

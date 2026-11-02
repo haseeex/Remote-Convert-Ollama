@@ -6,8 +6,29 @@
 <title>Remote Convert Ollama · 配置管理</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Ctext%20x='32'%20y='46'%20font-size='40'%20text-anchor='middle'%3E%F0%9F%90%AD%3C/text%3E%3C/svg%3E">
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--accent2:#1f6feb;--green:#3fb950;--yellow:#d29922;--red:#f85149;--radius:12px}
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--accent2:#1f6feb;--green:#3fb950;--yellow:#d29922;--red:#f85149;--radius:12px;
+  /* 让浏览器原生控件（select 下拉面板、datalist 候选框、数字框上下箭头、复选框、
+     自动填充背景、滚动条）跟随深色主题——不加这一行，原生弹出层会是刺眼的浅色 */
+  color-scheme:dark}
 *{box-sizing:border-box;margin:0;padding:0}
+/* 始终为滚动条预留槽位：切换 tab 时页面高度变化（有的 tab 需要滚动、有的不需要）
+   不会再让整页宽度抖动（sticky header / footerbar / 内容左右位置保持一致）。
+   旧浏览器不支持 scrollbar-gutter，用 overflow-y:scroll 兜底（代价是常驻滚动条轨道）。 */
+html{overflow-y:scroll;scrollbar-gutter:stable}
+/* 滚动条风格统一（默认滚动条是系统浅灰样式，和深色 UI 割裂）。
+   实现要点：thumb 用 border + background-clip:content-box 做内缩，
+   这样轨道不用画底色就能得到「细圆角滑块」的效果，比直接设背景更贴合主题。 */
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#30363d;border:3px solid transparent;background-clip:content-box;border-radius:10px}
+::-webkit-scrollbar-thumb:hover{background:#484f58;background-clip:content-box}
+::-webkit-scrollbar-thumb:active{background:#58a6ff;background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+/* Firefox 走标准属性；但 Chromium 只要看到 scrollbar-width/color 就会忽略上面的
+   ::-webkit-scrollbar 规则，所以必须用 @supports 隔离，不能无条件写 *{} */
+@supports not selector(::-webkit-scrollbar){
+  *{scrollbar-width:thin;scrollbar-color:#484f58 transparent}
+}
 body{background:linear-gradient(180deg,#0d1117 0%,#0a0e14 100%);color:var(--text);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;min-height:100vh;padding-bottom:120px}
 header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:12px;padding:14px 24px;background:rgba(13,17,23,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
 header .logo{font-size:22px}
@@ -35,7 +56,7 @@ header .spacer{flex:1}
 .head-tools select{width:auto;min-width:150px;padding:5px 26px 5px 10px;font-size:12px}
 .card>.head:has(.head-tools){flex-wrap:wrap;row-gap:8px}
 /* 子页 Tab 条右侧的粘滞工具栏（快速跳转）：跟着吸顶条一起，永远可见 */
-.subtab-tools{display:none;align-items:center;gap:8px;margin-left:auto;flex-shrink:0}
+.subtab-tools{display:none;align-items:center;gap:8px;margin-left:auto;flex-shrink:0;flex-wrap:wrap}
 .subtab-tools.show{display:flex}
 .subtab-tools select{width:auto;min-width:170px;max-width:240px;padding:5px 26px 5px 10px;font-size:12px;border-radius:20px}
 .subtab-tools .badge{white-space:nowrap}
@@ -54,6 +75,12 @@ header .spacer{flex:1}
 input[type=text],input[type=number],input[type=password],select,textarea{width:100%;padding:9px 12px;background:#0d1117;color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:13.5px;font-family:inherit;outline:none;transition:border-color .15s}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
 select{appearance:none;-webkit-appearance:none;background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"><path d="M0 0l5 6 5-6z" fill="%238b949e"/></svg>');background-repeat:no-repeat;background-position:right 10px center;background-size:10px 6px;padding-right:34px;cursor:pointer}
+/* 下拉面板本身由系统渲染（无法完全自定义），但配色可以跟上主题 */
+select option{background:var(--panel2);color:var(--text)}
+/* 输入框/下拉悬停反馈，与按钮、卡片的边框反馈保持一致 */
+input[type=text]:hover:not(:focus),input[type=number]:hover:not(:focus),input[type=password]:hover:not(:focus),select:hover:not(:focus),textarea:hover:not(:focus){border-color:#484f58}
+/* 数字框的上下箭头跟随主题（Chromium 默认会画成浅色） */
+input[type=number]{accent-color:var(--accent2)}
 textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-size:12.5px;line-height:1.5}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
@@ -114,6 +141,15 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .row.disabled-row{opacity:.45;pointer-events:none;filter:grayscale(.4)}
 /* 末日循环保护：子选项缩进，与总开关形成层级 */
 .row.sub-row{margin-left:26px}
+/* 思考标签消毒：角色勾选为二级子项，整体左对齐（不要 align-items:center，否则会整行居中） */
+.row.sub2-row{margin-left:52px;gap:8px}
+.tt-role-hd{font-size:12px;color:var(--muted);line-height:1.4}
+.tt-roles{display:flex;flex-wrap:wrap;align-items:center;gap:8px 22px}
+.tt-role{gap:8px}
+.tt-role .lbl{font-size:12.5px}
+.tt-role-hint{font-size:11.5px;color:var(--muted);line-height:1.6;margin:0}
+/* 开关文案里的灰色补充说明 */
+.switch .lbl .hint{font-size:11.5px;font-weight:400;opacity:.8;line-height:1.55}
 /* 末日循环保护：组框（框住“启用+子选项”，ThinkTag 独立开关在组框外） */
 .dlp-group{border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-top:4px;background:rgba(13,17,23,.35);display:flex;flex-direction:column;gap:10px}
 .dlp-group .row:first-child{margin-top:0}
@@ -142,7 +178,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .rt-badge.connecting .dot{background:var(--yellow);animation:rtpulse .8s infinite}
 @keyframes rtpulse{0%,100%{opacity:1}50%{opacity:.3}}
 .rt-count{margin-left:auto;font-family:Consolas,monospace;font-size:12px;color:var(--muted)}
-.rt-list{display:flex;flex-direction:column;gap:8px;max-height:66vh;overflow:auto}
+.rt-list{display:flex;flex-direction:column;gap:8px;max-height:66vh;overflow:auto;scrollbar-gutter:stable}
 .rt-item{border:1px solid var(--border);border-radius:10px;background:var(--panel2);overflow:hidden;flex-shrink:0}
 .rt-head{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;font-size:12.5px;flex-wrap:wrap;user-select:none}
 .rt-head:hover{background:rgba(88,166,255,.06)}
@@ -167,8 +203,20 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .rt-body{flex-direction:column;gap:6px;padding:4px 12px 12px;border-top:1px solid var(--border);background:rgba(13,17,23,.45)}
 .rt-sec-label{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:8px;margin-top:8px}
 .rt-trunc{font-size:10.5px;color:var(--yellow);border:1px solid rgba(210,153,34,.35);background:rgba(210,153,34,.1);padding:1px 7px;border-radius:10px}
-.rt-pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:Consolas,"Courier New",monospace;font-size:11.5px;line-height:1.55;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;color:#c9d1d9;margin:0}
+.rt-pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:Consolas,"Courier New",monospace;font-size:11.5px;line-height:1.55;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;color:#c9d1d9;margin:0;scrollbar-gutter:stable}
 .rt-empty{color:var(--muted);font-size:13px;text-align:center;padding:22px}
+/* ===== 模型选择器：自定义可搜索下拉（替代 datalist，完全跟随主题） =====
+   为什么不用原生 <select> / <datalist>：
+   - datalist 候选框的间距/圆角/hover 高亮无法自定义，永远带着系统味
+   - select 无法同时支持「下拉选」与「自由手填」（模型可能尚未部署到上游）
+   实现：input 保持 text 可手填，聚焦时弹出浮层（position:fixed），输入即过滤。 */
+.mp-panel{position:fixed;z-index:300;background:var(--panel2);border:1px solid var(--border);border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.55);padding:4px;max-height:280px;overflow:auto;scrollbar-gutter:stable;font-size:12.5px;min-width:220px}
+.mp-item{padding:7px 10px;border-radius:7px;cursor:pointer;color:var(--text);font-family:Consolas,"Courier New",monospace;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .1s,color .1s}
+.mp-item:hover,.mp-item.active{background:rgba(88,166,255,.16);color:var(--accent)}
+.mp-item.mp-cur{color:var(--green)}
+.mp-empty{padding:12px 10px;color:var(--muted);text-align:center;font-size:12px;line-height:1.6}
+.mp-foot{position:sticky;bottom:-4px;margin:4px -4px -4px;padding:6px 12px;border-top:1px solid var(--border);background:var(--panel2);color:var(--muted);font-size:11px;display:flex;justify-content:space-between;gap:10px;border-radius:0 0 10px 10px}
+.mp-kbd{font-family:Consolas,monospace;opacity:.85;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -311,6 +359,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
         <div class="subtab" data-subtab="alias" onclick="switchSubTab('model','alias')" data-i18n="subModelAlias">🔖 别名</div>
         <div class="subtab" data-subtab="detail" onclick="switchSubTab('model','detail')" data-i18n="subModelDetail">📐 详细设置</div>
         <div class="subtab-tools" id="detailTools">
+          <button class="btn small" id="btnFetchModels" onclick="fetchModelList(this)" data-i18n="btnFetchModels">🔄 获取模型列表</button>
           <select id="detailJump" onchange="jumpToDetail(this.value)"></select>
           <span class="badge" id="detailCount">0</span>
         </div>
@@ -390,7 +439,21 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
         <div class="card">
           <div class="head" data-i18n="dlpTitle">🚨 末日循环保护 DoomLoopProtection <span class="hint" data-i18n="dlpHint">检测上游内容重复并熔断，防止客户端陷入重试死循环</span></div>
           <div class="body">
-            <div class="row"><label class="switch"><input type="checkbox" id="DlpThinkTag"><span class="track"></span><span class="lbl" data-i18n="dlpThinkTag">思考标签消毒：裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]（ollama cloud 死循环根因防护，独立于总开关生效）</span></label></div>
+            <div class="dlp-group">
+            <div class="row"><label class="switch"><input type="checkbox" id="DlpThinkTag" onchange="toggleThinkTagInputs()"><span class="track"></span><span class="lbl"><span data-i18n="dlpThinkTag">思考标签消毒</span> <span class="hint" data-i18n="dlpThinkTagHint">裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为安全文本，防 ollama cloud 死循环（独立于下方「启用」）</span></span></label></div>
+            <div class="row sub-row" id="rowDlpThinkTagRequest"><label class="switch"><input type="checkbox" id="DlpThinkTagRequest" onchange="toggleThinkTagInputs()"><span class="track"></span><span class="lbl"><span data-i18n="dlpThinkTagRequest">请求侧消毒</span> <span class="hint" data-i18n="dlpThinkTagRequestHint">客户端历史 → 上游，防上游渲染器截断 assistant 历史</span></span></label></div>
+            <div class="row sub2-row" id="rowDlpThinkTagRoles">
+              <div class="tt-role-hd" data-i18n="dlpThinkTagRoles">请求侧生效角色</div>
+              <div class="tt-roles">
+                <label class="switch tt-role"><input type="checkbox" id="DlpThinkTagRoleAssistant"><span class="track"></span><span class="lbl">assistant</span></label>
+                <label class="switch tt-role"><input type="checkbox" id="DlpThinkTagRoleUser"><span class="track"></span><span class="lbl">user</span></label>
+                <label class="switch tt-role"><input type="checkbox" id="DlpThinkTagRoleSystem"><span class="track"></span><span class="lbl">system</span></label>
+                <label class="switch tt-role"><input type="checkbox" id="DlpThinkTagRoleTool"><span class="track"></span><span class="lbl">tool</span></label>
+              </div>
+              <div class="tt-role-hint" data-i18n="dlpThinkTagRolesHint">默认只处理 assistant（死循环的真正污染源）；tool 工具输出里的字面标签多属内容的一部分，默认跳过以免误触发</div>
+            </div>
+            <div class="row sub-row" id="rowDlpThinkTagResponse"><label class="switch"><input type="checkbox" id="DlpThinkTagResponse"><span class="track"></span><span class="lbl"><span data-i18n="dlpThinkTagResponse">响应侧消毒</span> <span class="hint" data-i18n="dlpThinkTagResponseHint">上游 → 客户端，阻止脏标签污染会话历史（根治源头）</span></span></label></div>
+            </div>
             <div class="dlp-group">
             <div class="row"><label class="switch"><input type="checkbox" id="DlpEnable" onchange="toggleDlpInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpEnable">启用：检测上游重复内容并熔断</span></label></div>
             <div class="row sub-row" id="rowDlpDedup"><label class="switch"><input type="checkbox" id="DlpDedup"><span class="track"></span><span class="lbl" data-i18n="dlpDedup">内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段</span></label></div>
@@ -480,6 +543,9 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 
 <div id="toast"></div>
 
+<!-- 模型选择器浮层（自定义可搜索下拉，内容由 mpRender 动态填充） -->
+<div id="mpPanel" class="mp-panel hidden"></div>
+
 <div id="loginOverlay" class="hidden">
   <div class="login-box">
     <div class="login-icon">🔒</div>
@@ -492,7 +558,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 </div>
 
 <script>
-var state = { aliases: [], details: [], rules: [], proxyKeys: [] };
+var state = { aliases: [], details: [], rules: [], proxyKeys: [], modelOptions: [], modelsFetched: false };
 // 实时请求状态提前声明：applyI18n（DOMContentLoaded 时调用）会重渲染列表
 var rtState = { items: [], open: {}, paused: false, es: null, lastId: 0, enabled: true, timer: null };
 
@@ -574,6 +640,15 @@ var I18N = {
     modelAlias: '🔖 模型别名 ModelAlias', modelAliasHint: '将上游模型 ID 显示为友好名称', btnAddAlias: '＋ 添加别名',
     modelDetail: '📐 模型详细设置 ModelDetailedSettings', modelDetailHint: '覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理', btnAddDetail: '＋ 添加模型设置',
     detailJumpPh: '快速跳转模型…', detailJumpHint: '选择一个模型，自动滚动到它的设置卡片', detailCountHint: '已配置的模型数量',
+    btnFetchModels: '🔄 获取模型列表', modelsFetching: '获取中…', modelsCount: '✅ {n} 个模型',
+    modelsFetched: '✅ 已获取 {n} 个模型，点击模型输入框即可下拉选择',
+    modelsEmpty: '⚠️ 上游没有返回任何模型',
+    modelsFetchFail: '❌ 获取模型列表失败：',
+    modelPickHint: '点击可从上游模型列表中选择，也可手动输入',
+    mpNoModels: '尚未获取模型列表<br>点顶部「🔄 获取模型列表」后再试',
+    mpNoMatch: '没有匹配的模型',
+    mpCount: '{n} / {total} 个模型',
+    mpKeyHint: '↑↓ 选择 · Enter 确认 · Esc 关闭',
     ctxTitle: '🧭 模型上下文信息注入 ModelContextPrompt', ctxHint: '在提示词中附加当前模型信息（模型ID/上下文长度/最大输出），帮助模型自我认知', ctxEnable: '启用：对话时自动注入当前位置模型信息',
     ctxPos: '插入位置 Position', ctxPosPrepend: 'prepend · 插入到首条 system 消息开头（无 system 则新建）', ctxPosAppend: 'append · 追加到消息末尾',
     ctxTemplate: '模板 Template', ctxTemplateHint: '占位符：{model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉说明（原生/代理/不支持）', ctxTemplatePh: '当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。',
@@ -581,7 +656,14 @@ var I18N = {
     dlpDedup: '内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段',
     dlpRepeatCheck: '跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）',
     dlpWarn: '跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）',
-    dlpThinkTag: '思考标签消毒（独立于总开关生效）：裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]，防止 ollama cloud 死循环（长上下文退化时模型会把字面 &lt;/thinking&gt; 泄漏进正文，客户端回放历史后上游渲染器在裸标签处截断消息历史导致死循环）',
+    dlpThinkTag: '思考标签消毒',
+    dlpThinkTagHint: '裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]，防止 ollama cloud 死循环（独立于下方「启用」生效）',
+    dlpThinkTagRequest: '请求侧消毒',
+    dlpThinkTagRequestHint: '客户端历史 → 上游：防止上游渲染器在裸标签处截断 assistant 历史',
+    dlpThinkTagResponse: '响应侧消毒',
+    dlpThinkTagResponseHint: '上游 → 客户端：阻止脏标签污染客户端会话历史（根治源头）',
+    dlpThinkTagRoles: '请求侧生效角色',
+    dlpThinkTagRolesHint: '默认只处理 assistant（死循环的真正污染源）；tool 工具输出里的字面标签多属内容的一部分，默认跳过以免误触发',
     dlpMaxRepeat: '连续重复熔断阈值 MaxRepeat（≥2，默认 3）',
     dlpRepeatEntries: '复读记录会话数上限 RepeatMaxEntries（默认 256，仅占内存，不影响判断精度）',
     dlpLimitRepeatEntries: '限制复读记录条数（关闭 = 不限条数）',
@@ -685,6 +767,15 @@ var I18N = {
     modelAlias: '🔖 Model Alias ModelAlias', modelAliasHint: 'Show friendly names for upstream model IDs', btnAddAlias: '＋ Add Alias',
     modelDetail: '📐 Model Detailed Settings ModelDetailedSettings', modelDetailHint: 'Override upstream values; VisionProxyModel sets a vision proxy for the main model', btnAddDetail: '＋ Add Model Setting',
     detailJumpPh: 'Jump to model…', detailJumpHint: 'Pick a model to scroll to its settings card', detailCountHint: 'Number of configured models',
+    btnFetchModels: '🔄 Fetch models', modelsFetching: 'Fetching…', modelsCount: '✅ {n} models',
+    modelsFetched: '✅ Fetched {n} models — click a model field to pick from the list',
+    modelsEmpty: '⚠️ Upstream returned no models',
+    modelsFetchFail: '❌ Failed to fetch model list: ',
+    modelPickHint: 'Click to pick from the upstream model list, or type manually',
+    mpNoModels: 'Model list not loaded yet<br>Click "🔄 Fetch models" at the top first',
+    mpNoMatch: 'No matching models',
+    mpCount: '{n} / {total} models',
+    mpKeyHint: '↑↓ select · Enter confirm · Esc close',
     ctxTitle: '🧭 Model Context Injection ModelContextPrompt', ctxHint: 'Appends current model info (ID/context length/max output) to the prompt, helping the model understand itself', ctxEnable: 'Enable: inject current model info into prompts on every request',
     ctxPos: 'Insert position Position', ctxPosPrepend: 'prepend · Insert at the start of the first system message (create one if none)', ctxPosAppend: 'append · Append to the end of messages',
     ctxTemplate: 'Template Template', ctxTemplateHint: 'Placeholders: {model} ID · {context_length} context length · {max_output_tokens} max output · {capabilities} capabilities · {vision} vision note (native/proxy/none)', ctxTemplatePh: 'You are running on the {model} model with a context window of {context_length} tokens, a max output of {max_output_tokens} tokens, and capabilities: {capabilities}. {vision}. Allocate your thinking and output length accordingly.',
@@ -692,7 +783,14 @@ var I18N = {
     dlpDedup: 'Content dedup (within a single response): skip blocks identical to the previous one, truncate fragments repeating the already-sent text',
     dlpRepeatCheck: 'Cross-request repeat check (across turns): flag as repetition when request and reply both match the previous round (stores each round reply)',
     dlpWarn: 'Cross-request warning injection: after tripping/repetition, inject a system warning into the next request so the AI stops repeating (once only)',
-    dlpThinkTag: 'Think-tag sanitization (independent of master switch): replace bare &lt;thinking&gt;/&lt;/thinking&gt; leaks with [THINK-START]/[THINK-END] to prevent ollama cloud loops (under long-context degeneration the model leaks a literal &lt;/thinking&gt; into text; when clients replay that history, the upstream renderer truncates the message at the bare tag, causing a loop)',
+    dlpThinkTag: 'Think-tag sanitization',
+    dlpThinkTagHint: 'Replace bare &lt;thinking&gt;/&lt;/thinking&gt; leaks with [THINK-START]/[THINK-END] to prevent ollama cloud loops (independent of the Enable switch below)',
+    dlpThinkTagRequest: 'Request-side sanitization',
+    dlpThinkTagRequestHint: 'Client history → upstream: prevents the upstream renderer from truncating assistant history at bare tags',
+    dlpThinkTagResponse: 'Response-side sanitization',
+    dlpThinkTagResponseHint: 'Upstream → client: stops dirty tags from polluting the client session history (root fix)',
+    dlpThinkTagRoles: 'Active roles (request side)',
+    dlpThinkTagRolesHint: 'Only assistant is handled by default (the real loop source); literal tags inside tool output are usually part of the content itself and are skipped to avoid false positives',
     dlpMaxRepeat: 'Consecutive repeat trip threshold MaxRepeat (≥2, default 3)',
     dlpRepeatEntries: 'Repeat record session limit RepeatMaxEntries (default 256, memory only, no effect on accuracy)',
     dlpLimitRepeatEntries: 'Limit repeat record count (off = unlimited)',
@@ -768,6 +866,9 @@ function applyI18n(){
   if(rb){ rb.textContent = t('rtRefresh'); }
   var cb = $('rtClearBtn');
   if(cb){ cb.textContent = t('rtClear'); }
+  // 模型选择器浮层：切语言时 renderDetails() 会重建卡片 DOM，
+  // 旧输入框节点被销毁 → 浮层失去锚点，直接关闭最稳妥（下次点开自然重定位）
+  if(typeof mpClose === 'function'){ mpClose(); }
   // 更新监听地址（含翻译）
   updateListenAddr();
 }
@@ -858,6 +959,218 @@ function onDetailModelInput(i, v){
   if(!state.details[i]){ return; }
   state.details[i].model = v;
   renderDetailJump();
+}
+
+// -------- 模型选择器：自定义可搜索下拉 --------
+// 从 /api/config/test 拉取上游 /models 的模型 ID 列表，供「详细设置」里的
+// 模型 / 视觉代理模型输入框下拉选择。
+// 为什么不用原生 <datalist>：候选框的间距、圆角、hover 高亮全部由系统渲染，无法自定义，
+// 在深色 UI 里始终显得突兀；这里用一个 position:fixed 浮层自己画，风格与页面完全一致。
+// 输入框仍是普通 text，随时可以手填（模型可能尚未部署到上游，或列表拉取失败）。
+
+var mpState = { input: null, items: [], active: -1, q: '' };
+
+function mpPanelEl(){ return $('mpPanel'); }
+
+// mpOpen 在指定输入框下方（空间不足则上方）展开候选面板
+// 打开时先展示【全部】候选：用户点开通常是想看有哪些可选，
+// 若按当前值预先过滤，反而只剩一条（当前值本身），失去浏览意义。
+// 当前值与候选相同的项会用绿色高亮（见 mpRender 的 mp-cur）。
+function mpOpen(input){
+  var p = mpPanelEl();
+  if(!p || !input){ return; }
+  mpState.input = input;
+  mpState.active = -1;
+  p.classList.remove('hidden');
+  mpRender('');
+  mpPosition(input);
+}
+
+function mpClose(){
+  var p = mpPanelEl();
+  if(p){ p.classList.add('hidden'); }
+  mpState.input = null;
+  mpState.active = -1;
+}
+
+// mpPosition 跟随输入框定位：下方空间够就往下弹，否则往上翻
+function mpPosition(input){
+  var p = mpPanelEl();
+  if(!p || !input || p.classList.contains('hidden')){ return; }
+  var r = input.getBoundingClientRect();
+  var ph = p.offsetHeight || 240;
+  var roomBelow = window.innerHeight - r.bottom;
+  var top = roomBelow > ph + 12 ? (r.bottom + 4) : Math.max(8, r.top - ph - 4);
+  p.style.left = Math.round(r.left) + 'px';
+  p.style.top = Math.round(top) + 'px';
+  p.style.width = Math.round(r.width) + 'px';
+}
+
+// mpRender 按关键词过滤后渲染候选列表（含底部提示，sticky 始终可见）
+// 过滤词记在 mpState.q 上：切语言等「非用户输入」的刷新场景要用同一个词重渲染，
+// 否则会被输入框当前值再过滤一次，列表莫名塌缩。
+function mpRender(q){
+  var p = mpPanelEl();
+  if(!p){ return; }
+  mpState.q = (q == null ? '' : String(q));
+  var all = state.modelOptions || [];
+  var kw = mpState.q.trim().toLowerCase();
+  var list = kw ? all.filter(function(x){ return x.toLowerCase().indexOf(kw) >= 0; }) : all.slice();
+  mpState.items = list;
+  if(mpState.active >= list.length){ mpState.active = -1; }
+  var cur = mpState.input ? String(mpState.input.value || '').trim() : '';
+  var html = '';
+  if(!all.length){
+    html = '<div class="mp-empty">' + t('mpNoModels') + '</div>';
+  } else if(!list.length){
+    html = '<div class="mp-empty">' + t('mpNoMatch') + '</div>';
+  } else {
+    for(var i = 0; i < list.length; i++){
+      // 与输入框当前值完全相同的项标绿，方便看出「已选中」
+      var cls = 'mp-item' + (i === mpState.active ? ' active' : '') + (list[i] === cur ? ' mp-cur' : '');
+      html += '<div class="' + cls + '" data-mp-idx="' + i + '" title="' + esc(list[i]) + '">' + esc(list[i]) + '</div>';
+    }
+  }
+  html += '<div class="mp-foot"><span>' + t('mpCount', { n: list.length, total: all.length }) +
+          '</span><span class="mp-kbd">' + t('mpKeyHint') + '</span></div>';
+  p.innerHTML = html;
+}
+
+// mpPick 选中第 idx 项：写回输入框并派发 input 事件（触发卡片上内联的 oninput → 同步 state）
+function mpPick(idx){
+  var input = mpState.input;
+  if(!input){ return; }
+  var val = mpState.items[idx];
+  if(val == null){ return; }
+  input.value = val;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  mpClose();
+  input.blur();
+}
+
+// mpSetActive 只切换高亮项，不重建列表。
+// ⚠️ 键盘导航绝不能调 mpRender(el.value)：那会按输入框当前值重新过滤，
+// 用户一按 ↓ 列表就塌缩成「只有当前值那一项」。
+function mpSetActive(i){
+  var p = mpPanelEl();
+  if(!p){ return; }
+  mpState.active = i;
+  var items = p.querySelectorAll('.mp-item');
+  for(var k = 0; k < items.length; k++){
+    items[k].classList.toggle('active', k === i);
+  }
+  mpScrollActive();
+}
+
+// 键盘导航：↑↓ 移动、Enter 确认、Esc 关闭、Tab 关闭
+function mpKeydown(e){
+  var p = mpPanelEl();
+  if(!p || p.classList.contains('hidden')){ return; }
+  var n = mpState.items.length;
+  if(e.key === 'ArrowDown'){
+    e.preventDefault();
+    if(n){ mpSetActive((mpState.active + 1) % n); }
+  } else if(e.key === 'ArrowUp'){
+    e.preventDefault();
+    if(n){ mpSetActive((mpState.active - 1 + n) % n); }
+  } else if(e.key === 'Enter'){
+    if(mpState.active >= 0){ e.preventDefault(); mpPick(mpState.active); }
+    else if(n === 1){ e.preventDefault(); mpPick(0); }  // 唯一候选直接选中
+    else { mpClose(); }
+  } else if(e.key === 'Escape' || e.key === 'Tab'){
+    mpClose();
+  }
+}
+
+function mpScrollActive(){
+  var p = mpPanelEl();
+  if(!p){ return; }
+  var el = p.querySelector('.mp-item.active');
+  if(el && el.scrollIntoView){ el.scrollIntoView({ block: 'nearest' }); }
+}
+
+// 全局委托：聚焦打开、输入过滤、键盘导航、点击外部关闭、滚动时跟随
+document.addEventListener('focusin', function(e){
+  var el = e.target;
+  if(el && el.classList && el.classList.contains('model-pick')){ mpOpen(el); }
+});
+document.addEventListener('input', function(e){
+  var el = e.target;
+  if(el && el.classList && el.classList.contains('model-pick') && mpState.input === el){
+    mpState.active = -1;
+    mpRender(el.value);
+    mpPosition(el);
+  }
+});
+// 点击输入框重新打开面板：Esc / 点击外部关闭后输入框仍保有焦点，
+// 此时再点它不会触发 focusin（焦点没变），必须靠 click 兜底，否则「关了就再也打不开」。
+document.addEventListener('click', function(e){
+  var el = e.target;
+  if(!el || !el.classList || !el.classList.contains('model-pick')){ return; }
+  var p = mpPanelEl();
+  if(p && p.classList.contains('hidden')){ mpOpen(el); }
+});
+document.addEventListener('keydown', function(e){
+  var el = e.target;
+  if(el && el.classList && el.classList.contains('model-pick')){ mpKeydown(e); }
+});
+// 用 mousedown 而不是 click：先 preventDefault 可避免输入框失焦导致面板提前关闭
+document.addEventListener('mousedown', function(e){
+  var p = mpPanelEl();
+  if(!p || p.classList.contains('hidden')){ return; }
+  var it = e.target && e.target.closest ? e.target.closest('.mp-item') : null;
+  if(it){
+    e.preventDefault();
+    mpPick(Number(it.getAttribute('data-mp-idx')));
+    return;
+  }
+  // 点在面板自身（滚动条/空白）或另一个 .model-pick 上都不关；其余位置关闭
+  if(p.contains(e.target)){ return; }
+  if(e.target && e.target.classList && e.target.classList.contains('model-pick')){ return; }
+  mpClose();
+});
+window.addEventListener('scroll', function(){
+  if(mpState.input){ mpPosition(mpState.input); }
+}, true);
+window.addEventListener('resize', function(){
+  if(mpState.input){ mpPosition(mpState.input); }
+});
+
+// fetchModelList 拉取上游模型列表。
+// btn 为 null 时表示静默调用（不显示提示）；silent=true 时失败也不弹错误。
+async function fetchModelList(btn, silent){
+  var oldHTML = btn ? btn.innerHTML : '';
+  if(btn){ btn.disabled = true; btn.innerHTML = t('modelsFetching'); }
+  try{
+    var res = await api('/api/config/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // 传当前表单值：用户可能刚改了 BASE/KEY 但还没保存
+      body: JSON.stringify({
+        OPENAI_BASE: $('OPENAI_BASE').value.trim(),
+        OPENAI_KEY: $('OPENAI_KEY').value.trim()
+      })
+    });
+    var models = (res && res.models) || [];
+    state.modelOptions = models;
+    state.modelsFetched = true;
+    // 面板正开着时立即刷新内容（沿用当前过滤词）
+    if(mpState.input){ mpRender(mpState.q); mpPosition(mpState.input); }
+    if(btn){ btn.innerHTML = t('modelsCount', { n: models.length }); }
+    if(!silent){
+      if(models.length){ toast(t('modelsFetched', { n: models.length }), 'ok'); }
+      else { toast(t('modelsEmpty'), 'err'); }
+    }
+  }catch(e){
+    if(btn){ btn.innerHTML = oldHTML; }
+    if(!silent){ toast(t('modelsFetchFail') + e.message, 'err'); }
+  }finally{
+    if(btn){
+      btn.disabled = false;
+      // 短暂显示结果数量后恢复按钮原文案
+      setTimeout(function(){ btn.innerHTML = t('btnFetchModels'); }, 2200);
+    }
+  }
 }
 
 function esc(s){
@@ -1062,6 +1375,15 @@ async function loadCfg(notify){
     $('DlpRepeatCheck').checked = !!dlp.RepeatCheck;
     $('DlpWarn').checked = !!dlp.Warn;
     $('DlpThinkTag').checked = dlp.ThinkTag !== false;
+    // 请求侧/响应侧：字段缺失时跟随总开关（与后端旧配置迁移保持一致）
+    $('DlpThinkTagRequest').checked = (dlp.ThinkTagRequest != null) ? !!dlp.ThinkTagRequest : (dlp.ThinkTag !== false);
+    $('DlpThinkTagResponse').checked = (dlp.ThinkTagResponse != null) ? !!dlp.ThinkTagResponse : (dlp.ThinkTag !== false);
+    // 请求侧生效角色：字段缺失时默认只处理 assistant
+    $('DlpThinkTagRoleAssistant').checked = (dlp.ThinkTagRoleAssistant != null) ? !!dlp.ThinkTagRoleAssistant : true;
+    $('DlpThinkTagRoleUser').checked = !!dlp.ThinkTagRoleUser;
+    $('DlpThinkTagRoleSystem').checked = !!dlp.ThinkTagRoleSystem;
+    $('DlpThinkTagRoleTool').checked = !!dlp.ThinkTagRoleTool;
+    toggleThinkTagInputs();
     $('DlpMaxRepeat').value = dlp.MaxRepeat || 3;
     $('DlpRepeatEntries').value = (dlp.RepeatMaxEntries != null) ? dlp.RepeatMaxEntries : 256;
     $('DlpRepeatTTL').value = (dlp.RepeatTTLMin != null) ? dlp.RepeatTTLMin : 30;
@@ -1103,6 +1425,8 @@ async function loadCfg(notify){
     }
     renderRules();
     updateListenAddr();
+    // 首次加载时静默拉一次上游模型列表（失败不打扰用户；之后靠「获取模型列表」按钮手动刷新）
+    if(!state.modelsFetched){ fetchModelList(null, true); }
     if(notify){ toast(t('toastReloaded')); }
   }catch(e){
     toast(t('toastLoadFail') + e.message, 'err');
@@ -1134,14 +1458,14 @@ function renderDetails(){
     el.id = 'detailCard_' + i; // 快速跳转定位用
     el.innerHTML =
       '<div class="item-head"><span class="name">' + t('lblModel') + '</span>' +
-      '<input type="text" class="mono" style="flex:1" value="' + esc(d.model) + '" placeholder="' + t('upModelIdPh2') + '" oninput="onDetailModelInput(' + i + ',this.value)">' +
+      '<input type="text" class="mono model-pick" style="flex:1" value="' + esc(d.model) + '" placeholder="' + t('upModelIdPh2') + '" oninput="onDetailModelInput(' + i + ',this.value)" title="' + t('modelPickHint') + '">' +
       '<button class="btn danger" onclick="removeAt(state.details,' + i + ',renderDetails)" title="' + t('btnDelete') + '">✕</button></div>' +
       '<div class="grid3">' +
       '<div class="row"><label>' + t('lblContextLength') + '</label><input type="number" min="0" value="' + esc(d.cl) + '" placeholder="1000000" oninput="state.details[' + i + '].cl=this.value"></div>' +
       '<div class="row"><label>' + t('lblMaxOutput') + '</label><input type="number" min="0" value="' + esc(d.mot) + '" placeholder="384000" oninput="state.details[' + i + '].mot=this.value"></div>' +
       '<div class="row"><label>' + t('lblCapsShort') + '</label><input type="text" value="' + esc(d.caps) + '" placeholder="tools, vision" oninput="state.details[' + i + '].caps=this.value"></div>' +
       '</div>' +
-      '<div class="row"><label>' + t('lblVisionProxyModel') + '</label><input type="text" class="mono" value="' + esc(d.vpm) + '" placeholder="gpt-4o" oninput="state.details[' + i + '].vpm=this.value"></div>' +
+      '<div class="row"><label>' + t('lblVisionProxyModel') + '</label><input type="text" class="mono model-pick" value="' + esc(d.vpm) + '" placeholder="gpt-4o" oninput="state.details[' + i + '].vpm=this.value" title="' + t('modelPickHint') + '"></div>' +
       '<div class="row"><label>' + t('lblVisionProxyPrompt') + '</label><textarea rows="2" placeholder="' + t('visionProxyPh') + '" oninput="state.details[' + i + '].vpp=this.value">' + esc(d.vpp) + '</textarea></div>' +
       '<div class="row"><label>' + t('lblGifNormalizeShort') + '</label>' +
       '<select onchange="state.details[' + i + '].gif=this.value">' +
@@ -1262,6 +1586,19 @@ function toggleRepeatInputs(){
     row.classList.toggle('disabled-row', !$(p[0]).checked);
   });
 }
+
+// 思考标签消毒：三级联动（总开关 → 请求侧/响应侧 → 请求侧生效角色）
+// 注意：整组独立于 DoomLoopProtection.Enable，不受总开关置灰影响
+function toggleThinkTagInputs(){
+  var on = $('DlpThinkTag').checked;
+  var reqOn = on && $('DlpThinkTagRequest').checked;
+  ['rowDlpThinkTagRequest','rowDlpThinkTagResponse'].forEach(function(id){
+    var row = $(id); if(row){ row.classList.toggle('disabled-row', !on); }
+  });
+  // 请求侧关闭时，角色勾选无意义 → 置灰
+  var roleRow = $('rowDlpThinkTagRoles');
+  if(roleRow){ roleRow.classList.toggle('disabled-row', !reqOn); }
+}
 function toggleVisionQualityInputs(){
   var row = $('rowVisionCustomPercent');
   if(row){ row.style.display = $('VisionImageQuality').value === 'custom' ? '' : 'none'; }
@@ -1360,6 +1697,12 @@ function collectCfg(){
       Dedup: $('DlpDedup').checked,
       Warn: $('DlpWarn').checked,
       ThinkTag: $('DlpThinkTag').checked,
+      ThinkTagRequest: $('DlpThinkTagRequest').checked,
+      ThinkTagResponse: $('DlpThinkTagResponse').checked,
+      ThinkTagRoleAssistant: $('DlpThinkTagRoleAssistant').checked,
+      ThinkTagRoleUser: $('DlpThinkTagRoleUser').checked,
+      ThinkTagRoleSystem: $('DlpThinkTagRoleSystem').checked,
+      ThinkTagRoleTool: $('DlpThinkTagRoleTool').checked,
       MaxRepeat: parseInt($('DlpMaxRepeat').value, 10) || 3,
       RepeatMaxEntries: (function(){ var v = parseInt($('DlpRepeatEntries').value, 10); return isNaN(v) ? 256 : v; })(),
       LimitRepeatEntries: $('DlpLimitRepeatEntries').checked,

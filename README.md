@@ -120,7 +120,7 @@
 - **自动获取模型列表**：启动时显示上游所有可用模型及其别名映射、上下文长度、最大输出
 - **流式策略**：支持 `preserve` / `force_stream` / `force_close` 三种模式灵活切换
 - **日志分级**：可分别控制请求头(`Log_Headers`)、请求体(`Log_Body`)、响应内容(`Log_Responses`)的日志打印
-- **模型详细设置**：`ModelDetailedSettings` 支持为每个模型单独指定上下文长度、最大输出 Token 和能力列表
+- **模型详细设置**：`ModelDetailedSettings` 支持为每个模型单独指定上下文长度、最大输出 Token 和能力列表；模型名/视觉代理模型输入框支持从上游 `/v1/models` 拉取列表后**可搜索下拉选择**（自定义浮层，同时保留手动输入）
 - **视觉代理模型**：`VisionProxyModel` 为主模型指定视觉代理，图片请求自动识别后合并文本，识别结果本地缓存防重复消耗 token
 - **请求提示词替换**：`RequestPromptReplace` 支持自动替换请求消息中的指定文本，实现 Copilot 自有提示词篡改等高级玩法
 - **模型上下文注入**：`ModelContextPrompt` 在对话时自动把当前模型信息（模型ID/上下文长度/最大输出/能力/视觉说明）注入提示词，让 AI 自我认知，更合理地规划思考与输出长度
@@ -244,6 +244,12 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
         "MaxRepeat": 3,
         "WarnPrompt": "",
         "ThinkTag": true,
+        "ThinkTagRequest": true,
+        "ThinkTagResponse": true,
+        "ThinkTagRoleAssistant": true,
+        "ThinkTagRoleUser": false,
+        "ThinkTagRoleSystem": false,
+        "ThinkTagRoleTool": false,
         "LimitRepeatEntries": true,
         "RepeatMaxEntries": 256,
         "LimitRepeatTTL": true,
@@ -280,7 +286,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `ConnPool`              | 上游连接池设置`{MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}`                          | 内置默认（见下表）                                                                                                                                                |
 | `ProxyLimit`            | 过载保护`{Enable, LimitConcurrency, MaxConcurrent, LimitQueueTimeout, QueueTimeoutSec, LimitRequestBody, MaxRequestBodyMB}`（防高并发 OOM，立即生效） | `{Enable:false, LimitConcurrency:true, MaxConcurrent:32, LimitQueueTimeout:true, QueueTimeoutSec:60, LimitRequestBody:false, MaxRequestBodyMB:32}`                |
 | `ServerTimeout`         | 入站服务器超时`{LimitReadHeader, ReadHeaderTimeoutSec, LimitIdle, IdleTimeoutSec, LimitMaxHeader, MaxHeaderMB}`（**需重启生效**）                     | `{LimitReadHeader:true, ReadHeaderTimeoutSec:30, LimitIdle:true, IdleTimeoutSec:120, LimitMaxHeader:true, MaxHeaderMB:1}`                                         |
-| `DoomLoopProtection`    | 末日循环保护`{Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt, ThinkTag, LimitRepeatEntries, RepeatMaxEntries, LimitRepeatTTL, RepeatTTLMin}`       | `{Enable:false, Dedup:false, RepeatCheck:false, MaxRepeat:3, ThinkTag:true, LimitRepeatEntries:true, RepeatMaxEntries:256, LimitRepeatTTL:true, RepeatTTLMin:30}` |
+| `DoomLoopProtection`    | 末日循环保护`{Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt, ThinkTag, ThinkTagRequest, ThinkTagResponse, ThinkTagRoleAssistant, ThinkTagRoleUser, ThinkTagRoleSystem, ThinkTagRoleTool, LimitRepeatEntries, RepeatMaxEntries, LimitRepeatTTL, RepeatTTLMin}`       | `{Enable:false, Dedup:false, RepeatCheck:false, MaxRepeat:3, ThinkTag:true, ThinkTagRequest:true, ThinkTagResponse:true, ThinkTagRoleAssistant:true, ThinkTagRoleUser:false, ThinkTagRoleSystem:false, ThinkTagRoleTool:false, LimitRepeatEntries:true, RepeatMaxEntries:256, LimitRepeatTTL:true, RepeatTTLMin:30}` |
 | `RealtimeLog`           | 实时请求查看`{Enable, MaxEntries, MaxBodyLen}`（内存记录，不写磁盘）                                                                                  | `{Enable:true, MaxEntries:100, MaxBodyLen:8000}`                                                                                                                  |
 
 **`StreamMode` 说明**：
@@ -422,7 +428,7 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | 🚨**末日循环保护**     | 可视化配置`DoomLoopProtection`（总开关 + 去重/复读检测/熔断阈值/警告提示词，分级置灰联动）                                                     |
 | 📡**实时请求**         | 实时查看每一笔请求（SSE 推送 + 手动刷新），展开查看原始请求体/转发上游请求体/响应体，自动标记触发的保护，可暂停/清空/隐藏探活请求              |
 | 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                                                                                    |
-| 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力、视觉代理模型与提示词）                                                          |
+| 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力、视觉代理模型与提示词）；顶部「🔄 获取模型列表」可拉取上游模型供下拉选择 |
 | ✂️**提示词替换规则** | 可视化增删`RequestPromptReplace` 规则                                                                                                          |
 
 保存后配置**立即写入 `config.json` 并同步到运行内存**（除 `IP`/`PORT` 外均即时生效），支持 `Ctrl+S` 快捷保存。
@@ -543,7 +549,11 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
                      检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),
                      并在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)
                      RepeatCheck 需记录每轮回复摘要,且可能误伤正常重复提问,默认关闭
-                     ThinkTag 思考标签消毒(独立于 Enable 生效,默认开启): 防 ollama cloud 死循环
+                     ThinkTag 思考标签消毒总开关(独立于 Enable 生效,默认开启): 防 ollama cloud 死循环
+                     ThinkTagRequest 请求侧消毒(默认开启): 客户端历史 → 上游, 防上游截断 assistant 历史
+                     ThinkTagResponse 响应侧消毒(默认开启): 上游 → 客户端, 防脏标签污染客户端历史(根治)
+                     ThinkTagRoleAssistant/User/System/Tool 请求侧生效角色(默认只处理 assistant)
+                       死循环污染源是 assistant 历史被回放; tool 工具输出里的字面标签多属内容的一部分, 默认不处理以免误触发
                      LimitRepeatEntries/RepeatMaxEntries: 复读记录条数上限(默认 256)
                      LimitRepeatTTL/RepeatTTLMin: 复读记录有效期(默认 30 分钟)
  ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启
@@ -710,7 +720,13 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 | `RepeatCheck`        | bool   | 跨请求复读检测：请求签名 + 回复与上一轮相同 → 判定复读（默认关闭；记录只存 SHA-256 摘要，内存与回复长短无关，但"相同请求+相同回复"仍可能误伤正常重复提问） |
 | `MaxRepeat`          | int    | 连续重复熔断阈值（≥2 生效，默认 3）                                                                                                                        |
 | `WarnPrompt`         | string | 跨请求注入的警告提示词（留空=内置默认）                                                                                                                     |
-| `ThinkTag`           | bool   | 思考标签消毒（独立于 `Enable` 生效，默认开启）                                                                                                              |
+| `ThinkTag`           | bool   | 思考标签消毒总开关（独立于 `Enable` 生效，默认开启）                                                                                                        |
+| `ThinkTagRequest`    | bool   | 请求侧消毒：客户端历史 → 上游（默认开启）；关闭后不再处理历史里的裸闭标签，只保留响应侧根治                                                              |
+| `ThinkTagResponse`   | bool   | 响应侧消毒：上游 → 客户端（默认开启）；阻止脏标签污染客户端会话历史                                                                                          |
+| `ThinkTagRoleAssistant` | bool | 请求侧只处理 `assistant` 消息（默认 `true`，真正会导致上游截断历史的角色）                                                                                |
+| `ThinkTagRoleUser`   | bool   | 请求侧处理 `user` 消息（默认 `false`）                                                                                                                      |
+| `ThinkTagRoleSystem` | bool   | 请求侧处理 `system` 消息，含 Anthropic 顶层 `system`（默认 `false`）                                                                                        |
+| `ThinkTagRoleTool`   | bool   | 请求侧处理 `tool` / `function` 工具结果（默认 `false`；工具输出里的字面标签多属内容的一部分，开了会频繁误触发徽章）                                              |
 | `LimitRepeatEntries` | bool   | 是否限制复读记录条数；`false` = 不限条数（map 可无限增长）                                                                                                  |
 | `RepeatMaxEntries`   | int    | 复读记录会话数上限（`0` = 默认 256，上限 10000）                                                                                                            |
 | `LimitRepeatTTL`     | bool   | 是否限制复读记录有效期；`false` = 永不过期                                                                                                                  |
@@ -724,6 +740,9 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 - **跨请求提醒（C 方案）**：熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）
 - **assistant 循环检测**：仅统计「连续段」内的重复——`user`/`system` 消息视为对话边界重置连续性，长会话中相隔多轮的重复调用（如先后两次读同一文件）不会误报；签名兼容 string/对象两种 arguments 形态，空 content 消息不参与检测；命中后警告注入带 **10 分钟冷却**（同一会话只提醒一次，避免污染上下文）
 - **多客户端隔离**：所有跨请求保护状态（警告标记/复读记录/冷却）以 `客户端IP + User-Agent 指纹` 为会话 key——同一台机器上同时运行 VS Code / VS2026 / Cherry Studio 等多个客户端时，各自状态互不污染（A 的熔断警告不会被 B 偷走，A 的冷却不会消耗 B 的额度）
+- **思考标签消毒分两侧 + 按角色生效**：`ThinkTagResponse`（响应侧，根治）挡住上游泄漏进入客户端历史；`ThinkTagRequest`（请求侧，兜底）防止上游渲染器截断 assistant 历史。
+  请求侧默认**只处理 `assistant`**，因为死循环的真正污染源是 assistant 历史被回放；`tool` 工具输出里的字面标签多属内容的一部分（如阅读源码时返回的文本），默认不处理，避免实时记录每轮都亮「请求侧思考标签消毒」徽章掩盖真正的异常。
+  两侧均**只替换裸闭标签 `</thinking>`**（才是上游 `SplitN` 截断历史的触发点）；裸开标签 `<thinking>` 与配对完整的 `<thinking>...</thinking>` 一律原样保留——裸开标签本身无害，无差别替换会让「讨论标签本身」的正常对话反复误报
 - 去重只影响 `content` 字段，`tool_calls` / `usage` / `finish_reason` / SSE 事件顺序全部保持原样
 - **复读记录只存摘要**：跨请求复读记录存的是请求签名与回复的 **SHA-256 摘要**（各 32 字节），而非回复全文——
   一方面内存与回复长短完全无关（256 条≈ 16KB），另一方面**摘要比对等价于全文精确比对**，
@@ -739,6 +758,12 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
     "MaxRepeat": 3,
     "WarnPrompt": "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。",
     "ThinkTag": true,
+    "ThinkTagRequest": true,
+    "ThinkTagResponse": true,
+    "ThinkTagRoleAssistant": true,
+    "ThinkTagRoleUser": false,
+    "ThinkTagRoleSystem": false,
+    "ThinkTagRoleTool": false,
     "LimitRepeatEntries": true,
     "RepeatMaxEntries": 256,
     "LimitRepeatTTL": true,
