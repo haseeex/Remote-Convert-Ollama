@@ -929,26 +929,100 @@ func proxyKeysHasValid() bool {
 	return false
 }
 
-// lastReasoningContent 存储上一个 assistant 响应的 reasoning_content，
-// 因为 DeepSeek 思考模式要求客户端下次请求时必须传回这个字段。
-// 如果 Cherry Studio 没有自动带上，我们就在转发时自动注入。
-var (
-	lastReasoningContent string
-	rcMutex              sync.RWMutex
+// ==================== DeepSeek 思考模式：reasoning_content 跨请求追踪 ====================
+//
+// 背景：DeepSeek 思考模式要求客户端下次请求时把上一轮的 reasoning_content 传回上游，
+// 但部分客户端（Cherry Studio 等）不会自动带上，因此网关在转发时做兜底注入。
+//
+// ⚠️ 旧实现是一个全局字符串变量，存在三个严重问题：
+//
+//	① 多模型串号：deepseek 的推理内容会被注入给 gpt-4o 等不相干的模型
+//	② 多客户端串号：A 客户端的推理内容会注入到 B 客户端的请求里
+//	③ 历史污染：给所有 assistant 消息都塞同一段推理（应只给最后一条）
+//
+// 现改为按 【会话(IP+UA指纹) | 模型ID】 隔离：
+//   - 按模型隔离 → 推理内容绝不会跨模型串号（按模型ID严格匹配）
+//   - 保留有效期 → 思考内容只对紧接的下一轮有意义，超时自动失效
+//   - 条数上限   → 防止长期运行后 map 无限增长
+const (
+	reasoningMaxEntries = 256              // 最多跟踪的「会话|模型」组合数
+	reasoningTTL        = 30 * time.Minute // 记录有效期（超过则视为陈旧，不再注入）
 )
 
-// setLastReasoningContent 线程安全地设置 lastReasoningContent
-func setLastReasoningContent(rc string) {
-	rcMutex.Lock()
-	lastReasoningContent = rc
-	rcMutex.Unlock()
+type reasoningEntry struct {
+	content string
+	at      time.Time
 }
 
-// getLastReasoningContent 线程安全地获取 lastReasoningContent
-func getLastReasoningContent() string {
-	rcMutex.RLock()
-	defer rcMutex.RUnlock()
-	return lastReasoningContent
+var lastReasoning = struct {
+	sync.Mutex
+	m map[string]reasoningEntry
+}{m: make(map[string]reasoningEntry)}
+
+// reasoningKey 生成 reasoning 记录的键：会话(IP+UA指纹) + 模型ID。
+// 返回空串表示无法定位（缺少请求或模型），调用方应跳过存取。
+func reasoningKey(r *http.Request, model string) string {
+	if r == nil || model == "" {
+		return ""
+	}
+	return clientSessionKey(r) + "|" + model
+}
+
+// setLastReasoning 保存某会话某模型最近一轮的 reasoning_content。
+// 超上限时先清理过期项，仍超限则淘汰最旧的一条。
+func setLastReasoning(r *http.Request, model, rc string) {
+	if rc == "" {
+		return
+	}
+	key := reasoningKey(r, model)
+	if key == "" {
+		return
+	}
+	now := time.Now()
+
+	lastReasoning.Lock()
+	defer lastReasoning.Unlock()
+	if len(lastReasoning.m) >= reasoningMaxEntries {
+		for k, e := range lastReasoning.m {
+			if now.Sub(e.at) > reasoningTTL {
+				delete(lastReasoning.m, k)
+			}
+		}
+		if len(lastReasoning.m) >= reasoningMaxEntries {
+			oldestKey := ""
+			var oldestAt time.Time
+			first := true
+			for k, e := range lastReasoning.m {
+				if first || e.at.Before(oldestAt) {
+					oldestKey, oldestAt, first = k, e.at, false
+				}
+			}
+			if oldestKey != "" {
+				delete(lastReasoning.m, oldestKey)
+			}
+		}
+	}
+	lastReasoning.m[key] = reasoningEntry{content: rc, at: now}
+}
+
+// getLastReasoning 取某会话某模型最近一轮的 reasoning_content，
+// 取不到或已超过有效期时返回空串（调用方据此跳过注入）。
+func getLastReasoning(r *http.Request, model string) string {
+	key := reasoningKey(r, model)
+	if key == "" {
+		return ""
+	}
+	lastReasoning.Lock()
+	defer lastReasoning.Unlock()
+	e, ok := lastReasoning.m[key]
+	if !ok {
+		return ""
+	}
+	if time.Since(e.at) > reasoningTTL {
+		delete(lastReasoning.m, key)
+		return ""
+	}
+	return e.content
 }
 
 const encryptedKeyPrefix = "已加密|"
@@ -1195,16 +1269,96 @@ func extractToolCalls(msg map[string]interface{}) []OllamaToolCall {
 	return result
 }
 
+// injectReasoningIntoOpenAIBody 给 OpenAI 协议的请求体补齐 reasoning_content。
+//
+// 为什么需要单独的函数：openaiChat / openaiChatStream 是【透传模式】，
+// 原样把客户端 body 转发上游，不经过 convertMessagesToOpenAI（那是 Ollama 协议专用），
+// 所以 reasoning_content 的兜底注入在 OpenAI 路径上原本完全缺失。
+//
+// 规则与 convertMessagesToOpenAI 保持一致：
+//   - 只给【最后一条】assistant 消息补齐（历史消息带旧推理会污染语义、白涨 token）
+//   - 客户端已自带 reasoning_content 时不覆盖
+//   - 按【会话+模型】取，不同模型/不同客户端互不串号
+//
+// [高并发内存安全] 先用字节标记预检，无 assistant 消息（如首轮）直接返回，不反序列化。
+func injectReasoningIntoOpenAIBody(body []byte, r *http.Request, model string) []byte {
+	if len(body) == 0 || model == "" {
+		return body
+	}
+	if !bytes.Contains(body, []byte(`"assistant"`)) {
+		return body // 没有 assistant 消息，无需注入
+	}
+	rc := getLastReasoning(r, model)
+	if rc == "" {
+		return body
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	messages, ok := req["messages"].([]interface{})
+	if !ok || len(messages) == 0 {
+		return body
+	}
+
+	// 定位最后一条 assistant 消息
+	lastIdx := -1
+	for i, raw := range messages {
+		if m, ok := raw.(map[string]interface{}); ok {
+			if role, _ := m["role"].(string); role == "assistant" {
+				lastIdx = i
+			}
+		}
+	}
+	if lastIdx < 0 {
+		return body
+	}
+	target, ok := messages[lastIdx].(map[string]interface{})
+	if !ok {
+		return body
+	}
+	if _, has := target["reasoning_content"]; has {
+		return body // 客户端已经带了，尊重客户端值
+	}
+	target["reasoning_content"] = rc
+	req["messages"] = messages
+
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	fmt.Printf("🧠 reasoning 兜底注入 [%s]: 已补齐最后一条 assistant 消息\n", model)
+	return newBody
+}
+
 // convertMessagesToOpenAI 将 Ollama 格式的消息列表转为 OpenAI 格式
 // 关键：维护 tool_call_id 闭环 —— assistant.tool_calls[].id 与后续 tool 消息的
 // tool_call_id 必须严格配对，否则上游 API 无法关联工具结果，
 // 模型会认为"调用没有返回结果"而反复重试同一调用（Agent 死循环的根源）
-func convertMessagesToOpenAI(messages []interface{}) []interface{} {
+//
+// r / model 用于 DeepSeek 思考模式的 reasoning_content 兜底注入：
+// 按【会话+模型】取本轮的推理内容，只给【最后一条】assistant 消息注入。
+func convertMessagesToOpenAI(messages []interface{}, r *http.Request, model string) []interface{} {
 	var result []interface{}
 	toolCallSeq := 0            // 本请求内 tool_call id 生成序号
 	var pendingToolIDs []string // 待消费的 tool_call id 队列（assistant 声明 → tool 消息按序消费）
 
-	for _, msg := range messages {
+	// 定位最后一条 assistant 消息的下标：
+	// 思考内容只属于最近一轮，旧实现给所有历史 assistant 消息都塞同一段推理，
+	// 既让上下文白涨（推理文本常几千字 × N 条），又让早期回复带上后期推理而语义错乱。
+	lastAssistantIdx := -1
+	for i, msg := range messages {
+		if m, ok := msg.(map[string]interface{}); ok {
+			if role, _ := m["role"].(string); role == "assistant" {
+				lastAssistantIdx = i
+			}
+		}
+	}
+	// 按【会话+模型】取本轮的 reasoning；取不到（无记录/已过期/模型不匹配）则为空，不注入
+	pendingReasoning := getLastReasoning(r, model)
+
+	for idx, msg := range messages {
 		msgMap, ok := msg.(map[string]interface{})
 		if !ok {
 			result = append(result, msg)
@@ -1240,15 +1394,18 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 
 		// 处理 assistant 消息中的 tool_calls（转换为 OpenAI 格式）
 		if role == "assistant" {
-			// DeepSeek 思考模式：如果客户端没带 reasoning_content，但我们有存储，就自动注入
-			if _, hasRC := msgMap["reasoning_content"]; !hasRC && getLastReasoningContent() != "" {
-				// 创建一个新 map 避免修改原始 msg 的 map
-				newMsg := make(map[string]interface{})
-				for k, v := range msgMap {
-					newMsg[k] = v
+			// DeepSeek 思考模式：只给最后一条 assistant 消息补齐 reasoning_content
+			// （客户端未带、且本会话本模型确有上一轮推理时才补）
+			if idx == lastAssistantIdx && pendingReasoning != "" {
+				if _, hasRC := msgMap["reasoning_content"]; !hasRC {
+					// 创建一个新 map 避免修改原始 msg 的 map
+					newMsg := make(map[string]interface{})
+					for k, v := range msgMap {
+						newMsg[k] = v
+					}
+					newMsg["reasoning_content"] = pendingReasoning
+					msgMap = newMsg
 				}
-				newMsg["reasoning_content"] = getLastReasoningContent()
-				msgMap = newMsg
 			}
 
 			tcRaw, hasTC := msgMap["tool_calls"]
@@ -5035,8 +5192,8 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 
 	var messages []interface{}
 	if rawMessages, ok := req["messages"].([]interface{}); ok {
-		// 将 Ollama 格式的消息转为 OpenAI 格式
-		messages = convertMessagesToOpenAI(rawMessages)
+		// 将 Ollama 格式的消息转为 OpenAI 格式（同时按会话+模型补齐 reasoning_content）
+		messages = convertMessagesToOpenAI(rawMessages, r, model)
 	} else if prompt, ok := req["prompt"].(string); ok {
 		messages = []interface{}{
 			map[string]interface{}{"role": "user", "content": prompt},
@@ -5147,9 +5304,9 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		markDlpReason(r, reason)
 	}
 
-	// 保存 reasoning_content，供后续请求自动注入
+	// 保存本轮 reasoning_content（按会话+模型隔离），供该模型下一轮请求兜底注入
 	if reasoningContent != "" {
-		setLastReasoningContent(reasoningContent)
+		setLastReasoning(r, model, reasoningContent)
 	}
 
 	// 提取上游 usage（真实 token 计数）
@@ -5554,9 +5711,9 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 		sendOllamaChunk("", true, outputTokens, nil, reasoningContent.String())
 	}
 
-	// 保存 reasoning_content，供后续请求自动注入
+	// 保存本轮 reasoning_content（按会话+模型隔离），供该模型下一轮请求兜底注入
 	if rc := reasoningContent.String(); rc != "" {
-		setLastReasoningContent(rc)
+		setLastReasoning(r, model, rc)
 	}
 
 	// 末日循环保护：思考标签消毒汇总（每轮一条日志，避免逐块刷屏）
@@ -5576,11 +5733,16 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 func openaiChat(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 
-	// 判断是否为流式请求
+	// 判断是否为流式请求（同时取出模型 ID，供 reasoning 按模型隔离使用）
 	var reqMeta struct {
-		Stream bool `json:"stream"`
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
 	}
 	json.Unmarshal(body, &reqMeta)
+
+	// DeepSeek 思考模式：OpenAI 协议是透传路径（不走 convertMessagesToOpenAI），
+	// 在此统一补齐 reasoning_content —— 放在流式分派之前，流式/非流式都能覆盖。
+	body = injectReasoningIntoOpenAIBody(body, r, reqMeta.Model)
 
 	if reqMeta.Stream {
 		openaiChatStream(w, r, body)
@@ -5662,7 +5824,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 			if choice, ok := choices[0].(map[string]interface{}); ok {
 				if msg, ok := choice["message"].(map[string]interface{}); ok {
 					if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
-						setLastReasoningContent(rc)
+						setLastReasoning(r, reqMeta.Model, rc)
 						// VS Code 兼容：将 reasoning_content 映射为 reasoning_text
 						if _, exists := msg["reasoning_text"]; !exists {
 							msg["reasoning_text"] = rc
@@ -5799,16 +5961,30 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	// usage 追踪：上游流式可能只在末尾发 usage-only chunk，也可能完全不发，
 	// 需要记录并转发/兜底，保证 VS Code 上下文窗口占用显示不为 0
 	hasUpstreamUsage := false
-	// 预解析请求消息列表，用于上游未返回 usage 时的本地估算兜底
+	// 预解析请求消息列表（用于 usage 兜底估算）与模型 ID（用于 reasoning 按模型隔离）
 	var requestMessages []interface{}
+	requestModel := ""
 	{
 		var reqMeta struct {
+			Model    string        `json:"model"`
 			Messages []interface{} `json:"messages"`
 		}
 		if json.Unmarshal(body, &reqMeta) == nil {
 			requestMessages = reqMeta.Messages
+			requestModel = reqMeta.Model
 		}
 	}
+
+	// 累积本轮 reasoning_content，供【同会话同模型】的下一轮请求兜底注入。
+	// 用 defer 保证无论从哪个分支 return（含熔断提前返回）都能保存。
+	// 无条件累积（不因 thinkingDone 后删字段而丢失）：与 ollamaChatStream 保持一致，
+	// 正文开始后上游仍可能交错输出思考碎片，这些也属于本轮推理内容。
+	var reasoningAccum strings.Builder
+	defer func() {
+		if rc := reasoningAccum.String(); rc != "" {
+			setLastReasoning(r, requestModel, rc)
+		}
+	}()
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -5906,6 +6082,10 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 				var deltaMap map[string]interface{}
 				if err := json.Unmarshal(choice.Delta, &deltaMap); err == nil {
 					delta = deltaMap
+					// 累积本轮推理内容（在 thinkingDone 删除字段前取，避免漏记）
+					if rc, ok := deltaMap["reasoning_content"].(string); ok && rc != "" {
+						reasoningAccum.WriteString(rc)
+					}
 					// 检查是否已有 content → 标记 thinking 结束
 					if c, ok := deltaMap["content"].(string); ok && c != "" {
 						// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
