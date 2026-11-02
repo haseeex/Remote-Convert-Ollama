@@ -35,3 +35,6 @@ go.work.sum
 
 # 忽略视觉代理识别缓存目录
 vision_cache/
+
+# 本地开发用的 XCA 证书目录（含私钥，绝不入库）
+xca/
