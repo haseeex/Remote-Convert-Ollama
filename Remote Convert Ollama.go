@@ -43,6 +43,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -109,17 +110,71 @@ type DoomLoopProtection struct {
 	// config.json 里没有该字段 → 前端重新加载拿到 undefined 被 "!== false" 误判为开启
 	// （开关"关不掉"），且重启时"旧配置升级"逻辑还会把缺失字段补回默认开启
 	ThinkTag bool `json:"ThinkTag"`
+	// RepeatMaxEntries 跨请求复读记录的会话数上限（LimitRepeatEntries=true 时生效）
+	LimitRepeatEntries bool `json:"LimitRepeatEntries"` // true=限制条数 / false=不限条数（map 可无限增长）
+	RepeatMaxEntries   int  `json:"RepeatMaxEntries"`   // 会话数上限（0=默认 256，上限 10000；记录只存 SHA-256 摘要）
+	// RepeatTTLMin 跨请求复读记录的有效期
+	LimitRepeatTTL bool `json:"LimitRepeatTTL"` // true=按 RepeatTTLMin 过期 / false=永不过期
+	RepeatTTLMin   int  `json:"RepeatTTLMin"`   // 有效期分钟（0=默认 30，上限 1440）
 }
 
 // defaultDoomLoopWarnPrompt 默认跨请求警告提示词
 const defaultDoomLoopWarnPrompt = "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"
 
-// normalizeDoomLoop 规范化配置：MaxRepeat 非法值回退为 3
+// 跨请求复读记录的默认上限（配置缺失/非法时的兜底值）
+const (
+	defaultRepeatMaxEntries = 256     // 最多跟踪的会话数
+	defaultRepeatTTLMin     = 30      // 记录有效期（分钟）
+	maxRepeatMaxEntries     = 10000   // 会话数上限（防误配置吃内存）
+	maxRepeatTTLMin         = 24 * 60 // 有效期上限（分钟，24 小时）
+)
+
+// normalizeDoomLoop 规范化配置：
+// MaxRepeat 非法值回退为 3；复读记录上限 0/越界回退默认；旧版 -1 迁移为「不限制」
 func normalizeDoomLoop(d DoomLoopProtection) DoomLoopProtection {
-	if d.MaxRepeat < 2 {
+	if d.MaxRepeat < 2 || d.MaxRepeat > 20 {
 		d.MaxRepeat = 3
 	}
+	// 旧版用 -1 表示不限制（负数），迁移为布尔开关
+	if d.RepeatMaxEntries < 0 {
+		d.LimitRepeatEntries = false
+		d.RepeatMaxEntries = defaultRepeatMaxEntries
+	} else if d.RepeatMaxEntries == 0 || d.RepeatMaxEntries > maxRepeatMaxEntries {
+		d.RepeatMaxEntries = defaultRepeatMaxEntries
+	}
+	if d.RepeatTTLMin < 0 {
+		d.LimitRepeatTTL = false
+		d.RepeatTTLMin = defaultRepeatTTLMin
+	} else if d.RepeatTTLMin == 0 || d.RepeatTTLMin > maxRepeatTTLMin {
+		d.RepeatTTLMin = defaultRepeatTTLMin
+	}
 	return d
+}
+
+// repeatEntryLimit 复读记录会话数上限（运行时读配置）。
+// 第二个返回值 false 表示不限制条数（LimitRepeatEntries 关闭）。
+func repeatEntryLimit() (int, bool) {
+	if !cfg.DoomLoopProtection.LimitRepeatEntries {
+		return 0, false
+	}
+	n := cfg.DoomLoopProtection.RepeatMaxEntries
+	if n <= 0 || n > maxRepeatMaxEntries {
+		n = defaultRepeatMaxEntries
+	}
+	return n, true
+}
+
+// repeatTTL 复读记录有效期（运行时读配置）。
+// 第二个返回值 false 表示不过期（LimitRepeatTTL 关闭）。
+func repeatTTL() (time.Duration, bool) {
+	if !cfg.DoomLoopProtection.LimitRepeatTTL {
+		return 0, false
+	}
+	n := cfg.DoomLoopProtection.RepeatTTLMin
+	if n <= 0 || n > maxRepeatTTLMin {
+		n = defaultRepeatTTLMin
+	}
+	return time.Duration(n) * time.Minute, true
 }
 
 // 末日循环保护：跨请求提醒状态（C 方案）
@@ -325,6 +380,10 @@ type Config struct {
 	DoomLoopProtection DoomLoopProtection `json:"DoomLoopProtection,omitempty"`
 	// ConnPool 上游连接池设置（HTTP/2 + keep-alive），保存后立即生效，无需重启
 	ConnPool ConnPool `json:"ConnPool,omitempty"`
+	// ProxyLimit 过载保护：并发闸门 + 请求体上限（防高并发 OOM），保存后立即生效
+	ProxyLimit ProxyLimit `json:"ProxyLimit,omitempty"`
+	// ServerTimeout 入站 HTTP 服务器超时（防慢速连接堆积），修改需重启程序生效
+	ServerTimeout ServerTimeout `json:"ServerTimeout,omitempty"`
 	// RealtimeLog 实时请求查看：内存记录最近的请求与响应，供配置页面实时查看
 	RealtimeLog RealtimeLog `json:"RealtimeLog,omitempty"`
 }
@@ -367,6 +426,341 @@ func normalizeRealtimeLog(rl RealtimeLog) RealtimeLog {
 		rl.MaxBodyLen = 5000000
 	}
 	return rl
+}
+
+// ProxyLimit 过载保护：并发闸门 + 请求体上限。
+//
+// 为什么需要：高并发场景（尤其是带图片的请求）单个请求体可达数十 MB，
+// 若没有任何上限，内存占用会随并发数线性增长，最终被系统当作 OOM 静默杀掉
+// （进程直接消失、服务停止，日志里看不到任何错误）。两道闸门配合才能治本：
+//   - 并发闸门：同时处理的请求数超过上限时排队，排队超时返回 503，避免内存无限堆积
+//   - 请求体上限：超过限制直接返回 413，不做任何解析（连读都不读完）
+//
+// 两项均运行时立即生效（保存配置即可，无需重启）。
+//
+// 配置设计：「是否限制」用布尔开关表达，「限制值」用整数表达。
+// 不用魔法数字（如 -1=不限制 / 0=默认）——那种写法人和 AI 都容易误判。
+type ProxyLimit struct {
+	Enable bool `json:"Enable"` // 总开关
+
+	// 并发闸门：LimitConcurrency=false 时完全不限并发（所有请求直接放行）
+	LimitConcurrency bool `json:"LimitConcurrency"` // true=按 MaxConcurrent 限制 / false=不限并发
+	MaxConcurrent    int  `json:"MaxConcurrent"`    // 最大并发请求数（0=默认 32，上限 4096）
+
+	// 排队超时：LimitQueueTimeout=false 时排队不限时（只等客户端断开）
+	LimitQueueTimeout bool `json:"LimitQueueTimeout"` // true=排队超时返回 503 / false=不限时
+	QueueTimeoutSec   int  `json:"QueueTimeoutSec"`   // 排队超时秒数（0=默认 60，上限 3600）
+
+	// 请求体上限：LimitRequestBody=false 时完全不限请求体大小
+	LimitRequestBody bool `json:"LimitRequestBody"` // true=超限返回 413 / false=不限大小
+	MaxRequestBodyMB int  `json:"MaxRequestBodyMB"` // 单请求体上限 MB（0=默认 32，上限 4096）
+}
+
+// defaultProxyLimit 过载保护内置默认值。
+// 默认不限制请求体大小：带图片的请求体本来就大，默认拦截反而可能误伤
+var defaultProxyLimit = ProxyLimit{
+	Enable:            false, // 默认关闭：不改变任何转发行为，用户主动开启才生效
+	LimitConcurrency:  true,
+	MaxConcurrent:     32,
+	LimitQueueTimeout: true,
+	QueueTimeoutSec:   60,
+	LimitRequestBody:  false,
+	MaxRequestBodyMB:  32,
+}
+
+// migrateProxyLimitSwitches 把旧版 ProxyLimit（用负数魔法值表示「不限制」）迁移为布尔开关结构。
+// 只在旧配置（缺少 LimitXxx 字段）时生效，返回是否发生了迁移（需要写回 config.json）。
+//
+// 为什么必须迁移：LimitXxx 是本版新增的 bool 字段，旧配置里不存在 →
+// 反序列化得到 false（= 不限制），若不修正会让原本「限制 32 并发」的配置
+// 在升级后静默变成「不限并发」。推断规则按旧版语义：
+//
+//	旧值 < 0  → 开关 = false（旧版用它表示不限制）
+//	旧值 >= 0 → 开关 = true （旧版有数值即视为限制，含 0=使用默认值）
+func migrateProxyLimitSwitches(pl *ProxyLimit, raw interface{}) bool {
+	rawMap, ok := raw.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	migrated := false
+	// 返回旧字段的数值（缺失视为 0 → 视为「限制」）
+	oldNum := func(key string) float64 {
+		if v, has := rawMap[key].(float64); has {
+			return v
+		}
+		return 0
+	}
+	if _, has := rawMap["LimitConcurrency"]; !has {
+		pl.LimitConcurrency = oldNum("MaxConcurrent") >= 0
+		migrated = true
+	}
+	if _, has := rawMap["LimitQueueTimeout"]; !has {
+		pl.LimitQueueTimeout = oldNum("QueueTimeoutSec") >= 0
+		migrated = true
+	}
+	if _, has := rawMap["LimitRequestBody"]; !has {
+		// ⚠️ 这一项特殊：MaxRequestBodyMB 在历史版本中出现过两种「不限制」写法
+		// （早期版本 0=不限制，后改为 -1=不限制），所以 <= 0 一律视为不限制，
+		// 只有正数才代表用户确实想限制请求体大小。
+		pl.LimitRequestBody = oldNum("MaxRequestBodyMB") > 0
+		migrated = true
+	}
+	return migrated
+}
+
+// migrateServerTimeoutSwitches 同 migrateProxyLimitSwitches，作用于 ServerTimeout 的三个开关
+func migrateServerTimeoutSwitches(st *ServerTimeout, raw interface{}) bool {
+	rawMap, ok := raw.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	migrated := false
+	oldNum := func(key string) float64 {
+		if v, has := rawMap[key].(float64); has {
+			return v
+		}
+		return 0
+	}
+	if _, has := rawMap["LimitReadHeader"]; !has {
+		st.LimitReadHeader = oldNum("ReadHeaderTimeoutSec") >= 0
+		migrated = true
+	}
+	if _, has := rawMap["LimitIdle"]; !has {
+		st.LimitIdle = oldNum("IdleTimeoutSec") >= 0
+		migrated = true
+	}
+	if _, has := rawMap["LimitMaxHeader"]; !has {
+		st.LimitMaxHeader = oldNum("MaxHeaderMB") >= 0
+		migrated = true
+	}
+	return migrated
+}
+
+// normalizeProxyLimit 规范化过载保护配置：数值 0/越界回退默认；旧版 -1 迁移为「不限制」
+func normalizeProxyLimit(pl ProxyLimit) ProxyLimit {
+	if pl.MaxConcurrent < 0 {
+		pl.LimitConcurrency = false
+		pl.MaxConcurrent = defaultProxyLimit.MaxConcurrent
+	} else if pl.MaxConcurrent == 0 || pl.MaxConcurrent > 4096 {
+		pl.MaxConcurrent = defaultProxyLimit.MaxConcurrent
+	}
+	if pl.QueueTimeoutSec < 0 {
+		pl.LimitQueueTimeout = false
+		pl.QueueTimeoutSec = defaultProxyLimit.QueueTimeoutSec
+	} else if pl.QueueTimeoutSec == 0 || pl.QueueTimeoutSec > 3600 {
+		pl.QueueTimeoutSec = defaultProxyLimit.QueueTimeoutSec
+	}
+	if pl.MaxRequestBodyMB < 0 {
+		pl.LimitRequestBody = false
+		pl.MaxRequestBodyMB = defaultProxyLimit.MaxRequestBodyMB
+	} else if pl.MaxRequestBodyMB == 0 || pl.MaxRequestBodyMB > 4096 {
+		pl.MaxRequestBodyMB = defaultProxyLimit.MaxRequestBodyMB
+	}
+	return pl
+}
+
+// ServerTimeout 入站 HTTP 服务器超时设置（防慢速连接堆积，需重启程序生效）。
+// ⚠️ Go 的 http.Server 字段不允许在 Serve 之后修改，因此本组配置只在启动时读取。
+// ⚠️ 不提供 WriteTimeout / ReadTimeout：会切断 SSE 流式对话与大请求体上传。
+type ServerTimeout struct {
+	LimitReadHeader      bool `json:"LimitReadHeader"`      // true=按 ReadHeaderTimeoutSec 超时 / false=不限时
+	ReadHeaderTimeoutSec int  `json:"ReadHeaderTimeoutSec"` // 读请求头超时秒（0=默认 30，上限 3600）
+	LimitIdle            bool `json:"LimitIdle"`            // true=按 IdleTimeoutSec 回收 / false=不回收
+	IdleTimeoutSec       int  `json:"IdleTimeoutSec"`       // 空闲 keep-alive 连接回收秒（0=默认 120，上限 86400）
+	LimitMaxHeader       bool `json:"LimitMaxHeader"`       // true=按 MaxHeaderMB 限制 / false=不限大小
+	MaxHeaderMB          int  `json:"MaxHeaderMB"`          // 请求头上限 MB（0=默认 1，上限 64）
+}
+
+// defaultServerTimeout 服务器超时内置默认值（三项默认均启用）
+var defaultServerTimeout = ServerTimeout{
+	LimitReadHeader:      true,
+	ReadHeaderTimeoutSec: 30,
+	LimitIdle:            true,
+	IdleTimeoutSec:       120,
+	LimitMaxHeader:       true,
+	MaxHeaderMB:          1,
+}
+
+// normalizeServerTimeout 规范化服务器超时配置：数值 0/越界回退默认；旧版 -1 迁移为「不限制」
+func normalizeServerTimeout(st ServerTimeout) ServerTimeout {
+	if st.ReadHeaderTimeoutSec < 0 {
+		st.LimitReadHeader = false
+		st.ReadHeaderTimeoutSec = defaultServerTimeout.ReadHeaderTimeoutSec
+	} else if st.ReadHeaderTimeoutSec == 0 || st.ReadHeaderTimeoutSec > 3600 {
+		st.ReadHeaderTimeoutSec = defaultServerTimeout.ReadHeaderTimeoutSec
+	}
+	if st.IdleTimeoutSec < 0 {
+		st.LimitIdle = false
+		st.IdleTimeoutSec = defaultServerTimeout.IdleTimeoutSec
+	} else if st.IdleTimeoutSec == 0 || st.IdleTimeoutSec > 86400 {
+		st.IdleTimeoutSec = defaultServerTimeout.IdleTimeoutSec
+	}
+	if st.MaxHeaderMB < 0 {
+		st.LimitMaxHeader = false
+		st.MaxHeaderMB = defaultServerTimeout.MaxHeaderMB
+	} else if st.MaxHeaderMB == 0 || st.MaxHeaderMB > 64 {
+		st.MaxHeaderMB = defaultServerTimeout.MaxHeaderMB
+	}
+	return st
+}
+
+// ==================== 过载保护：并发闸门 ====================
+// proxySem 并发信号量（带缓冲 channel 充当计数信号量）。
+//
+// 热更新策略：容量变化时换一个新的 channel，老 channel 不关闭——
+// 已经持有旧槽位的请求在 releaseProxySlot 时归还到自己当初获取的那个 channel，
+// 因此调整并发数既不会 panic，也不会阻塞任何在途请求。
+var (
+	proxySemMu sync.RWMutex
+	proxySem   = make(chan struct{}, defaultProxyLimit.MaxConcurrent)
+)
+
+// getProxySem 取当前并发信号量（读锁保护引用替换）
+func getProxySem() chan struct{} {
+	proxySemMu.RLock()
+	defer proxySemMu.RUnlock()
+	return proxySem
+}
+
+// applyProxyLimitConfig 应用并发上限：容量变化时重建信号量，立即生效。
+// 不限制并发时建容量 1 的占位信号量（acquireProxySlot 不会用到它）。
+func applyProxyLimitConfig(pl ProxyLimit) {
+	pl = normalizeProxyLimit(pl)
+	size := pl.MaxConcurrent
+	if !pl.LimitConcurrency || size <= 0 || size > 4096 {
+		size = 1
+	}
+	proxySemMu.Lock()
+	if cap(proxySem) != size {
+		proxySem = make(chan struct{}, size)
+	}
+	proxySemMu.Unlock()
+}
+
+// acquireProxySlot 获取一个并发槽位。返回的 channel 必须原样传给 releaseProxySlot。
+// 排队超过 QueueTimeoutSec 或客户端断开时返回 false。
+//
+// 两个开关均为 false 时不限制：
+//   - LimitConcurrency=false：直接放行，返回 nil channel（releaseProxySlot 对 nil 安全）
+//   - LimitQueueTimeout=false：排队不限时，只等客户端断开
+func acquireProxySlot(ctx context.Context) (chan struct{}, bool) {
+	// 不限并发：不占任何槽位，直接放行
+	if !cfg.ProxyLimit.LimitConcurrency {
+		return nil, true
+	}
+	ch := getProxySem()
+	if !cfg.ProxyLimit.LimitQueueTimeout {
+		// 排队不限时：只等槽位或客户端断开
+		select {
+		case ch <- struct{}{}:
+			return ch, true
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
+	timeoutSec := cfg.ProxyLimit.QueueTimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = defaultProxyLimit.QueueTimeoutSec
+	}
+	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+	defer timer.Stop()
+	select {
+	case ch <- struct{}{}:
+		return ch, true
+	case <-timer.C:
+		return nil, false
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+// releaseProxySlot 归还并发槽位（必须用 acquireProxySlot 返回的那个 channel）
+func releaseProxySlot(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+		// 槽位已被归还（理论上不会发生）：静默忽略，绝不阻塞请求收尾
+	}
+}
+
+// errRequestBodyTooLarge 请求体超过 ProxyLimit.MaxRequestBodyMB
+var errRequestBodyTooLarge = errors.New("request body too large")
+
+// drainMaxBytes 超限时最多丢弃的请求体字节数（让客户端能读到 413 响应）。
+//
+// 为什么要丢：客户端还在发送大请求体时，若服务端直接返回并关连接，
+// Go 的 net/http 只能读掉 256KB，剩余部分会导致连接被 RST，
+// 客户端看到的是“连接被重置”而不是我们的 413 +中文提示。
+// 丢到 Discard 不占内存（内置 32KB 缓冲区），但会消耗带宽，因此设上限。
+const drainMaxBytes = 64 << 20 // 最多丢弃 64MB
+
+// drainRequestBody 丢弃请求体剩余部分（有上限），确保错误响应能被客户端读到
+func drainRequestBody(r *http.Request) {
+	if r == nil || r.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, drainMaxBytes))
+}
+
+// readRequestBodyLimited 读取请求体，超过 ProxyLimit.MaxRequestBodyMB 时返回 errRequestBodyTooLarge。
+// LimitRequestBody=false 表示不限制。
+// 同时防住两种形态：① 声明了超大 Content-Length（直接拒绝，一字节不读）
+// ② 未声明长度（chunked）的超大请求（LimitReader 多读 1 字节判断是否超限）
+func readRequestBodyLimited(r *http.Request) ([]byte, error) {
+	if !cfg.ProxyLimit.LimitRequestBody {
+		return io.ReadAll(r.Body)
+	}
+	limitMB := cfg.ProxyLimit.MaxRequestBodyMB
+	if limitMB <= 0 {
+		limitMB = defaultProxyLimit.MaxRequestBodyMB
+	}
+	limitBytes := int64(limitMB) * 1024 * 1024
+	if r.ContentLength > limitBytes {
+		return nil, errRequestBodyTooLarge
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limitBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limitBytes {
+		return nil, errRequestBodyTooLarge
+	}
+	return body, nil
+}
+
+// writeOverloadError 返回过载保护拒绝响应（按端点风格选择错误格式，与鉴权失败保持一致）。
+// status 取 503（并发排队超时）或 413（请求体过大）。
+func writeOverloadError(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "5")
+	}
+	w.WriteHeader(status)
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "overloaded_error",
+				"message": msg,
+			},
+		})
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/") {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": msg,
+				"type":    "server_error",
+				"param":   nil,
+				"code":    "overloaded",
+			},
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // ConnPool 上游连接池设置（HTTP/2 + keep-alive 连接复用）
@@ -1781,6 +2175,14 @@ func applyVisionProxy(ctx context.Context, body []byte, modelID string) ([]byte,
 				go func(idx int, img visionImage) {
 					defer wg.Done()
 					defer func() { <-sem }()
+					// [进程存活兜底] 这是本程序自己起的 goroutine，net/http 只会 recover
+					// handler 主 goroutine，兜不住这里：任一 panic（图片解码越界等）
+					// 都会直接终止整个进程，表现为服务「突然消失」。
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Printf("⚠️ 视觉代理: 第 %d 张图片识别发生 panic，已拦截: %v\n", idx+1, r)
+						}
+					}()
 					desc, err := recognizeImageWithProxy(ctx, img, proxyModel, prompt)
 					if err != nil {
 						fmt.Printf("⚠️ 视觉代理: 第 %d 张图片识别失败: %v\n", idx+1, err)
@@ -1900,16 +2302,22 @@ func getDefaultConfig() Config {
 		DoomLoopProtection: DoomLoopProtection{
 			Enable:      false, // 默认全关：不改变任何转发行为，用户主动开启才生效
 			Dedup:       false,
-			RepeatCheck: false, // 跨请求复读检测默认关闭（需记录每轮回复全文，且可能误伤正常重复提问）
+			RepeatCheck: false, // 跨请求复读检测默认关闭（只存摘要、不存全文，但"相同请求+相同回复"仍可能误伤正常重复提问）
 			Warn:        false, // 跨请求警告注入默认关闭
 			MaxRepeat:   3,
 			WarnPrompt:  defaultDoomLoopWarnPrompt,
 			// 思考标签消毒默认开启（独立于 Enable 生效）：ollama cloud 死循环根因防护，
 			// 只替换异常泄漏的裸标签，正常对话零影响
-			ThinkTag: true,
+			ThinkTag:           true,
+			LimitRepeatEntries: true,
+			RepeatMaxEntries:   defaultRepeatMaxEntries,
+			LimitRepeatTTL:     true,
+			RepeatTTLMin:       defaultRepeatTTLMin,
 		},
-		ConnPool:    defaultConnPool,
-		RealtimeLog: defaultRealtimeLog,
+		ConnPool:      defaultConnPool,
+		ProxyLimit:    defaultProxyLimit,    // 过载保护（并发闸门 + 请求体上限），默认关闭
+		ServerTimeout: defaultServerTimeout, // 入站服务器超时（需重启生效）
+		RealtimeLog:   defaultRealtimeLog,
 	}
 }
 
@@ -1971,7 +2379,9 @@ func printConfigHelp() {
 	fmt.Println("                     视觉说明自动判断:Capabilities含vision=原生支持;否则若配置 VisionProxyModel=由该代理模型识别;否则=不支持")
 	fmt.Println("                     示例: {\"Enable\": true, \"Position\": \"prepend\", \"Template\": \"你运行在{model}上,上下文{context_length},最大输出{max_output_tokens},能力{capabilities},{vision}\"}")
 	fmt.Println(" ▼ DoomLoopProtection : 末日循环保护,检测上游内容重复并熔断,防止客户端陷入重试死循环")
-	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), Warn: 跨请求警告注入(熔断/复读后下一轮注入system警告), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词, ThinkTag: 思考标签消毒}")
+	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), Warn: 跨请求警告注入(熔断/复读后下一轮注入system警告), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词, ThinkTag: 思考标签消毒,")
+	fmt.Println("                           LimitRepeatEntries: 是否限记录条数, RepeatMaxEntries: 会话数上限(默认256),")
+	fmt.Println("                           LimitRepeatTTL: 是否限记录有效期, RepeatTTLMin: 有效期分钟(默认30)}")
 	fmt.Println("                     检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),")
 	fmt.Println("                     Warn 开启时在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)")
 	fmt.Println("                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭")
@@ -1985,6 +2395,18 @@ func printConfigHelp() {
 	fmt.Println("                     格式: {MaxIdleConns: 全局最大空闲连接数, MaxIdleConnsPerHost: 每上游主机最大空闲连接数, MaxConnsPerHost: 每上游主机最大并发连接数,")
 	fmt.Println("                           IdleConnTimeoutSec: 空闲连接回收秒数, TLSHandshakeTimeoutSec: TLS握手超时秒数, ForceHTTP2: 强制协商HTTP/2}")
 	fmt.Println("                     0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true")
+	fmt.Println(" ▼ ProxyLimit       : 过载保护(并发闸门 + 请求体上限),防高并发 OOM,保存后立即生效,无需重启")
+	fmt.Println("                     格式: {Enable: 总开关, LimitConcurrency: 是否限并发, MaxConcurrent: 最大并发数(默认32),")
+	fmt.Println("                           LimitQueueTimeout: 是否限排队时间, QueueTimeoutSec: 排队超时秒(默认60),")
+	fmt.Println("                           LimitRequestBody: 是否限请求体大小, MaxRequestBodyMB: 请求体上限MB(默认32)}")
+	fmt.Println("                     限制用布尔开关控制(关闭=完全不限制),数值只填具体数字(0=用默认值)")
+	fmt.Println("                     并发已满时请求排队,排队超时返回 503;请求体超过上限直接返回 413(不做任何解析)")
+	fmt.Println("                     建议: 高并发带图片场景开启,MaxConcurrent 按内存与上游限流能力设置(如 16~64)")
+	fmt.Println(" ▼ ServerTimeout    : 入站 HTTP 服务器超时(防慢速连接堆积),修改需重启程序生效")
+	fmt.Println("                     格式: {LimitReadHeader: 是否限读头时间, ReadHeaderTimeoutSec: 读头超时秒(默认30),")
+	fmt.Println("                           LimitIdle: 是否回收空闲连接, IdleTimeoutSec: 空闲回收秒(默认120),")
+	fmt.Println("                           LimitMaxHeader: 是否限请求头大小, MaxHeaderMB: 请求头上限MB(默认1)}")
+	fmt.Println("                     刻意不提供 WriteTimeout/ReadTimeout: 会切断 SSE 流式对话与大请求体上传")
 	fmt.Println(" ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)")
 	fmt.Println("                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,0=不截断,默认8000,上限5000000)}")
 	fmt.Println("                     记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量")
@@ -2197,6 +2619,26 @@ func loadConfig() {
 				stored.DoomLoopProtection.ThinkTag = defaultCfg.DoomLoopProtection.ThinkTag
 				needSave = true
 			}
+			// 旧配置升级：复读记录上限字段缺失时补默认
+			if _, has := rawDlp["RepeatMaxEntries"]; !has {
+				stored.DoomLoopProtection.RepeatMaxEntries = defaultCfg.DoomLoopProtection.RepeatMaxEntries
+				needSave = true
+			}
+			if _, has := rawDlp["RepeatTTLMin"]; !has {
+				stored.DoomLoopProtection.RepeatTTLMin = defaultCfg.DoomLoopProtection.RepeatTTLMin
+				needSave = true
+			}
+			// 旧配置升级：LimitRepeatEntries / LimitRepeatTTL 是新加的布尔开关，
+			// 旧配置里没有这两个字段 → 反序列化为 false（= 不限制），
+			// 必须显式补 true，否则升级后会意外变成「不限条数 / 永不过期」
+			if _, has := rawDlp["LimitRepeatEntries"]; !has {
+				stored.DoomLoopProtection.LimitRepeatEntries = defaultCfg.DoomLoopProtection.LimitRepeatEntries
+				needSave = true
+			}
+			if _, has := rawDlp["LimitRepeatTTL"]; !has {
+				stored.DoomLoopProtection.LimitRepeatTTL = defaultCfg.DoomLoopProtection.LimitRepeatTTL
+				needSave = true
+			}
 		}
 	}
 	if _, ok := rawMap["ConnPool"]; !ok {
@@ -2204,6 +2646,24 @@ func loadConfig() {
 		needSave = true
 	} else {
 		stored.ConnPool = normalizeConnPool(stored.ConnPool)
+	}
+	if _, ok := rawMap["ProxyLimit"]; !ok {
+		stored.ProxyLimit = defaultCfg.ProxyLimit
+		needSave = true
+	} else {
+		if migrateProxyLimitSwitches(&stored.ProxyLimit, rawMap["ProxyLimit"]) {
+			needSave = true
+		}
+		stored.ProxyLimit = normalizeProxyLimit(stored.ProxyLimit)
+	}
+	if _, ok := rawMap["ServerTimeout"]; !ok {
+		stored.ServerTimeout = defaultCfg.ServerTimeout
+		needSave = true
+	} else {
+		if migrateServerTimeoutSwitches(&stored.ServerTimeout, rawMap["ServerTimeout"]) {
+			needSave = true
+		}
+		stored.ServerTimeout = normalizeServerTimeout(stored.ServerTimeout)
 	}
 	if _, ok := rawMap["RealtimeLog"]; !ok {
 		stored.RealtimeLog = defaultCfg.RealtimeLog
@@ -2351,6 +2811,8 @@ func loadConfig() {
 
 	// 应用连接池配置（构建共享 Transport）
 	applyConnPoolConfig(stored.ConnPool)
+	// 应用过载保护（并发信号量容量）
+	applyProxyLimitConfig(stored.ProxyLimit)
 
 	// 应用视觉代理图片内存缓存大小，并预加载最近的识别结果到内存
 	setVisionMemCacheCap(stored.VisionProxyMemCacheSize)
@@ -2978,7 +3440,7 @@ func newRealtimeRecorder(w http.ResponseWriter, r *http.Request, rawBody []byte)
 		Status:   0,
 	}
 	// 客户端原始请求体（截断）
-	e.ReqBody, e.ReqTrunc = truncateBytes(string(rawBody), rl.MaxBodyLen)
+	e.ReqBody, e.ReqTrunc = truncateBodyString(rawBody, rl.MaxBodyLen)
 
 	cap := &realtimeCaptureWriter{ResponseWriter: w, limit: rl.MaxBodyLen}
 	var wrapped http.ResponseWriter
@@ -2996,7 +3458,7 @@ func (rec *realtimeRecorder) setUpstreamBody(body []byte) {
 	if rec == nil {
 		return
 	}
-	up, trunc := truncateBytes(string(body), normalizeRealtimeLog(cfg.RealtimeLog).MaxBodyLen)
+	up, trunc := truncateBodyString(body, normalizeRealtimeLog(cfg.RealtimeLog).MaxBodyLen)
 	e := rec.entry
 	e.mu.Lock()
 	e.UpBody, e.UpTrunc = up, trunc
@@ -3074,17 +3536,50 @@ func lastMatchInt(re *regexp.Regexp, s string) int {
 	return v
 }
 
+// truncateBodyString 把请求体按字符（rune）截断到 n 个字符后返回字符串。
+//
+// [高并发内存安全] 不要写成 truncateBytes(string(body), n)：那样会先把整份请求体
+// 复制成 string（带图片时单份就可达数十 MB），再截断丢掉 99.9%，纯属浪费；
+// 高并发下这部分临时垃圾会直接把进程推到 OOM。本函数直接扫描 []byte，
+// 只在末尾做一次必要的 string() 转换。
+func truncateBodyString(body []byte, n int) (string, bool) {
+	if n <= 0 || len(body) <= n {
+		// 字节数 <= 字符上限时，字符数必然也 <= 上限，无需扫描
+		return string(body), false
+	}
+	count := 0
+	for i := 0; i < len(body); {
+		if count == n {
+			return string(body[:i]), true
+		}
+		_, size := utf8.DecodeRune(body[i:])
+		if size <= 0 {
+			size = 1
+		}
+		i += size
+		count++
+	}
+	return string(body), false
+}
+
 // truncateBytes 按字符截断字符串到 n 个字符（按 rune，避免切断中文多字节字符），
 // 返回 (截断后文本, 是否发生了截断)
 func truncateBytes(s string, n int) (string, bool) {
 	if n <= 0 || len(s) <= n {
 		return s, false
 	}
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s, false
+	// [高并发内存安全] 这里绝不能用 []rune(s) —— 每个 rune 占 4 字节，
+	// 一个几 MB 的请求体会瞬时分配 4 倍内存，而调用方只要前 n 个字符，
+	// 高并发下这部分临时垃圾足以把进程推到 OOM。
+	// 改为顺序扫描到第 n 个 rune 的起始字节位置，零额外分配。
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i], true
+		}
+		count++
 	}
-	return string(runes[:n]), true
+	return s, false
 }
 
 // handleRealtimeAPI GET /api/realtime?after=<id> 返回记录列表；DELETE 清空
@@ -3568,6 +4063,10 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	// 规范化实时请求查看配置（条数/截断长度上下界）
 	newCfg.RealtimeLog = normalizeRealtimeLog(newCfg.RealtimeLog)
+	// 规范化过载保护配置（并发数/排队超时/请求体上限）
+	newCfg.ProxyLimit = normalizeProxyLimit(newCfg.ProxyLimit)
+	// 规范化入站服务器超时（修改需重启生效）
+	newCfg.ServerTimeout = normalizeServerTimeout(newCfg.ServerTimeout)
 	// 规范化模型详细设置里的图片质量配置
 	for m, s := range newCfg.ModelDetailedSettings {
 		if s.VisionImageQuality != nil {
@@ -3726,6 +4225,11 @@ func applyConfigToRuntime(newCfg Config) {
 	// 应用连接池配置（重建共享 Transport，立即生效）
 	cfg.ConnPool = normalizeConnPool(newCfg.ConnPool)
 	applyConnPoolConfig(cfg.ConnPool)
+	// 应用过载保护（并发闸门 + 请求体上限，立即生效）
+	cfg.ProxyLimit = normalizeProxyLimit(newCfg.ProxyLimit)
+	applyProxyLimitConfig(cfg.ProxyLimit)
+	// 应用入站服务器超时（仅存配置，http.Server 字段不允许在 Serve 后修改，需重启生效）
+	cfg.ServerTimeout = normalizeServerTimeout(newCfg.ServerTimeout)
 	// 应用实时请求查看配置（记录条数/截断长度，立即生效）
 	cfg.RealtimeLog = normalizeRealtimeLog(newCfg.RealtimeLog)
 }
@@ -3954,6 +4458,11 @@ func sanitizeContentField(msg map[string]interface{}, field string) bool {
 // 把客户端历史里已污染的裸 </thinking> 替换为安全文本，防止上游 prompt 渲染器截断
 // assistant 历史导致死循环。返回 (处理后的请求体, 是否发生了替换)。
 func sanitizeMessagesThinkTags(body []byte) ([]byte, bool) {
+	// [高并发内存安全] 预检门禁：请求体里根本没有裸思考标签时直接返回，
+	// 不做整体反序列化。带图片的请求体极大，每省一次 map 物化就省一整份 base64 副本。
+	if !bytes.Contains(body, []byte(thinkTagOpen)) && !bytes.Contains(body, []byte(thinkTagClose)) {
+		return body, false
+	}
 	var req map[string]interface{}
 	if json.Unmarshal(body, &req) != nil {
 		return body, false
@@ -4041,19 +4550,108 @@ func dedupStreamContent(content string, full *strings.Builder, last *string, dup
 //   ② 跨请求复读：请求签名（最后一条 user 消息）与回复都与上一轮相同（Agent 死循环特征）
 // 处理：纯检测模式原样透传 + 标记跨请求警告；去重模式额外截断为前半段
 
-// 非流式跨请求复读记录：key → 上一轮 (请求签名, 回复)
+// 跨请求复读记录：key → 上一轮 (请求签名摘要, 回复摘要)
+//
+// [内存安全 + 精确判断] 早期实现把「完整请求签名 + 完整回复全文」存进 map，
+// key 是 IP+UA指纹|模型 —— 每多一个客户端/模型就永久多占一份全文，
+// 长回复叠加高并发后会持续吃掉内存，是进程被 OOM 静默杀掉的元凶之一。
+//
+// 但单纯把全文「截断到 8192 字符」又会引入判定偏差：
+// 两次回复只要「前 8192 字符相同、后面不同」就会被误判为复读
+// （开启 Dedup 时甚至会真的把正常内容截断成一半，属于误伤）。
+//
+// 因此改为只存 SHA-256 摘要（各 32 字节）：
+//
+//	① 判断精度 100%：摘要比对等价于全文比对，不存在截断导致的误报
+//	② 内存量级：256 条 × 64 字节 ≈ 16KB，与回复长短完全无关
+//	③ 天然免疫超长回复，不需要任何长度上限
+//
+// 仍保留条数上限与有效期，保证 map 与内存总量有确定上界。
+// 两个上限均由配置项控制（DoomLoopProtection.RepeatMaxEntries / RepeatTTLMin），
+// 默认值与上下界见 defaultRepeatMaxEntries / maxRepeatMaxEntries 等常量。
 var lastReplies = struct {
 	sync.Mutex
 	m map[string]lastReplyEntry
 }{m: make(map[string]lastReplyEntry)}
 
 type lastReplyEntry struct {
-	reqSig string
-	reply  string
+	reqSigHash [32]byte // 上一轮请求签名（最后一条 user 消息）的 SHA-256
+	replyHash  [32]byte // 上一轮回复全文的 SHA-256
+	at         time.Time
+}
+
+// replyDigest 计算用于复读比对的摘要。
+// 用 SHA-256 代替全文：既与「全文精确比对」完全等价（不含任何截断偏差），
+// 又把每条记录的内存占用从「回复长度」压缩到固定 32 字节。
+func replyDigest(s string) [32]byte {
+	return sha256.Sum256([]byte(s))
+}
+
+// getLastReply 读取指定会话的上一轮记录。
+// 返回 ok=false 表示无记录或已超过有效期（调用方应按「无上一轮」处理）。
+func getLastReply(key string) (lastReplyEntry, bool) {
+	lastReplies.Lock()
+	defer lastReplies.Unlock()
+	e, found := lastReplies.m[key]
+	if !found {
+		return lastReplyEntry{}, false
+	}
+	// 启用有效期限制且已超时才视为陈旧
+	if ttl, ok := repeatTTL(); ok && time.Since(e.at) > ttl {
+		return lastReplyEntry{}, false
+	}
+	return e, true
+}
+
+// setLastReply 写入指定会话的上一轮记录（只存摘要，不存原文）。
+// 超限时先清理过期项，仍超限则淘汰最旧的一条，保证 map 大小有硬上限。
+func setLastReply(key, reqSig, reply string) {
+	if reply == "" {
+		return
+	}
+	now := time.Now()
+	entry := lastReplyEntry{
+		reqSigHash: replyDigest(reqSig),
+		replyHash:  replyDigest(reply),
+		at:         now,
+	}
+
+	lastReplies.Lock()
+	defer lastReplies.Unlock()
+	limit, limitOn := repeatEntryLimit()
+	ttl, ttlOn := repeatTTL()
+	// 启用条数限制时才裁剪；先清过期项，仍超限则淘汰最旧
+	if limitOn && len(lastReplies.m) >= limit {
+		for k, e := range lastReplies.m {
+			if ttlOn && now.Sub(e.at) > ttl {
+				delete(lastReplies.m, k)
+			}
+		}
+		if len(lastReplies.m) >= limit {
+			oldestKey := ""
+			var oldestAt time.Time
+			first := true
+			for k, e := range lastReplies.m {
+				if first || e.at.Before(oldestAt) {
+					oldestKey, oldestAt, first = k, e.at, false
+				}
+			}
+			if oldestKey != "" {
+				delete(lastReplies.m, oldestKey)
+			}
+		}
+	}
+	lastReplies.m[key] = entry
 }
 
 // reqSignature 生成请求签名：取最后一条 user 消息内容（用于跨请求复读对比）
 func reqSignature(body []byte) string {
+	// [高并发内存安全] 请求签名只服务于跨请求复读检测（RepeatCheck 子开关，默认关）。
+	// 未开启时直接返回空串，避免把整份大请求体（带图片时数十 MB）物化成 map，
+	// 白占一份 base64 副本。调用方均能在 reqSig=="" 时正常降级。
+	if !cfg.DoomLoopProtection.Enable || !cfg.DoomLoopProtection.RepeatCheck {
+		return ""
+	}
 	var req map[string]interface{}
 	if json.Unmarshal(body, &req) != nil {
 		return ""
@@ -4138,12 +4736,11 @@ func dedupNonStreamContent(content, reqSig, key string) (string, string) {
 		}
 	}
 
-	// ② 跨请求复读：请求签名 + 回复都与上一轮相同（独立子开关 RepeatCheck 控制）
+	// ② 跨请求复读：请求签名 + 回复都与上一轮相同（独立子开关 RepeatCheck 控制）。
+	// 摘要比对等价于全文精确比对，不会因为超长回复被截断而误判
 	if cfg.DoomLoopProtection.RepeatCheck {
-		lastReplies.Lock()
-		prev := lastReplies.m[key]
-		lastReplies.Unlock()
-		if reqSig != "" && prev.reqSig == reqSig && prev.reply != "" && prev.reply == content {
+		prev, found := getLastReply(key)
+		if found && reqSig != "" && prev.reqSigHash == replyDigest(reqSig) && prev.replyHash == replyDigest(content) {
 			fmt.Printf("🚨 末日循环保护: 检测到跨请求复读 (请求与回复均与上一轮相同)\n")
 			markRepeatWarning(key)
 			reasons = append(reasons, "cross")
@@ -4154,10 +4751,10 @@ func dedupNonStreamContent(content, reqSig, key string) (string, string) {
 		}
 	}
 
-	// 更新记录（记录处理后的内容，客户端实际收到的）
-	lastReplies.Lock()
-	lastReplies.m[key] = lastReplyEntry{reqSig: reqSig, reply: content}
-	lastReplies.Unlock()
+	// 更新记录（仅跨请求复读检测需要；只存摘要，不存原文，内存与回复长短无关）
+	if cfg.DoomLoopProtection.RepeatCheck {
+		setLastReply(key, reqSig, content)
+	}
 
 	return content, strings.Join(reasons, ",")
 }
@@ -4170,18 +4767,14 @@ func checkStreamRepeat(fullText, reqSig, key string) bool {
 	if !cfg.DoomLoopProtection.Enable || !cfg.DoomLoopProtection.RepeatCheck || fullText == "" {
 		return false
 	}
-	lastReplies.Lock()
-	prev := lastReplies.m[key]
-	lastReplies.Unlock()
-	repeated := reqSig != "" && prev.reqSig == reqSig && prev.reply != "" && prev.reply == fullText
+	prev, found := getLastReply(key)
+	repeated := found && reqSig != "" && prev.reqSigHash == replyDigest(reqSig) && prev.replyHash == replyDigest(fullText)
 	if repeated {
 		fmt.Printf("🚨 末日循环保护: 检测到跨请求复读 (流式, 请求与回复均与上一轮相同)\n")
 		markRepeatWarning(key)
 	}
-	// 更新记录（记录本轮全文，供下一轮对比）
-	lastReplies.Lock()
-	lastReplies.m[key] = lastReplyEntry{reqSig: reqSig, reply: fullText}
-	lastReplies.Unlock()
+	// 更新记录（记录本轮全文的摘要，供下一轮对比；只存摘要，不存原文）
+	setLastReply(key, reqSig, fullText)
 	return repeated
 }
 
@@ -6965,37 +7558,20 @@ func hasImageInBody(body []byte) bool {
 	if len(body) == 0 {
 		return false
 	}
-	var req map[string]interface{}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return false
-	}
-	// 检查 messages 数组
-	messages, _ := req["messages"].([]interface{})
-	for _, msg := range messages {
-		msgMap, _ := msg.(map[string]interface{})
-		if msgMap == nil {
-			continue
-		}
-		// Ollama images 数组
-		if images, _ := msgMap["images"].([]interface{}); len(images) > 0 {
+	// [高并发内存安全] 不要用 json.Unmarshal 到 map[string]interface{} 来判断有没有图片：
+	// 带图片的请求体里 base64 动辄数十 MB，物化成 interface{} 会额外复制一整套字符串，
+	// 而本函数只需要回答「是不是带图请求」（仅用于日志图标）。改为字节级标记扫描，零分配。
+	// 四种载体：OpenAI image_url data URI / OpenAI 图片块 / Ollama 图片块 / Ollama images 数组。
+	for _, marker := range [][]byte{
+		[]byte("data:image/"),
+		[]byte(`"image_url"`),
+		[]byte(`"image_base64"`),
+		[]byte(`"images"`),
+	} {
+		if bytes.Contains(body, marker) {
 			return true
 		}
-		// content 数组中的图片块
-		if contentArr, _ := msgMap["content"].([]interface{}); len(contentArr) > 0 {
-			for _, block := range contentArr {
-				blockMap, _ := block.(map[string]interface{})
-				if blockMap == nil {
-					continue
-				}
-				switch blockMap["type"] {
-				case "image", "image_url":
-					return true
-				}
-			}
-		}
 	}
-	// Anthropic /v1/messages 格式（顶层 content 数组已在 messages 中处理）
-	// Anthropic system 字段也可能含图片（较少见，不做额外处理）
 	return false
 }
 
@@ -7006,6 +7582,13 @@ func hasImageInBody(body []byte) bool {
 // 返回 (处理后的请求体, 是否发生了还原)
 func stripModelPrefixSuffix(body []byte) ([]byte, bool) {
 	if len(body) == 0 || (cfg.OpenAIPrefix == "" && cfg.OpenAISuffix == "") {
+		return body, false
+	}
+	// [高并发内存安全] 预检门禁：请求体里连前缀/后缀字符串都未出现，必然无需剥离，
+	// 直接跳过整体反序列化（超大带图片请求体因此完全不会被 map 物化）。
+	needPrefix := cfg.OpenAIPrefix != "" && bytes.Contains(body, []byte(cfg.OpenAIPrefix))
+	needSuffix := cfg.OpenAISuffix != "" && bytes.Contains(body, []byte(cfg.OpenAISuffix))
+	if !needPrefix && !needSuffix {
 		return body, false
 	}
 
@@ -7085,6 +7668,11 @@ func assistantMsgSignature(m map[string]interface{}) string {
 // 签名 = content + tool_calls(name+arguments)；空 content 且无 tool_calls 的消息跳过。
 // 连续（中间只有 tool 消息）出现 2 条相同签名的 assistant 消息 → 判定循环。
 func detectAssistantLoop(body []byte) bool {
+	// [高并发内存安全] 预检门禁：触发条件要求至少两条 assistant 消息签名相同，
+	// 因此 assistant 出现次数 < 2 时不可能命中，直接返回（零分配）。
+	if bytes.Count(body, []byte(`"assistant"`)) < 2 {
+		return false
+	}
 	var req map[string]interface{}
 	if json.Unmarshal(body, &req) != nil {
 		return false
@@ -7432,6 +8020,19 @@ func ruleLogDesc(rule PromptReplaceRule) string {
 }
 
 func logAllRequests(w http.ResponseWriter, r *http.Request) {
+	// 过载保护①：并发闸门。超出上限的请求在此排队（不占内存、不读请求体），
+	// 排队超过 QueueTimeoutSec 或客户端断开则返回 503，避免 goroutine 与内存无限堆积。
+	// 注意：流式请求会长时间持有槽位，这正是并发控制的目的（防止上游/内存被压垮）。
+	if cfg.ProxyLimit.Enable {
+		slot, ok := acquireProxySlot(r.Context())
+		if !ok {
+			fmt.Printf("🛡️ 过载保护: 并发已满，拒绝请求 %s %s (客户端: %s)\n", r.Method, r.URL.Path, clientIP(r))
+			writeOverloadError(w, r, http.StatusServiceUnavailable, "服务繁忙：并发请求已满，请稍后重试（可调大「过载保护」的最大并发数）")
+			return
+		}
+		defer releaseProxySlot(slot)
+	}
+
 	count := atomic.AddInt64(&requestCount, 1)
 	if count >= cfg.Log_Limit {
 		CallClear()
@@ -7439,7 +8040,19 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("🧹 日志已清理")
 	}
 
-	body, _ := io.ReadAll(r.Body)
+	// 过载保护②：请求体大小上限（带图片的请求体可能非常大）。
+	// 超限直接返回 413，不进入任何解析/注入链，避免内存被单个巨大请求吃掉。
+	body, readErr := readRequestBodyLimited(r)
+	if readErr != nil {
+		if errors.Is(readErr, errRequestBodyTooLarge) {
+			fmt.Printf("🛡️ 过载保护: 请求体超过 %d MB，已拒绝 %s %s (客户端: %s)\n", cfg.ProxyLimit.MaxRequestBodyMB, r.Method, r.URL.Path, clientIP(r))
+			// 先把剩余请求体丢掉，否则连接被 RST，客户端看不到 413 错误信息
+			drainRequestBody(r)
+			writeOverloadError(w, r, http.StatusRequestEntityTooLarge, fmt.Sprintf("请求体过大：超过上限 %d MB（可在「过载保护」中调整上限或关闭「限制请求体大小」）", cfg.ProxyLimit.MaxRequestBodyMB))
+			return
+		}
+		body = nil // 读取失败（客户端断开等）：交给后续流程按空请求体处理
+	}
 
 	// 实时请求查看：包装响应写入器（捕获状态码/响应体）并登记「进行中」记录，
 	// 请求结束时由 finish() 更新为最终状态（响应体/耗时/token 用量）
@@ -7751,5 +8364,38 @@ func main() {
 	}
 
 	http.HandleFunc("/", logAllRequests)
-	http.ListenAndServe(cfg.IP+":"+cfg.PORT, nil)
+
+	// [高并发稳定性] 不要直接用 http.ListenAndServe —— 它没有任何超时，
+	// 慢客户端 / 异常连接会无限堆积 goroutine 与文件句柄，高并发下把进程拖死。
+	// 注意：绝对不能设 WriteTimeout，否则 SSE 流式对话与实时记录推送会被中途掐断；
+	// 同理不设 ReadTimeout，避免大上下文请求体上传被中途截断。
+	// 以上参数来自配置页「服务器超时 ServerTimeout」，修改需重启程序生效
+	// （Go 的 http.Server 字段不允许在 Serve 之后修改，无法热更新）。
+	st := normalizeServerTimeout(cfg.ServerTimeout)
+	// 三项均为「布尔开关 + 数值」：开关关闭时用零值（Go 的零值就是不限制）。
+	// ⚠ MaxHeaderBytes 特殊：Go 把 0 当作「使用 DefaultMaxHeaderBytes(1MB)」而不是不限制，
+	// 因此不限制时必须显式给一个极大值（约 2GB）。
+	var readHeaderTimeout, idleTimeout time.Duration
+	if st.LimitReadHeader {
+		readHeaderTimeout = time.Duration(st.ReadHeaderTimeoutSec) * time.Second
+	}
+	if st.LimitIdle {
+		idleTimeout = time.Duration(st.IdleTimeoutSec) * time.Second
+	}
+	maxHeaderBytes := 0
+	if st.LimitMaxHeader {
+		maxHeaderBytes = st.MaxHeaderMB << 20
+	} else {
+		maxHeaderBytes = int(^uint32(0) >> 1) // 2147483647（约 2GB，实际等同于不限制）
+	}
+	srv := &http.Server{
+		Addr:              cfg.IP + ":" + cfg.PORT,
+		Handler:           nil,               // nil = 使用 http.DefaultServeMux（上面注册的 handler）
+		ReadHeaderTimeout: readHeaderTimeout, // 0 = 不限制；只限制请求头读取（慢速攻击防护，不影响流式）
+		IdleTimeout:       idleTimeout,       // 0 = 不限制；空闲 keep-alive 连接超时回收
+		MaxHeaderBytes:    maxHeaderBytes,    // 请求头上限（0 会被 Go 当成 1MB，所以不限制时给极大值）
+	}
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Printf("服务异常退出: %v\n", err)
+	}
 }

@@ -34,6 +34,7 @@
 - 🖼️ **无中生有视觉**：主模型不支持图片时，自动用视觉代理模型识别后合并文本返回
 - 🛠️ **打通工具调用**：Ollama / OpenAI / Anthropic 三种格式的工具调用互相转换，解决 Agent 死循环
 - 🔌 **连接池调优**：HTTP/2 + keep-alive 连接复用，可配置空闲连接数/超时/并发上限，保存后立即生效无需重启
+- 🛡️ **过载保护**：并发闸门 + 请求体上限，防止高并发（尤其带图片）把进程 OOM 掉；「限制」用布尔开关控制，一关就真的不限制
 - 📡 **实时请求查看**：配置页面内实时查看每一笔请求的原始请求体、转发上游请求体、响应体、耗时与 Token 用量，并自动标记本次触发的保护（思考标签消毒/去重/熔断/复读等）
 
 > 💡 **简单来说**：你只需在 VS Code / VS2026 中配置 Ollama 作为 API 提供商，然后指向本程序，就能使用任何 **OpenAI 兼容的 API 服务**（如 DeepSeek、GPT、Claude 等）——并且还能把任何一个模型"调教"成你想要的样子。
@@ -121,6 +122,8 @@
 - **模型上下文注入**：`ModelContextPrompt` 在对话时自动把当前模型信息（模型ID/上下文长度/最大输出/能力/视觉说明）注入提示词，让 AI 自我认知，更合理地规划思考与输出长度
 - **末日循环保护**：`DoomLoopProtection` 检测上游内容重复（相邻块/全文尾部/跨请求复读）并熔断，防止客户端陷入重试死循环
 - **连接池设置**：`ConnPool` 可配置上游 HTTP/2 + keep-alive 连接池（空闲连接数/超时/并发上限），保存后立即生效，无需重启
+- **过载保护**：`ProxyLimit` 并发闸门 + 请求体上限，防止高并发 OOM（进程被系统静默杀掉）；每项「是否限制」都是独立布尔开关，关闭 = 完全不限制，保存后立即生效
+- **服务器超时**：`ServerTimeout` 配置入站 HTTP 服务器的读头超时/空闲回收/请求头上限，防慢速连接堆积（修改需重启生效）
 - **实时请求查看**：`RealtimeLog` 在内存中记录最近的请求与响应（原始请求体/转发上游请求体/响应体/耗时/Token 用量），配置页面「📡 实时请求」页实时查看（SSE 推送），自动标记触发的保护（思考标签消毒/去重/熔断/复读/视觉代理等），只存内存不写磁盘
 
 ---
@@ -213,12 +216,34 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
         "TLSHandshakeTimeoutSec": 10,
         "ForceHTTP2": true
     },
+    "ProxyLimit": {
+        "Enable": false,
+        "LimitConcurrency": true,
+        "MaxConcurrent": 32,
+        "LimitQueueTimeout": true,
+        "QueueTimeoutSec": 60,
+        "LimitRequestBody": false,
+        "MaxRequestBodyMB": 32
+    },
+    "ServerTimeout": {
+        "LimitReadHeader": true,
+        "ReadHeaderTimeoutSec": 30,
+        "LimitIdle": true,
+        "IdleTimeoutSec": 120,
+        "LimitMaxHeader": true,
+        "MaxHeaderMB": 1
+    },
     "DoomLoopProtection": {
         "Enable": false,
         "Dedup": false,
         "RepeatCheck": false,
         "MaxRepeat": 3,
-        "WarnPrompt": ""
+        "WarnPrompt": "",
+        "ThinkTag": true,
+        "LimitRepeatEntries": true,
+        "RepeatMaxEntries": 256,
+        "LimitRepeatTTL": true,
+        "RepeatTTLMin": 30
     },
     "RealtimeLog": {
         "Enable": true,
@@ -248,7 +273,9 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | `RequestPromptReplace`  | 请求提示词替换规则`{规则名: {enable, mode, role, index, prompt, replace}}`   | `{}`                                 |
 | `ModelContextPrompt`   | 模型上下文信息注入`{Enable, Position, Template}`                         | `{Enable:false, Position:"prepend", Template:内置默认}` |
 | `ConnPool`            | 上游连接池设置`{MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}` | 内置默认（见下表） |
-| `DoomLoopProtection`  | 末日循环保护`{Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt}`         | `{Enable:false, Dedup:false, RepeatCheck:false, MaxRepeat:3, WarnPrompt:""}` |
+| `ProxyLimit`          | 过载保护`{Enable, LimitConcurrency, MaxConcurrent, LimitQueueTimeout, QueueTimeoutSec, LimitRequestBody, MaxRequestBodyMB}`（防高并发 OOM，立即生效） | `{Enable:false, LimitConcurrency:true, MaxConcurrent:32, LimitQueueTimeout:true, QueueTimeoutSec:60, LimitRequestBody:false, MaxRequestBodyMB:32}` |
+| `ServerTimeout`       | 入站服务器超时`{LimitReadHeader, ReadHeaderTimeoutSec, LimitIdle, IdleTimeoutSec, LimitMaxHeader, MaxHeaderMB}`（**需重启生效**） | `{LimitReadHeader:true, ReadHeaderTimeoutSec:30, LimitIdle:true, IdleTimeoutSec:120, LimitMaxHeader:true, MaxHeaderMB:1}` |
+| `DoomLoopProtection`  | 末日循环保护`{Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt, ThinkTag, LimitRepeatEntries, RepeatMaxEntries, LimitRepeatTTL, RepeatTTLMin}` | `{Enable:false, Dedup:false, RepeatCheck:false, MaxRepeat:3, ThinkTag:true, LimitRepeatEntries:true, RepeatMaxEntries:256, LimitRepeatTTL:true, RepeatTTLMin:30}` |
 | `RealtimeLog`  | 实时请求查看`{Enable, MaxEntries, MaxBodyLen}`（内存记录，不写磁盘）         | `{Enable:true, MaxEntries:100, MaxBodyLen:8000}` |
 
 **`StreamMode` 说明**：
@@ -294,6 +321,51 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 - **保存后立即生效（热更新连接池，无需重启）**；字段填 `0` 回退内置默认值
 - 可通过配置管理页面「🔌 连接设置 → 连接池设置 ConnPool」可视化调整
 
+**`ProxyLimit` 过载保护说明**：
+
+高并发场景（尤其是**带图片的请求**）单个请求体可达数十 MB，若没有任何上限，内存占用会随并发数线性增长，最终被系统当作 OOM 静默杀掉——表现为**进程直接消失、服务停止，日志里看不到任何错误**。
+
+配置设计原则：**「是否限制」用布尔开关表达，「限制值」用整数表达**（不用 `-1`/`0` 这类魔法数字，人读和 AI 读都不容易误判）。
+
+| 字段 | 类型 | 说明 | 默认值 |
+| --- | --- | --- | --- |
+| `Enable` | bool | 总开关（关闭时不改变任何转发行为） | `false` |
+| `LimitConcurrency` | bool | 是否限制并发数；**`false` = 完全不限并发**（所有请求直接放行） | `true` |
+| `MaxConcurrent` | int | 最大并发请求数，超出排队（`0` = 用默认值，上限 4096） | `32` |
+| `LimitQueueTimeout` | bool | 是否限制排队时间；`false` = 排队不限时（只等客户端断开） | `true` |
+| `QueueTimeoutSec` | int | 排队超时秒数，超时返回 **503** + `Retry-After` | `60` |
+| `LimitRequestBody` | bool | 是否限制请求体大小；**`false` = 不限大小**（带图片场景推荐关闭） | `false` |
+| `MaxRequestBodyMB` | int | 单请求体上限（MB），超限返回 **413** | `32` |
+
+- **并发闸门**：带缓冲 channel 作为计数信号量，槽位满时请求排队（**排队期间不读请求体、不占内存**）
+- **热更新安全**：修改并发数时只替换信号量，已持有旧槽位的请求归还到**它当初获取的那个** channel —— 既不 panic，也不阻塞在途请求
+- **请求体双保险**：先看 `Content-Length` 直接拒绝（一字节不读），再用 `LimitReader(limit+1)` 兜住 chunked 无长度声明的请求
+- **413 会先丢弃剩余请求体**（`drainRequestBody`，上限 64MB），否则连接会被 RST，客户端只能看到"连接被重置"而读不到中文错误提示
+- 错误体按端点风格区分：`/v1/messages` → Anthropic 格式、`/v1/*` → OpenAI 格式、其他 → Ollama 格式
+- **保存后立即生效（无需重启）**，可通过配置页「🔌 连接设置 → 🛡️ 过载保护 ProxyLimit」调整
+
+> 💡 **建议**：高并发带图场景开启后，`MaxConcurrent` 按内存与上游限流能力设置（如 16~64）；带图片时 `LimitRequestBody` 建议保持关闭。
+
+**`ServerTimeout` 服务器超时说明**：
+
+管的是**客户端连进本服务**这一侧（与 `ConnPool` 的上游连接池方向相反），防慢速攻击与连接堆积。
+
+| 字段 | 类型 | 说明 | 默认值 |
+| --- | --- | --- | --- |
+| `LimitReadHeader` | bool | 是否限制读请求头时间；`false` = 不限时 | `true` |
+| `ReadHeaderTimeoutSec` | int | 从连接建立起，多少秒内必须发完请求头，否则断开 | `30` |
+| `LimitIdle` | bool | 是否回收空闲 keep-alive 连接；`false` = 不回收 | `true` |
+| `IdleTimeoutSec` | int | 空闲连接多久回收（秒） | `120` |
+| `LimitMaxHeader` | bool | 是否限制请求头大小；`false` = 不限大小 | `true` |
+| `MaxHeaderMB` | int | 单次请求头最大体积（MB） | `1` |
+
+- **慢速攻击（Slowloris）防护**：无超时时，上千个"每秒只发 1 字节请求头"的连接会永远挂着，占满 goroutine 与文件句柄
+- **连接泄漏防护**：客户端异常退出留下的死连接会被自动回收
+- **刻意不提供 `ReadTimeout` / `WriteTimeout`**：`WriteTimeout` 会中途掐断 SSE 流式对话，`ReadTimeout` 会中断几十 MB 的大请求体上传
+- ⚠️ **修改需重启程序生效**——Go 的 `http.Server` 字段不允许在 `Serve()` 之后修改
+- ⚠️ `MaxHeaderMB` 的"不限制"在 Go 里要特殊处理：`MaxHeaderBytes = 0` 表示**使用默认 1MB**，所以开关关闭时会显式填入极大值
+
+
 > ⚠️ **注意**：`OPENAI_KEY` 在第一次启动后会自动加密并回写到配置文件中。后续启动将使用加密后的密钥，换机器会提示"机器码不匹配"。
 
 ### 2️⃣ 启动程序
@@ -333,6 +405,8 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 | 🔒**访问密码**         | 设置`WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改） |
 | 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            |
 | 🔌**连接池设置**     | 可视化调整`ConnPool`（HTTP/2 + keep-alive 连接复用），**保存后立即生效，无需重启** |
+| 🛡️**过载保护**       | 可视化配置`ProxyLimit`：并发闸门 + 请求体上限，防高并发 OOM。每项都有独立的「限制」开关（关闭 = 完全不限制），三级置灰联动，**保存后立即生效** |
+| ⏱️**服务器超时**     | 可视化配置`ServerTimeout`：读头超时 / 空闲连接回收 / 请求头上限，防慢速连接堆积（**需重启生效**） |
 | 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
 | 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                         |
 | 🧭**模型上下文注入** | 可视化配置`ModelContextPrompt`（开关、插入位置、模板）                            |
@@ -454,13 +528,26 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
                      模板占位符: {model} {context_length} {max_output_tokens} {capabilities} {vision}
                      {vision} 自动判断: 配置了视觉代理→"图片由代理模型识别"; 否则Capabilities含vision→"原生支持"; 否则→"不支持"
  ▼ DoomLoopProtection : 末日循环保护,检测上游内容重复并熔断,防止客户端陷入重试死循环
-                     格式: {Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt}
+                     格式: {Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt, ThinkTag,
+                           LimitRepeatEntries, RepeatMaxEntries, LimitRepeatTTL, RepeatTTLMin}
                      检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),
                      并在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)
-                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭
+                     RepeatCheck 需记录每轮回复摘要,且可能误伤正常重复提问,默认关闭
+                     ThinkTag 思考标签消毒(独立于 Enable 生效,默认开启): 防 ollama cloud 死循环
+                     LimitRepeatEntries/RepeatMaxEntries: 复读记录条数上限(默认 256)
+                     LimitRepeatTTL/RepeatTTLMin: 复读记录有效期(默认 30 分钟)
  ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启
                      格式: {MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}
                      0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true
+ ▼ ProxyLimit       : 过载保护(并发闸门 + 请求体上限),防高并发 OOM,保存后立即生效,无需重启
+                     格式: {Enable, LimitConcurrency, MaxConcurrent, LimitQueueTimeout, QueueTimeoutSec,
+                           LimitRequestBody, MaxRequestBodyMB}
+                     限制用布尔开关控制(关闭=完全不限制),数值只填具体数字(0=用默认值)
+                     并发已满时请求排队,排队超时返回 503;请求体超过上限直接返回 413
+ ▼ ServerTimeout    : 入站 HTTP 服务器超时(防慢速连接堆积),修改需重启程序生效
+                     格式: {LimitReadHeader, ReadHeaderTimeoutSec, LimitIdle, IdleTimeoutSec,
+                           LimitMaxHeader, MaxHeaderMB}
+                     刻意不提供 WriteTimeout/ReadTimeout: 会切断 SSE 流式对话与大请求体上传
  ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)
                      格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,默认8000)}
                      记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量
@@ -486,6 +573,75 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 ### 📡 局域网共享
 
 将 `config.json` 中的 `IP` 改为 `0.0.0.0`，局域网内的其他设备可通过 `http://你的IP:11434` 访问。
+
+### 🛡️ 过载保护（防高并发 OOM）
+
+如果你用高并发压测或批量请求（**尤其是带图片的请求**），可能会遇到"代理服务端突然崩溃、进程直接消失、日志里什么错误都没有"——这通常是**内存被撑爆后系统静默杀掉进程**。
+
+单个带图请求体里塞着几张图的 base64，轻松就是 10~40 MB。高并发时如果每个请求都被整体复制放大若干次，内存会随并发数线性爆炸。
+
+本程序已从两个方向解决：
+
+**① 消除内存放大**（默认启用，无需配置）
+
+- 请求体截断、图片检测、模型名还原、思考标签消毒、assistant 循环检测等环节都加了**字节级预检门禁**——不满足条件时直接跳过整体反序列化，不会把几十 MB 的 base64 再复制一份
+- 截断函数改为顺序扫描，不再 `[]rune(s)` 整份 4 倍膨胀
+- 跨请求复读记录只存 **SHA-256 摘要**，内存与回复长短无关
+
+**② 两道闸门**（`ProxyLimit`，需手动开启）
+
+```json
+"ProxyLimit": {
+    "Enable": true,
+    "LimitConcurrency": true,
+    "MaxConcurrent": 32,
+    "LimitQueueTimeout": true,
+    "QueueTimeoutSec": 60,
+    "LimitRequestBody": false,
+    "MaxRequestBodyMB": 32
+}
+```
+
+- **并发闸门**：同时处理的请求数超过 `MaxConcurrent` 时排队（**排队期间不读请求体、不占内存**），排队超时返回 `503`
+- **请求体上限**：超过 `MaxRequestBodyMB` 直接返回 `413`，不做任何解析
+- 两项都可独立开关：例如只想限请求体、不限并发，就把 `LimitConcurrency` 关掉
+
+**参数怎么定**（参考）：
+
+| 场景 | MaxConcurrent | MaxRequestBodyMB |
+| --- | --- | --- |
+| 纯文本对话 | 32 ~ 64 | 32 |
+| 偶尔带图 | 16 ~ 32 | 16 ~ 32 |
+| 高并发大量带图 | 8 ~ 16 | 建议关闭（`LimitRequestBody: false`） |
+
+> 💡 **调优思路**：并发数上限 ≈ 可用内存 ÷ 单个请求峰值内存。带图请求峰值按"图片体积 × 3"粗估（base64 + 反序列化副本 + 转发缓冲）。
+
+开启后若频繁看到 `503 服务繁忙`，说明并发压到了上限，可以调大 `MaxConcurrent` 或排查是否有请求卡住不释放。
+
+### ⏱️ 服务器超时（防慢速连接）
+
+`ServerTimeout` 管的是**客户端连进本服务**这一侧，与 `ConnPool`（上游连接池）方向相反。
+
+典型威胁是**慢速攻击（Slowloris）**：有人或某个抽风的客户端开上千个 TCP 连接，每个每秒只发 1 个字节的请求头。如果服务端没有任何超时，这些连接会永远挂着，占满 goroutine 和文件句柄，正常请求就进不来了。
+
+```json
+"ServerTimeout": {
+    "LimitReadHeader": true,
+    "ReadHeaderTimeoutSec": 30,
+    "LimitIdle": true,
+    "IdleTimeoutSec": 120,
+    "LimitMaxHeader": true,
+    "MaxHeaderMB": 1
+}
+```
+
+- `ReadHeaderTimeoutSec`：30 秒内必须把请求头发完，否则断开
+- `IdleTimeoutSec`：空闲的 keep-alive 连接多久回收
+- `MaxHeaderMB`：单次请求头最大体积（防有人塞个 50MB 的 `Cookie`）
+
+> ⚠️ **修改需重启程序生效**（Go 的 `http.Server` 字段不允许在 `Serve()` 之后修改）。
+>
+> ⚠️ **本程序刻意不提供 `ReadTimeout` / `WriteTimeout`**：`WriteTimeout` 会中途掐断 SSE 流式对话（用户看到半截话），`ReadTimeout` 会中断几十 MB 的大请求体上传。默认值就是推荐值，一般无需调整。
 
 ### 🏷️ 模型别名
 
@@ -539,9 +695,14 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 | --- | --- | --- |
 | `Enable` | bool | 总开关（默认 `false`，透明转发不改变任何行为，主动开启才生效） |
 | `Dedup` | bool | 内容去重：相邻块去重 + 全文尾部去重（≥20 字符才参与尾部匹配，防误杀短文本） |
-| `RepeatCheck` | bool | 跨请求复读检测：请求签名 + 回复全文与上一轮相同 → 判定复读（默认关闭，需记录每轮回复全文，且可能误伤正常重复提问） |
+| `RepeatCheck` | bool | 跨请求复读检测：请求签名 + 回复与上一轮相同 → 判定复读（默认关闭；记录只存 SHA-256 摘要，内存与回复长短无关，但"相同请求+相同回复"仍可能误伤正常重复提问） |
 | `MaxRepeat` | int | 连续重复熔断阈值（≥2 生效，默认 3） |
 | `WarnPrompt` | string | 跨请求注入的警告提示词（留空=内置默认） |
+| `ThinkTag` | bool | 思考标签消毒（独立于 `Enable` 生效，默认开启） |
+| `LimitRepeatEntries` | bool | 是否限制复读记录条数；`false` = 不限条数（map 可无限增长） |
+| `RepeatMaxEntries` | int | 复读记录会话数上限（`0` = 默认 256，上限 10000） |
+| `LimitRepeatTTL` | bool | 是否限制复读记录有效期；`false` = 永不过期 |
+| `RepeatTTLMin` | int | 复读记录保留分钟数（`0` = 默认 30，上限 1440） |
 
 **工作原理**：
 
@@ -552,6 +713,9 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 - **assistant 循环检测**：仅统计「连续段」内的重复——`user`/`system` 消息视为对话边界重置连续性，长会话中相隔多轮的重复调用（如先后两次读同一文件）不会误报；签名兼容 string/对象两种 arguments 形态，空 content 消息不参与检测；命中后警告注入带 **10 分钟冷却**（同一会话只提醒一次，避免污染上下文）
 - **多客户端隔离**：所有跨请求保护状态（警告标记/复读记录/冷却）以 `客户端IP + User-Agent 指纹` 为会话 key——同一台机器上同时运行 VS Code / VS2026 / Cherry Studio 等多个客户端时，各自状态互不污染（A 的熔断警告不会被 B 偷走，A 的冷却不会消耗 B 的额度）
 - 去重只影响 `content` 字段，`tool_calls` / `usage` / `finish_reason` / SSE 事件顺序全部保持原样
+- **复读记录只存摘要**：跨请求复读记录存的是请求签名与回复的 **SHA-256 摘要**（各 32 字节），而非回复全文——
+  一方面内存与回复长短完全无关（256 条≈ 16KB），另一方面**摘要比对等价于全文精确比对**，
+  避免了「截断到固定长度后比对」带来的误报（前 N 字符相同、后面不同会误判为复读）
 
 示例配置：
 
@@ -561,7 +725,12 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
     "Dedup": true,
     "RepeatCheck": false,
     "MaxRepeat": 3,
-    "WarnPrompt": "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"
+    "WarnPrompt": "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。",
+    "ThinkTag": true,
+    "LimitRepeatEntries": true,
+    "RepeatMaxEntries": 256,
+    "LimitRepeatTTL": true,
+    "RepeatTTLMin": 30
 }
 ```
 
@@ -596,7 +765,7 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 | --- | --- | --- |
 | `Enable` | bool | 总开关（默认 `true`） |
 | `MaxEntries` | int | 保留条数（1-1000，默认 100，超出丢弃最旧） |
-| `MaxBodyLen` | int | 请求/响应体截断长度（字符，默认 8000，上限 100000） |
+| `MaxBodyLen` | int | 请求/响应体截断长度（字符，默认 8000；`0` = 不截断，上限 5000000） |
 
 #### 🏷️ 保护标记一览
 
@@ -697,7 +866,7 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 
 > 💡 **提示**：替换规则按 `role+index` 的精确定位，只影响特定消息的文本内容，不影响消息结构。
 
-###🛡️ 自定义加密 UUID
+### 🛡️ 自定义加密 UUID
 
 修改源码中的 `secretUUID` 常量，使用 [UUID Generator](https://www.uuidgenerator.net/) 生成自己的 UUID，增强加密安全性。
 
@@ -760,9 +929,11 @@ Remote Convert Ollama/
 | ------------------------ | ----------------------------------- |
 | Go`net/http`           | HTTP 服务器和反向代理               |
 | AES-256-GCM              | API Key 加密存储                    |
-| SHA-256                  | 机器指纹 + UUID 密钥派生            |
+| SHA-256                  | 机器指纹 + UUID 密钥派生；跨请求复读记录摘要比对（等价全文精确比对，内存恒定） |
 | Server-Sent Events (SSE) | 流式响应实时转发；配置页面实时请求查看（`/api/realtime/events` 推送） |
 | 内存环形缓冲 + 互斥锁 | 实时请求记录（`RealtimeLog`）线程安全存储，只存内存不写磁盘 |
+| 带缓冲 channel 信号量 | 过载保护并发闸门（热更新时只替换信号量，在途请求归还到自己获取的那个 channel，不 panic 不阻塞） |
+| `io.LimitReader` / `io.Discard` | 请求体上限拦截与超限后丢弃剩余 body（防 413 响应被连接 RST 抢掉） |
 | 系统调用 (Windows)       | 控制台标题设置、磁盘卷序列号获取    |
 | `bufio` 流式解析       | OpenAI / Anthropic 流式数据实时转发 |
 | `sync.RWMutex`         | reasoning_content 线程安全读写      |
@@ -850,6 +1021,34 @@ Remote Convert Ollama/
 <summary><b>Q: 实时记录会写入磁盘吗？隐私安全吗？</b></summary>
 
 不会。实时记录仅存于程序内存，程序退出即清空。但记录包含对话内容，若配置页面未设访问密码，局域网内可访问者也能看到，建议启用访问密码。
+
+</details>
+
+<details>
+<summary><b>Q: 高并发请求时服务端突然崩溃 / 进程直接消失，日志里没有任何错误？</b></summary>
+
+这几乎都是**内存被撑爆后系统静默杀掉进程**（OOM Killer），所以看不到 Go 的 panic 栈。带图片的请求最容易触发——单个请求体就可能有几十 MB。
+
+解决步骤：
+
+1. 打开配置页「🔌 连接设置 → 🛡️ 过载保护 ProxyLimit」，**启用总开关**
+2. `MaxConcurrent` 按内存设置（如 16~32），`LimitRequestBody` 带图场景建议**关闭**
+3. 保存即生效，无需重启
+4. 若仍崩溃，把 `MaxConcurrent` 再调小（如 8），并观察是否有个别请求长时间卡住不释放
+
+> 💡 本程序已消除大部分内存放大（预检门禁跳过无谓的反序列化、截断不再 4 倍膨胀、复读记录只存摘要），配合 `ProxyLimit` 基本不会再 OOM。
+
+</details>
+
+<details>
+<summary><b>Q: 客户端报「503 服务繁忙」或「413 请求体过大」？</b></summary>
+
+两者都来自**过载保护**（`ProxyLimit`），说明防护正常工作了：
+
+- **503**：并发已满且排队超时。调大 `MaxConcurrent`，或把 `LimitQueueTimeout` 关掉（排队不限时）
+- **413**：请求体超过 `MaxRequestBodyMB`。调大该值，或把 `LimitRequestBody` 关掉（完全不限大小）
+
+如果不想要这些限制，直接关闭 `ProxyLimit.Enable`（总开关），就会恢复成完全透明转发。
 
 </details>
 

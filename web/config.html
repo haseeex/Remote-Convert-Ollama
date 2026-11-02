@@ -210,6 +210,34 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
           </div>
         </div>
       </div>
+
+      <div class="card">
+        <div class="head" data-i18n="limitTitle">🛡️ 过载保护 ProxyLimit <span class="hint" data-i18n="limitHint">防高并发 OOM：「限制」开关关闭即完全不限制；保存后立即生效，无需重启</span></div>
+        <div class="body">
+          <div class="row"><label class="switch"><input type="checkbox" id="LimitEnable" onchange="toggleLimitInputs()"><span class="track"></span><span class="lbl" data-i18n="limitEnable">启用：限制并发与请求体大小，防止高并发把服务撑爆（默认关闭）</span></label></div>
+
+          <div class="row sub-row" id="rowLimitConcurrency"><label class="switch"><input type="checkbox" id="LimitConcurrency" onchange="toggleLimitInputs()"><span class="track"></span><span class="lbl" data-i18n="limitConcurrency">限制并发数（关闭 = 不限并发，所有请求直接放行）</span></label></div>
+          <div class="row sub-row" id="rowLimitMaxConcurrent"><label data-i18n="limitMaxConcurrent">最大并发请求数 MaxConcurrent（超出排队，默认 32）</label><input type="number" id="LimitMaxConcurrent" min="1" max="4096" placeholder="32"></div>
+
+          <div class="row sub-row" id="rowLimitQueueTimeout"><label class="switch"><input type="checkbox" id="LimitQueueTimeout" onchange="toggleLimitInputs()"><span class="track"></span><span class="lbl" data-i18n="limitQueueTimeout">限制排队时间（关闭 = 排队不限时，只等客户端断开）</span></label></div>
+          <div class="row sub-row" id="rowLimitQueueTimeoutVal"><label data-i18n="limitQueueTimeoutVal">排队超时秒数 QueueTimeoutSec（超时返回 503，默认 60）</label><input type="number" id="LimitQueueTimeoutVal" min="1" max="3600" placeholder="60"></div>
+
+          <div class="row sub-row" id="rowLimitRequestBody"><label class="switch"><input type="checkbox" id="LimitRequestBody" onchange="toggleLimitInputs()"><span class="track"></span><span class="lbl" data-i18n="limitRequestBody">限制请求体大小（关闭 = 不限大小；带图片请求建议关闭）</span></label></div>
+          <div class="row sub-row" id="rowLimitMaxBody"><label data-i18n="limitMaxBody">单请求体上限 MaxRequestBodyMB（MB，超限返回 413，默认 32）</label><input type="number" id="LimitMaxBody" min="1" max="4096" placeholder="32"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="stTitle">⏱️ 服务器超时 ServerTimeout <span class="hint" data-i18n="stHint">防慢速连接堆积；修改 IP / PORT / 本组设置需重启程序生效</span></div>
+        <div class="body">
+          <div class="row"><label class="switch"><input type="checkbox" id="StLimitReadHeader" onchange="toggleServerTimeoutInputs()"><span class="track"></span><span class="lbl" data-i18n="stLimitReadHeader">限制读请求头时间（关闭 = 不限时）</span></label></div>
+          <div class="row sub-row" id="rowStReadHeader"><label data-i18n="stReadHeader">读请求头超时秒 ReadHeaderTimeoutSec（默认 30）</label><input type="number" id="StReadHeader" min="1" max="3600" placeholder="30"></div>
+          <div class="row"><label class="switch"><input type="checkbox" id="StLimitIdle" onchange="toggleServerTimeoutInputs()"><span class="track"></span><span class="lbl" data-i18n="stLimitIdle">回收空闲连接（关闭 = 不回收）</span></label></div>
+          <div class="row sub-row" id="rowStIdle"><label data-i18n="stIdle">空闲回收秒 IdleTimeoutSec（默认 120）</label><input type="number" id="StIdle" min="1" max="86400" placeholder="120"></div>
+          <div class="row"><label class="switch"><input type="checkbox" id="StLimitMaxHeader" onchange="toggleServerTimeoutInputs()"><span class="track"></span><span class="lbl" data-i18n="stLimitMaxHeader">限制请求头大小（关闭 = 不限大小）</span></label></div>
+          <div class="row sub-row" id="rowStMaxHeader"><label data-i18n="stMaxHeader">请求头上限 MB MaxHeaderMB（默认 1）</label><input type="number" id="StMaxHeader" min="1" max="64" placeholder="1"></div>
+        </div>
+      </div>
     </div>
 
     <div class="panel" id="tab-sec">
@@ -320,6 +348,10 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
           <div class="row sub-row" id="rowDlpRepeatCheck"><label class="switch"><input type="checkbox" id="DlpRepeatCheck"><span class="track"></span><span class="lbl" data-i18n="dlpRepeatCheck">跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）</span></label></div>
           <div class="row sub-row" id="rowDlpWarn"><label class="switch"><input type="checkbox" id="DlpWarn"><span class="track"></span><span class="lbl" data-i18n="dlpWarn">跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label></div>
           <div class="row sub-row" id="rowDlpMaxRepeat"><label data-i18n="dlpMaxRepeat">连续重复熔断阈值 MaxRepeat（≥2，默认 3）</label><input type="number" id="DlpMaxRepeat" min="2" max="20" value="3" placeholder="3"></div>
+          <div class="row sub-row" id="rowDlpRepeatEntries"><label class="switch"><input type="checkbox" id="DlpLimitRepeatEntries" onchange="toggleRepeatInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpLimitRepeatEntries">限制复读记录条数（关闭 = 不限条数）</span></label></div>
+          <div class="row sub-row" id="rowDlpRepeatEntriesVal"><label data-i18n="dlpRepeatEntries">复读记录会话数上限 RepeatMaxEntries（默认 256，仅占内存，不影响判断精度）</label><input type="number" id="DlpRepeatEntries" min="1" max="10000" placeholder="256"></div>
+          <div class="row sub-row" id="rowDlpRepeatTTL"><label class="switch"><input type="checkbox" id="DlpLimitRepeatTTL" onchange="toggleRepeatInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpLimitRepeatTTL">限制复读记录有效期（关闭 = 永不过期）</span></label></div>
+          <div class="row sub-row" id="rowDlpRepeatTTLVal"><label data-i18n="dlpRepeatTTL">复读记录保留分钟 RepeatTTLMin（默认 30）</label><input type="number" id="DlpRepeatTTL" min="1" max="1440" placeholder="30"></div>
           <div class="row sub-row" id="rowDlpWarnPrompt"><label data-i18n="dlpWarnPrompt">跨请求警告提示词 WarnPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="dlpWarnHint">熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label><textarea rows="3" id="DlpWarnPrompt" data-i18n-ph="dlpWarnPh" placeholder="【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"></textarea></div>
           </div>
         </div>
@@ -449,6 +481,18 @@ var I18N = {
     poolTitle: '🔌 连接池设置 ConnPool', poolHint: 'HTTP/2 + keep-alive 连接复用；0 值回退默认；保存后立即生效，无需重启',
     poolMaxIdle: '全局最大空闲连接 MaxIdleConns', poolMaxIdlePerHost: '每主机空闲连接 MaxIdleConnsPerHost', poolMaxConnsPerHost: '每主机并发上限 MaxConnsPerHost',
     poolIdleTimeout: '空闲回收秒数 IdleConnTimeoutSec', poolTlsTimeout: 'TLS 握手超时秒数 TLSHandshakeTimeoutSec', poolForceH2: '强制 HTTP/2（HTTPS 上游）',
+    limitTitle: '🛡️ 过载保护 ProxyLimit', limitHint: '防高并发 OOM：「限制」开关关闭即完全不限制；保存后立即生效，无需重启',
+    limitEnable: '启用：限制并发与请求体大小，防止高并发把服务撑爆（默认关闭）',
+    limitConcurrency: '限制并发数（关闭 = 不限并发，所有请求直接放行）',
+    limitMaxConcurrent: '最大并发请求数 MaxConcurrent（超出排队，默认 32）',
+    limitQueueTimeout: '限制排队时间（关闭 = 排队不限时，只等客户端断开）',
+    limitQueueTimeoutVal: '排队超时秒数 QueueTimeoutSec（超时返回 503，默认 60）',
+    limitRequestBody: '限制请求体大小（关闭 = 不限大小；带图片请求建议关闭）',
+    limitMaxBody: '单请求体上限 MaxRequestBodyMB（MB，超限返回 413，默认 32）',
+    stTitle: '⏱️ 服务器超时 ServerTimeout', stHint: '防慢速连接堆积；修改 IP / PORT / 本组设置需重启程序生效',
+    stLimitReadHeader: '限制读请求头时间（关闭 = 不限时）', stReadHeader: '读请求头超时秒 ReadHeaderTimeoutSec（默认 30）',
+    stLimitIdle: '回收空闲连接（关闭 = 不回收）', stIdle: '空闲回收秒 IdleTimeoutSec（默认 120）',
+    stLimitMaxHeader: '限制请求头大小（关闭 = 不限大小）', stMaxHeader: '请求头上限 MB MaxHeaderMB（默认 1）',
     secPw: '🔒 访问密码', secPwHint: '防止局域网内被他人乱改，留空保持不变',
     lblWebPw: '配置页面访问密码 WebConfigPassword', pwEnabled: '已启用', webPwPlaceholder: '留空保持不变；设置新密码后需重新登录',
     secPwTip: '💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改',
@@ -480,6 +524,10 @@ var I18N = {
     dlpWarn: '跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）',
     dlpThinkTag: '思考标签消毒（独立于总开关生效）：裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]，防止 ollama cloud 死循环（长上下文退化时模型会把字面 &lt;/thinking&gt; 泄漏进正文，客户端回放历史后上游渲染器在裸标签处截断消息历史导致死循环）',
     dlpMaxRepeat: '连续重复熔断阈值 MaxRepeat（≥2，默认 3）',
+    dlpRepeatEntries: '复读记录会话数上限 RepeatMaxEntries（默认 256，仅占内存，不影响判断精度）',
+    dlpLimitRepeatEntries: '限制复读记录条数（关闭 = 不限条数）',
+    dlpRepeatTTL: '复读记录保留分钟 RepeatTTLMin（默认 30）',
+    dlpLimitRepeatTTL: '限制复读记录有效期（关闭 = 永不过期）',
     dlpWarnPrompt: '跨请求警告提示词 WarnPrompt', dlpWarnHint: '熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）', dlpWarnPh: '【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。',
     rulesTitle: '✂️ 请求提示词替换 RequestPromptReplace', rulesHint: '自动替换请求中的指定文本', btnAddRule: '＋ 添加替换规则',
     btnReload: '🔄 重新加载', btnSave: '💾 保存配置', btnLogout: '🔒 退出登录',
@@ -538,6 +586,18 @@ var I18N = {
     poolTitle: '🔌 Connection Pool ConnPool', poolHint: 'HTTP/2 + keep-alive reuse; 0 = default; takes effect immediately after save',
     poolMaxIdle: 'Global max idle MaxIdleConns', poolMaxIdlePerHost: 'Idle per host MaxIdleConnsPerHost', poolMaxConnsPerHost: 'Max conns per host MaxConnsPerHost',
     poolIdleTimeout: 'Idle timeout (s) IdleConnTimeoutSec', poolTlsTimeout: 'TLS handshake timeout (s) TLSHandshakeTimeoutSec', poolForceH2: 'Force HTTP/2 (HTTPS upstream)',
+    limitTitle: '🛡️ Overload Protection ProxyLimit', limitHint: 'Prevents high-concurrency OOM: turning a "limit" switch off means truly unlimited; takes effect immediately after save',
+    limitEnable: 'Enable: limit concurrency and request body size to keep the service alive (off by default)',
+    limitConcurrency: 'Limit concurrency (off = unlimited, all requests pass through)',
+    limitMaxConcurrent: 'Max concurrent requests MaxConcurrent (excess queues, default 32)',
+    limitQueueTimeout: 'Limit queue wait time (off = queue without timeout, wait for client to disconnect)',
+    limitQueueTimeoutVal: 'Queue timeout seconds QueueTimeoutSec (returns 503, default 60)',
+    limitRequestBody: 'Limit request body size (off = unlimited; recommended off for image requests)',
+    limitMaxBody: 'Max request body MaxRequestBodyMB (MB, returns 413, default 32)',
+    stTitle: '⏱️ Server Timeout ServerTimeout', stHint: 'Prevents slow-connection pile-up; IP / PORT / this group require a restart',
+    stLimitReadHeader: 'Limit read-header time (off = unlimited)', stReadHeader: 'Read header timeout (s) ReadHeaderTimeoutSec (default 30)',
+    stLimitIdle: 'Reclaim idle connections (off = never reclaim)', stIdle: 'Idle timeout (s) IdleTimeoutSec (default 120)',
+    stLimitMaxHeader: 'Limit request header size (off = unlimited)', stMaxHeader: 'Max header MB MaxHeaderMB (default 1)',
     secPw: '🔒 Access Password', secPwHint: 'Prevent others on LAN from modifying; leave empty to keep',
     lblWebPw: 'Config page password WebConfigPassword', pwEnabled: 'Enabled', webPwPlaceholder: 'Leave empty to keep; new password requires re-login',
     secPwTip: '💡 After setting, /config requires password and all config APIs are protected',
@@ -569,6 +629,10 @@ var I18N = {
     dlpWarn: 'Cross-request warning injection: after tripping/repetition, inject a system warning into the next request so the AI stops repeating (once only)',
     dlpThinkTag: 'Think-tag sanitization (independent of master switch): replace bare &lt;thinking&gt;/&lt;/thinking&gt; leaks with [THINK-START]/[THINK-END] to prevent ollama cloud loops (under long-context degeneration the model leaks a literal &lt;/thinking&gt; into text; when clients replay that history, the upstream renderer truncates the message at the bare tag, causing a loop)',
     dlpMaxRepeat: 'Consecutive repeat trip threshold MaxRepeat (≥2, default 3)',
+    dlpRepeatEntries: 'Repeat record session limit RepeatMaxEntries (default 256, memory only, no effect on accuracy)',
+    dlpLimitRepeatEntries: 'Limit repeat record count (off = unlimited)',
+    dlpRepeatTTL: 'Repeat record TTL minutes RepeatTTLMin (default 30)',
+    dlpLimitRepeatTTL: 'Limit repeat record TTL (off = never expires)',
     dlpWarnPrompt: 'Cross-request warning prompt WarnPrompt', dlpWarnHint: 'After tripping, inject a system warning into the next request so the AI stops repeating (once only)', dlpWarnPh: '[System warning] Your previous reply contained duplicated content (possible loop). Stop repeating immediately and give the final answer directly. Do not repeat any already-output text.',
     rulesTitle: '✂️ Request Prompt Replace RequestPromptReplace', rulesHint: 'Automatically replace specified text in requests', btnAddRule: '＋ Add Rule',
     btnReload: '🔄 Reload', btnSave: '💾 Save Config', btnLogout: '🔒 Logout',
@@ -836,6 +900,27 @@ async function loadCfg(notify){
     $('poolTlsTimeout').value = cp.TLSHandshakeTimeoutSec || '';
     $('poolForceH2').checked = cp.ForceHTTP2 !== false;
 
+    // 过载保护（限制项均为「布尔开关 + 具体数值」）
+    var pl = c.ProxyLimit || {};
+    $('LimitEnable').checked = !!pl.Enable;
+    $('LimitConcurrency').checked = pl.LimitConcurrency !== false;
+    $('LimitMaxConcurrent').value = pl.MaxConcurrent || 32;
+    $('LimitQueueTimeout').checked = pl.LimitQueueTimeout !== false;
+    $('LimitQueueTimeoutVal').value = pl.QueueTimeoutSec || 60;
+    $('LimitRequestBody').checked = !!pl.LimitRequestBody;
+    $('LimitMaxBody').value = pl.MaxRequestBodyMB || 32;
+    toggleLimitInputs();
+
+    // 服务器超时（修改需重启生效）
+    var st = c.ServerTimeout || {};
+    $('StLimitReadHeader').checked = st.LimitReadHeader !== false;
+    $('StReadHeader').value = st.ReadHeaderTimeoutSec || 30;
+    $('StLimitIdle').checked = st.LimitIdle !== false;
+    $('StIdle').value = st.IdleTimeoutSec || 120;
+    $('StLimitMaxHeader').checked = st.LimitMaxHeader !== false;
+    $('StMaxHeader').value = st.MaxHeaderMB || 1;
+    toggleServerTimeoutInputs();
+
     // 模型上下文信息注入
     var ctx = c.ModelContextPrompt || {};
     $('CtxEnable').checked = !!ctx.Enable;
@@ -850,6 +935,11 @@ async function loadCfg(notify){
     $('DlpWarn').checked = !!dlp.Warn;
     $('DlpThinkTag').checked = dlp.ThinkTag !== false;
     $('DlpMaxRepeat').value = dlp.MaxRepeat || 3;
+    $('DlpRepeatEntries').value = (dlp.RepeatMaxEntries != null) ? dlp.RepeatMaxEntries : 256;
+    $('DlpRepeatTTL').value = (dlp.RepeatTTLMin != null) ? dlp.RepeatTTLMin : 30;
+    $('DlpLimitRepeatEntries').checked = dlp.LimitRepeatEntries !== false;
+    $('DlpLimitRepeatTTL').checked = dlp.LimitRepeatTTL !== false;
+    toggleRepeatInputs();
     $('DlpWarnPrompt').value = dlp.WarnPrompt || '';
     toggleDlpInputs();
 
@@ -988,13 +1078,53 @@ function removeAt(arr, i, render){ arr.splice(i, 1); render(); }
 // 注意：ThinkTag 思考标签消毒独立于总开关生效，不参与置灰
 function toggleDlpInputs(){
   var on = $('DlpEnable').checked;
-  ['rowDlpDedup','rowDlpRepeatCheck','rowDlpWarn','rowDlpMaxRepeat','rowDlpWarnPrompt'].forEach(function(id){
+  ['rowDlpDedup','rowDlpRepeatCheck','rowDlpWarn','rowDlpMaxRepeat','rowDlpRepeatEntries','rowDlpRepeatTTL','rowDlpRepeatEntriesVal','rowDlpRepeatTTLVal','rowDlpWarnPrompt'].forEach(function(id){
+    var row = $(id);
+    if(row){ row.classList.toggle('disabled-row', !on); }
+  });
+  // 总开关开启时，再按各自的限制开关细化置灰
+  if (on) { toggleRepeatInputs(); }
+}
+
+// 过载保护：总开关关闭时子项置灰
+function toggleLimitInputs(){
+  var on = $('LimitEnable').checked;
+  ['rowLimitMaxConcurrent','rowLimitQueueTimeout','rowLimitMaxBody'].forEach(function(id){
     var row = $(id);
     if(row){ row.classList.toggle('disabled-row', !on); }
   });
 }
 
-// 全局图片质量：custom 档位时显示自定义百分比输入框
+// 过载保护：三级联动（总开关 → 各项限制开关 → 具体数值输入框）
+function toggleLimitInputs(){
+  var on = $('LimitEnable').checked;
+  ['rowLimitConcurrency','rowLimitQueueTimeout','rowLimitRequestBody'].forEach(function(id){
+    var row = $(id); if(row){ row.classList.toggle('disabled-row', !on); }
+  });
+  // 子项数值框：总开关关 或 该项限制开关关 → 置灰
+  var pairs = [['LimitConcurrency','rowLimitMaxConcurrent'],['LimitQueueTimeout','rowLimitQueueTimeoutVal'],['LimitRequestBody','rowLimitMaxBody']];
+  pairs.forEach(function(p){
+    var row = $(p[1]); if(!row){ return; }
+    var disabled = !on || !$(p[0]).checked;
+    row.classList.toggle('disabled-row', disabled);
+  });
+}
+
+// 服务器超时：每项限制开关联动对应数值框
+function toggleServerTimeoutInputs(){
+  [['StLimitReadHeader','rowStReadHeader'],['StLimitIdle','rowStIdle'],['StLimitMaxHeader','rowStMaxHeader']].forEach(function(p){
+    var row = $(p[1]); if(!row){ return; }
+    row.classList.toggle('disabled-row', !$(p[0]).checked);
+  });
+}
+
+// 复读记录：限制开关联动数值框
+function toggleRepeatInputs(){
+  [['DlpLimitRepeatEntries','rowDlpRepeatEntriesVal'],['DlpLimitRepeatTTL','rowDlpRepeatTTLVal']].forEach(function(p){
+    var row = $(p[1]); if(!row){ return; }
+    row.classList.toggle('disabled-row', !$(p[0]).checked);
+  });
+}
 function toggleVisionQualityInputs(){
   var row = $('rowVisionCustomPercent');
   if(row){ row.style.display = $('VisionImageQuality').value === 'custom' ? '' : 'none'; }
@@ -1090,8 +1220,12 @@ function collectCfg(){
       Warn: $('DlpWarn').checked,
       ThinkTag: $('DlpThinkTag').checked,
       MaxRepeat: parseInt($('DlpMaxRepeat').value, 10) || 3,
+      RepeatMaxEntries: (function(){ var v = parseInt($('DlpRepeatEntries').value, 10); return isNaN(v) ? 256 : v; })(),
+      LimitRepeatEntries: $('DlpLimitRepeatEntries').checked,
+      RepeatTTLMin: (function(){ var v = parseInt($('DlpRepeatTTL').value, 10); return isNaN(v) ? 30 : v; })(),
+      LimitRepeatTTL: $('DlpLimitRepeatTTL').checked,
       WarnPrompt: $('DlpWarnPrompt').value.trim()
-    },
+      },
     ConnPool: {
       MaxIdleConns: parseInt($('poolMaxIdle').value, 10) || 0,
       MaxIdleConnsPerHost: parseInt($('poolMaxIdlePerHost').value, 10) || 0,
@@ -1099,6 +1233,23 @@ function collectCfg(){
       IdleConnTimeoutSec: parseInt($('poolIdleTimeout').value, 10) || 0,
       TLSHandshakeTimeoutSec: parseInt($('poolTlsTimeout').value, 10) || 0,
       ForceHTTP2: $('poolForceH2').checked
+    },
+    ProxyLimit: {
+      Enable: $('LimitEnable').checked,
+      LimitConcurrency: $('LimitConcurrency').checked,
+      MaxConcurrent: (function(){ var v = parseInt($('LimitMaxConcurrent').value, 10); return isNaN(v) ? 32 : v; })(),
+      LimitQueueTimeout: $('LimitQueueTimeout').checked,
+      QueueTimeoutSec: (function(){ var v = parseInt($('LimitQueueTimeoutVal').value, 10); return isNaN(v) ? 60 : v; })(),
+      LimitRequestBody: $('LimitRequestBody').checked,
+      MaxRequestBodyMB: (function(){ var v = parseInt($('LimitMaxBody').value, 10); return isNaN(v) ? 32 : v; })()
+    },
+    ServerTimeout: {
+      LimitReadHeader: $('StLimitReadHeader').checked,
+      ReadHeaderTimeoutSec: (function(){ var v = parseInt($('StReadHeader').value, 10); return isNaN(v) ? 30 : v; })(),
+      LimitIdle: $('StLimitIdle').checked,
+      IdleTimeoutSec: (function(){ var v = parseInt($('StIdle').value, 10); return isNaN(v) ? 120 : v; })(),
+      LimitMaxHeader: $('StLimitMaxHeader').checked,
+      MaxHeaderMB: (function(){ var v = parseInt($('StMaxHeader').value, 10); return isNaN(v) ? 1 : v; })()
     },
     OPENAI_BASE: $('OPENAI_BASE').value.trim(),
     OPENAI_KEY: $('OPENAI_KEY').value.trim(),
