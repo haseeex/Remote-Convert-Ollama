@@ -11,15 +11,22 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"image"
@@ -29,6 +36,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -457,6 +465,8 @@ type Config struct {
 	ProxyLimit ProxyLimit `json:"ProxyLimit,omitempty"`
 	// ServerTimeout 入站 HTTP 服务器超时（防慢速连接堆积），修改需重启程序生效
 	ServerTimeout ServerTimeout `json:"ServerTimeout,omitempty"`
+	// ServerTLS 入站 HTTPS 加密（自签名证书 / 自定义 CA），修改需重启程序生效
+	ServerTLS ServerTLS `json:"ServerTLS,omitempty"`
 	// RealtimeLog 实时请求查看：内存记录最近的请求与响应，供配置页面实时查看
 	RealtimeLog RealtimeLog `json:"RealtimeLog,omitempty"`
 }
@@ -675,6 +685,835 @@ func normalizeServerTimeout(st ServerTimeout) ServerTimeout {
 		st.MaxHeaderMB = defaultServerTimeout.MaxHeaderMB
 	}
 	return st
+}
+
+// ==================== 入站 HTTPS 加密 ServerTLS ====================
+
+// 入站监听模式
+const (
+	listenModeHTTP  = "http"  // 仅明文 HTTP（默认，保持原有行为）
+	listenModeBoth  = "both"  // 同一端口同时接受 HTTP 与 HTTPS（按首个字节自动识别，推荐）
+	listenModeHTTPS = "https" // 仅 HTTPS（强制加密，明文客户端会被拒绝）
+)
+
+// 证书来源模式
+const (
+	certModeAuto = "auto" // 自动生成本机自签名 CA 与服务器证书（默认，可在配置页下载 CA）
+	certModeFile = "file" // 使用用户提供的证书文件（如 XCA / OpenSSL 生成）
+)
+
+// defaultTLSCertDir 自动证书默认存放目录
+const defaultTLSCertDir = "certs"
+
+// ServerTLS 入站 HTTPS 加密配置。
+//
+// 设计目标：
+//   - 零配置可用：默认 CertMode=auto，首次启动自动生成 CA 与服务器证书（certs/ 目录），
+//     配置页可一键下载 CA 证书给客户端/系统信任；
+//   - 兼容已有证书：CertMode=file 时使用用户自己的证书（XCA、OpenSSL、mkcert 等签发）；
+//   - 同一端口可同时接受 HTTP 与 HTTPS（ListenMode=both）或强制 HTTPS（ListenMode=https），
+//     另可额外监听一个专用 HTTPS 端口，方便「老客户端走 HTTP、新客户端走 HTTPS」并存。
+//
+// ⚠️ 本组配置只在启动时读取（证书与监听器无法在运行中热切换），修改需重启程序生效。
+type ServerTLS struct {
+	Enable bool `json:"Enable"` // 总开关：关闭时完全保持原有 HTTP 行为
+	// ListenMode 主端口监听模式：http / both / https
+	ListenMode string `json:"ListenMode"`
+	// HTTPSPort 额外监听的专用 HTTPS 端口（留空=不额外监听；与主端口相同则忽略）
+	HTTPSPort string `json:"HTTPSPort,omitempty"`
+	// CertMode 证书来源：auto=自动生成 / file=使用自定义证书文件
+	CertMode string `json:"CertMode"`
+	// CertDir 自动证书目录（CertMode=auto 时生效，留空=certs）
+	CertDir string `json:"CertDir,omitempty"`
+	// CertFile 服务器证书文件（PEM，CertMode=file 时必填，可包含中间证书）
+	CertFile string `json:"CertFile,omitempty"`
+	// KeyFile 服务器私钥文件（PEM，CertMode=file 时必填）
+	KeyFile string `json:"KeyFile,omitempty"`
+	// CAFile CA 证书文件（PEM）：既作为服务器证书链补充发送给客户端，
+	// 也在 ClientAuth=true 时用于校验客户端证书（mTLS）。CertMode=auto 时留空=使用自动生成的 CA
+	CAFile string `json:"CAFile,omitempty"`
+	// CAKeyFile CA 私钥文件（PEM，需无密码）：配合 ReissueServerCert 使用——
+	// 当现有证书缺少 SAN（可选名称）扩展时，Chrome/Edge 会报 NET::ERR_CERT_COMMON_NAME_INVALID，
+	// 可用 CA 私钥重新签发一张带 SAN 的服务器证书（自动写入 CertDir）
+	CAKeyFile string `json:"CAKeyFile,omitempty"`
+	// ReissueServerCert 用 CA 私钥重新签发服务器证书（修正缺失 SAN / 过期 / 主机名不匹配问题）。
+	// ⚠️ bool 字段不能加 omitempty
+	ReissueServerCert bool `json:"ReissueServerCert"`
+	// ClientAuth 要求客户端提供证书（mTLS）；开启时必须能读取到 CA 证书
+	ClientAuth bool `json:"ClientAuth"`
+}
+
+// defaultServerTLS 入站加密内置默认值：默认关闭，保持原有透明转发行为
+var defaultServerTLS = ServerTLS{
+	Enable:     false,
+	ListenMode: listenModeHTTP,
+	CertMode:   certModeAuto,
+	CertDir:    defaultTLSCertDir,
+}
+
+// normalizeServerTLS 规范化入站加密配置：非法枚举回退默认值，端口只保留数字
+func normalizeServerTLS(st ServerTLS) ServerTLS {
+	switch strings.ToLower(strings.TrimSpace(st.ListenMode)) {
+	case listenModeBoth:
+		st.ListenMode = listenModeBoth
+	case listenModeHTTPS:
+		st.ListenMode = listenModeHTTPS
+	default:
+		st.ListenMode = listenModeHTTP
+	}
+	switch strings.ToLower(strings.TrimSpace(st.CertMode)) {
+	case certModeFile:
+		st.CertMode = certModeFile
+	default:
+		st.CertMode = certModeAuto
+	}
+	st.CertDir = strings.TrimSpace(st.CertDir)
+	if st.CertDir == "" {
+		st.CertDir = defaultTLSCertDir
+	}
+	st.HTTPSPort = strings.TrimSpace(st.HTTPSPort)
+	for _, r := range st.HTTPSPort {
+		if r < '0' || r > '9' {
+			st.HTTPSPort = ""
+			break
+		}
+	}
+	st.CertFile = strings.TrimSpace(st.CertFile)
+	st.KeyFile = strings.TrimSpace(st.KeyFile)
+	st.CAFile = strings.TrimSpace(st.CAFile)
+	st.CAKeyFile = strings.TrimSpace(st.CAKeyFile)
+	if st.CertMode != certModeFile {
+		// auto 模式不保存自定义路径（避免残留旧值造成困惑）
+		st.CertFile = ""
+		st.KeyFile = ""
+	}
+	return st
+}
+
+// tlsHostList 生成自动证书需要覆盖的主机名/IP 列表（至少包含 localhost 与 127.0.0.1）
+func tlsHostList(listenIP string) []string {
+	hosts := []string{"localhost", "127.0.0.1", "::1"}
+	if h, err := os.Hostname(); err == nil && strings.TrimSpace(h) != "" {
+		hosts = append(hosts, strings.TrimSpace(h))
+	}
+	if ip := strings.TrimSpace(listenIP); ip != "" {
+		if parsed := net.ParseIP(ip); parsed != nil && !parsed.IsUnspecified() {
+			hosts = append(hosts, ip)
+		}
+	}
+	// 去重
+	seen := make(map[string]bool, len(hosts))
+	out := hosts[:0]
+	for _, h := range hosts {
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	return out
+}
+
+// autoCertPaths 自动证书文件路径
+func autoCertPaths(dir string) (certFile, keyFile, caFile string) {
+	if dir == "" {
+		dir = defaultTLSCertDir
+	}
+	return filepath.Join(dir, "server.crt"), filepath.Join(dir, "server.key"), filepath.Join(dir, "ca.crt")
+}
+
+// writePEMFile 以指定权限写入 PEM 文件（先写临时文件再原子替换，避免中断损坏）
+func writePEMFile(path, blockType string, der []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(f, &pem.Block{Type: blockType, Bytes: der}); err != nil {
+		f.Close()
+		os.Remove(path + ".tmp")
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path + ".tmp")
+		return err
+	}
+	return os.Rename(path+".tmp", path)
+}
+
+// loadCertFile 读取并解析 PEM 证书文件中的第一张证书
+func loadCertFile(path string) (*x509.Certificate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("不是有效的 PEM 证书文件: " + path)
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// loadECKeyFile 读取 ECDSA 私钥（兼容 SEC1 与 PKCS#8）
+func loadECKeyFile(path string) (*ecdsa.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			return nil, errors.New("不是有效的 PEM 私钥文件: " + path)
+		}
+		if k, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
+			return k, nil
+		}
+		if k8, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+			if k, ok := k8.(*ecdsa.PrivateKey); ok {
+				return k, nil
+			}
+		}
+		data = rest
+	}
+}
+
+// loadSignerFile 读取私钥文件，支持 ECDSA / RSA / Ed25519（SEC1 / PKCS#1 / PKCS#8）。
+// ⚠️ 不支持带密码的私钥（Go 标准库不提供口令解密）——遇到时给出明确提示。
+func loadSignerFile(path string) (crypto.Signer, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	encrypted := false
+	for {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if strings.Contains(block.Type, "ENCRYPTED") {
+			encrypted = true
+		}
+		if !strings.Contains(block.Type, "PRIVATE KEY") {
+			data = rest
+			continue
+		}
+		if k, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
+			return k, nil
+		}
+		if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+			return k, nil
+		}
+		if k, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+			if signer, ok := k.(crypto.Signer); ok {
+				return signer, nil
+			}
+			return nil, errors.New("私钥类型不受支持（仅支持 RSA / ECDSA / Ed25519）: " + path)
+		}
+		data = rest
+	}
+	if encrypted {
+		return nil, errors.New("私钥被口令加密，无法直接使用——请在 XCA / OpenSSL 中导出「无密码（不加密）」的私钥: " + path)
+	}
+	return nil, errors.New("不是有效的 PEM 私钥文件: " + path)
+}
+
+// ecKeyMatchesCert 判断私钥是否与证书匹配
+func ecKeyMatchesCert(cert *x509.Certificate, key *ecdsa.PrivateKey) bool {
+	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return false
+	}
+	return pub.X.Cmp(key.PublicKey.X) == 0 && pub.Y.Cmp(key.PublicKey.Y) == 0
+}
+
+// signerMatchesCert 判断任意私钥是否与证书公钥匹配
+func signerMatchesCert(cert *x509.Certificate, signer crypto.Signer) bool {
+	a, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return false
+	}
+	b, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(a, b)
+}
+
+// randomSerial 生成 128 位随机证书序列号
+func randomSerial() (*big.Int, error) {
+	limit := new(big.Int).Lsh(big.NewInt(1), 128)
+	return rand.Int(rand.Reader, limit)
+}
+
+// loadOrCreateCA 读取 CA 证书与私钥；不存在或损坏时重新生成（ECDSA P-256，有效期 10 年）
+func loadOrCreateCA(certPath, keyPath string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
+	if cert, err := loadCertFile(certPath); err == nil && cert.IsCA {
+		if key, err := loadECKeyFile(keyPath); err == nil && ecKeyMatchesCert(cert, key) {
+			return cert, key, nil
+		}
+	}
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	serial, err := randomSerial()
+	if err != nil {
+		return nil, nil, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "Remote Convert Ollama Local CA", Organization: []string{"Remote Convert Ollama"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := writePEMFile(certPath, "CERTIFICATE", der, 0644); err != nil {
+		return nil, nil, err
+	}
+	if err := writePEMFile(keyPath, "EC PRIVATE KEY", keyDER, 0600); err != nil {
+		return nil, nil, err
+	}
+	fmt.Println("🔐 已生成自签名 CA 证书:", certPath)
+	return cert, key, nil
+}
+
+// serverCertUsable 判断现有服务器证书能否继续复用（未临近过期 + 由当前 CA 签发 + 覆盖全部主机名）
+func serverCertUsable(cert, ca *x509.Certificate, hosts []string) bool {
+	if time.Now().After(cert.NotAfter.Add(-30 * 24 * time.Hour)) {
+		return false
+	}
+	if err := cert.CheckSignatureFrom(ca); err != nil {
+		return false
+	}
+	for _, h := range hosts {
+		if err := cert.VerifyHostname(h); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// createServerCert 用 CA 签发服务器证书（证书链 = 服务器证书 + CA 证书），有效期 3 年
+func createServerCert(certPath, keyPath string, ca *x509.Certificate, caKey *ecdsa.PrivateKey, hosts []string) error {
+	return createServerCertWith(certPath, keyPath, ca, caKey, nil, hosts)
+}
+
+// createServerCertWith 用任意类型的 CA 私钥签发服务器证书，并把 extraChain（中间证书等）一并写入证书链。
+//
+// 为什么需要它：XCA / OpenSSL 手工签发的证书常常**没有 SAN（Subject Alternative Name）**，
+// 现代浏览器（Chrome 58+ / Edge）完全忽略 CN，只认 SAN → 必然报 NET::ERR_CERT_COMMON_NAME_INVALID。
+// 这里用用户自己的 CA 私钥重签一张 SAN 完整、有效期 3 年的服务器证书，客户端无需重新信任 CA。
+func createServerCertWith(certPath, keyPath string, ca *x509.Certificate, caKey crypto.Signer, extraChain [][]byte, hosts []string) error {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	serial, err := randomSerial()
+	if err != nil {
+		return err
+	}
+	cn := "localhost"
+	if len(hosts) > 0 {
+		cn = hosts[0]
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: cn, Organization: []string{"Remote Convert Ollama"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(3, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, h)
+		}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+	if err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+
+	// 证书链文件：服务器证书 + CA 证书 + 额外中间证书
+	var chain bytes.Buffer
+	if err := pem.Encode(&chain, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		return err
+	}
+	if err := pem.Encode(&chain, &pem.Block{Type: "CERTIFICATE", Bytes: ca.Raw}); err != nil {
+		return err
+	}
+	for _, extra := range extraChain {
+		if len(extra) == 0 || bytes.Equal(extra, ca.Raw) {
+			continue
+		}
+		if err := pem.Encode(&chain, &pem.Block{Type: "CERTIFICATE", Bytes: extra}); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(certPath+".tmp", chain.Bytes(), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(certPath+".tmp", certPath); err != nil {
+		return err
+	}
+	return writePEMFile(keyPath, "EC PRIVATE KEY", keyDER, 0600)
+}
+
+// loadCAChain 读取 CA 文件：返回第一张证书（用于签名校验 / mTLS）与其余证书（仅用于补链）
+func loadCAChain(path string) (*x509.Certificate, [][]byte, []byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var first *x509.Certificate
+	var rest [][]byte
+	raw := data
+	for {
+		block, next := pem.Decode(raw)
+		if block == nil {
+			break
+		}
+		raw = next
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		if first == nil {
+			c, perr := x509.ParseCertificate(block.Bytes)
+			if perr != nil {
+				return nil, nil, nil, perr
+			}
+			first = c
+			continue
+		}
+		rest = append(rest, block.Bytes)
+	}
+	if first == nil {
+		return nil, nil, nil, errors.New("CA 文件不含有效证书: " + path)
+	}
+	return first, rest, data, nil
+}
+
+// reissueServerCertIfNeeded 用用户提供的 CA 证书 + CA 私钥，重新签发一张 SAN 完整的服务器证书。
+// 输出到 dir/server.crt 与 dir/server.key，返回实际使用的证书路径。
+func reissueServerCertIfNeeded(st ServerTLS, dir string, hosts []string) (certFile, keyFile string, warnings []string, err error) {
+	if st.CAFile == "" {
+		return "", "", nil, errors.New("「用 CA 重签服务器证书」需要配置 CA 证书 CAFile")
+	}
+	if st.CAKeyFile == "" {
+		return "", "", nil, errors.New("「用 CA 重签服务器证书」需要配置 CA 私钥 CAKeyFile（需无密码）")
+	}
+	caCert, extraChain, _, err := loadCAChain(st.CAFile)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("读取 CA 证书失败: %w", err)
+	}
+	if !caCert.IsCA {
+		return "", "", nil, errors.New("CAFile 里的第一张证书不是 CA 证书（缺少 BasicConstraints CA:TRUE）")
+	}
+	caKey, err := loadSignerFile(st.CAKeyFile)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("读取 CA 私钥失败: %w", err)
+	}
+	if !signerMatchesCert(caCert, caKey) {
+		return "", "", nil, errors.New("CA 私钥与 CA 证书不匹配，请检查是否选错了文件")
+	}
+
+	if dir == "" {
+		dir = defaultTLSCertDir
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", "", nil, fmt.Errorf("创建证书目录失败: %w", err)
+	}
+	certFile = filepath.Join(dir, "server.crt")
+	keyFile = filepath.Join(dir, "server.key")
+
+	// 已存在由同一 CA 签发且 SAN 完整的证书 → 直接复用（避免每次启动都换证书）
+	if existing, err := loadCertFile(certFile); err == nil {
+		if existing.CheckSignatureFrom(caCert) == nil && serverCertUsable(existing, caCert, hosts) {
+			return certFile, keyFile, nil, nil
+		}
+	}
+	if err := createServerCertWith(certFile, keyFile, caCert, caKey, extraChain, hosts); err != nil {
+		return "", "", nil, fmt.Errorf("重签服务器证书失败: %w", err)
+	}
+	fmt.Println("🔐 已用自定义 CA 重签服务器证书:", certFile)
+	return certFile, keyFile, nil, nil
+}
+
+// serverCertWarnings 诊断服务器证书的常见问题（返回可直接展示给用户的中文提示）
+func serverCertWarnings(leaf *x509.Certificate, chainLen int) []string {
+	var warns []string
+	now := time.Now()
+	if len(leaf.DNSNames) == 0 && len(leaf.IPAddresses) == 0 {
+		warns = append(warns, "证书缺少「使用者可选名称 SAN」扩展：Chrome / Edge 只认 SAN 不认 CN，访问时会报 NET::ERR_CERT_COMMON_NAME_INVALID。请开启「用 CA 重签服务器证书」，或用 XCA 重新签发并在「Subject Alternative Name」里填写 127.0.0.1 / localhost")
+	}
+	if now.After(leaf.NotAfter) {
+		warns = append(warns, "服务器证书已过期（"+leaf.NotAfter.Format("2006-01-02")+"），请重签或续期")
+	} else if now.Before(leaf.NotBefore) {
+		warns = append(warns, "服务器证书尚未生效（生效时间 "+leaf.NotBefore.Format("2006-01-02 15:04")+"），请检查系统时间或证书")
+	} else if leaf.NotAfter.Sub(now) < 30*24*time.Hour {
+		warns = append(warns, "服务器证书将在 30 天内过期（"+leaf.NotAfter.Format("2006-01-02")+"），建议提前重签")
+	}
+	if chainLen <= 1 && !bytes.Equal(leaf.RawIssuer, leaf.RawSubject) {
+		warns = append(warns, "服务器证书未携带中间证书：若客户端未预装中间 CA，会报「证书链不完整」。请把中间 CA 与根 CA 合并写入 CAFile")
+	}
+	if len(leaf.CRLDistributionPoints) == 0 && len(leaf.OCSPServer) == 0 {
+		warns = append(warns, "证书不含吊销信息（CRL / OCSP）：Windows schannel 客户端（如 curl、.NET）可能报 CRYPT_E_NO_REVOCATION_CHECK；浏览器一般不受影响，命令行验证可加 --ssl-no-revoke")
+	}
+	return warns
+}
+
+// ensureAutoCert 确保自动证书存在且可用（必要时自动生成 / 续期），返回证书、私钥与 CA 路径
+func ensureAutoCert(dir string, hosts []string) (certFile, keyFile, caFile string, err error) {
+	if dir == "" {
+		dir = defaultTLSCertDir
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", "", "", fmt.Errorf("创建证书目录失败: %w", err)
+	}
+	certFile, keyFile, caFile = autoCertPaths(dir)
+	caCertPath := filepath.Join(dir, "ca.crt")
+	caKeyPath := filepath.Join(dir, "ca.key")
+
+	caCert, caKey, err := loadOrCreateCA(caCertPath, caKeyPath)
+	if err != nil {
+		return "", "", "", fmt.Errorf("加载/生成 CA 失败: %w", err)
+	}
+
+	// 现有服务器证书仍可用则不重建（避免每次启动都换证书导致客户端信任失效）
+	if cert, err := loadCertFile(certFile); err == nil {
+		if _, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil && serverCertUsable(cert, caCert, hosts) {
+			return certFile, keyFile, caFile, nil
+		}
+	}
+
+	if err := createServerCert(certFile, keyFile, caCert, caKey, hosts); err != nil {
+		return "", "", "", fmt.Errorf("签发服务器证书失败: %w", err)
+	}
+	fmt.Println("🔐 已生成服务器证书:", certFile)
+	return certFile, keyFile, caFile, nil
+}
+
+// buildInboundTLSConfig 根据配置构建入站 TLS 配置。
+// listenIP 用于自动证书生成时确定需要覆盖的 IP。
+func buildInboundTLSConfig(st ServerTLS, listenIP string) (*tls.Config, error) {
+	st = normalizeServerTLS(st)
+	hosts := tlsHostList(listenIP)
+
+	certFile, keyFile, caFile := st.CertFile, st.KeyFile, st.CAFile
+	if st.CertMode == certModeAuto {
+		var err error
+		certFile, keyFile, caFile, err = ensureAutoCert(st.CertDir, hosts)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if certFile == "" || keyFile == "" {
+			return nil, errors.New("证书文件与私钥文件路径不能为空")
+		}
+		// 用自定义 CA 重签：修正「缺少 SAN / 过期 / 主机名不匹配」的证书
+		// （XCA 手动签发常常没有 SAN，浏览器会直接拒绝）
+		if st.ReissueServerCert {
+			newCert, newKey, warns, err := reissueServerCertIfNeeded(st, st.CertDir, hosts)
+			if err != nil {
+				return nil, err
+			}
+			certFile, keyFile = newCert, newKey
+			for _, w := range warns {
+				fmt.Println("⚠️ " + w)
+			}
+		}
+	}
+	if _, err := os.Stat(certFile); err != nil {
+		return nil, fmt.Errorf("证书文件不可读: %w", err)
+	}
+	if _, err := os.Stat(keyFile); err != nil {
+		return nil, fmt.Errorf("私钥文件不可读: %w", err)
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("加载证书失败（私钥可能带密码或格式不匹配）: %w", err)
+	}
+
+	var caPool *x509.CertPool
+	if caFile != "" {
+		if _, err := os.Stat(caFile); err != nil {
+			return nil, fmt.Errorf("CA 证书文件不可读: %w", err)
+		}
+		caFirst, caRest, caPEM, err := loadCAChain(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("读取 CA 证书失败: %w", err)
+		}
+		caPool = x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(caPEM) {
+			return nil, errors.New("CA 证书文件不是有效的 PEM 证书")
+		}
+		// 证书链里只有服务器证书时，把 CAFile 中的全部证书（CA + 中间证书）追加进去，
+		// 客户端才能完整验证；注意跳过与链中已有的重复项。
+		if len(cert.Certificate) == 1 {
+			cert.Certificate = append(cert.Certificate, caFirst.Raw)
+			for _, extra := range caRest {
+				if !bytes.Equal(extra, caFirst.Raw) {
+					cert.Certificate = append(cert.Certificate, extra)
+				}
+			}
+		}
+	}
+
+	cfgTLS := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+	if st.ClientAuth {
+		if caPool == nil {
+			return nil, errors.New("开启「要求客户端证书」时必须配置 CA 证书")
+		}
+		cfgTLS.ClientAuth = tls.RequireAndVerifyClientCert
+		cfgTLS.ClientCAs = caPool
+	}
+	return cfgTLS, nil
+}
+
+// certFingerprint 返回证书 SHA-256 指纹（AA:BB:CC 形式，便于人工核对）
+func certFingerprint(cert *x509.Certificate) string {
+	sum := sha256.Sum256(cert.Raw)
+	hexStr := strings.ToUpper(hex.EncodeToString(sum[:]))
+	parts := make([]string, 0, len(hexStr)/2)
+	for i := 0; i+1 < len(hexStr); i += 2 {
+		parts = append(parts, hexStr[i:i+2])
+	}
+	return strings.Join(parts, ":")
+}
+
+// tlsCAInfo 证书状态视图（供配置页展示 CA 指纹与下载入口）
+type tlsCAInfo struct {
+	Available      bool     `json:"Available"`
+	CertMode       string   `json:"CertMode"`
+	CertFile       string   `json:"CertFile,omitempty"`
+	KeyFile        string   `json:"KeyFile,omitempty"`
+	CAFile         string   `json:"CAFile,omitempty"`
+	Subject        string   `json:"Subject,omitempty"`
+	Issuer         string   `json:"Issuer,omitempty"`
+	Fingerprint    string   `json:"Fingerprint,omitempty"`
+	NotAfter       string   `json:"NotAfter,omitempty"`
+	ServerDomains  []string `json:"ServerDomains,omitempty"`
+	ServerNotAfter string   `json:"ServerNotAfter,omitempty"`
+	ServerSubject  string   `json:"ServerSubject,omitempty"`
+	ServerIssuer   string   `json:"ServerIssuer,omitempty"`
+	ChainLength    int      `json:"ChainLength,omitempty"`
+	Reissued       bool     `json:"Reissued"`
+	Warnings       []string `json:"Warnings,omitempty"`
+	Error          string   `json:"Error,omitempty"`
+	Downloadable   bool     `json:"Downloadable"`
+}
+
+// buildTLSInfo 读取证书文件并生成配置页展示信息（不生成证书，仅在保存/启动时生成）
+func buildTLSInfo(st ServerTLS, listenIP string) tlsCAInfo {
+	st = normalizeServerTLS(st)
+	info := tlsCAInfo{Available: false, CertMode: st.CertMode, CertFile: st.CertFile, KeyFile: st.KeyFile, CAFile: st.CAFile}
+	certFile, caFile := st.CertFile, st.CAFile
+	if st.CertMode == certModeAuto {
+		certFile, _, caFile = autoCertPaths(st.CertDir)
+		info.CertFile = certFile
+		info.CAFile = caFile
+	} else if st.ReissueServerCert {
+		// 重签模式：运行时实际使用的是 CertDir 下的重签证书
+		dir := st.CertDir
+		if dir == "" {
+			dir = defaultTLSCertDir
+		}
+		if reissued := filepath.Join(dir, "server.crt"); fileExists(reissued) {
+			certFile = reissued
+			info.CertFile = reissued
+			info.Reissued = true
+		}
+	}
+
+	leaf, err := loadCertFile(certFile)
+	if err != nil {
+		info.Error = err.Error()
+		return info
+	}
+	info.Available = true
+	info.Subject = leaf.Subject.String()
+	info.Issuer = leaf.Issuer.String()
+	info.ServerSubject = leaf.Subject.String()
+	info.ServerIssuer = leaf.Issuer.String()
+	info.ServerNotAfter = leaf.NotAfter.Format("2006-01-02")
+	info.ServerDomains = append(leaf.DNSNames, func() []string {
+		out := make([]string, 0, len(leaf.IPAddresses))
+		for _, ip := range leaf.IPAddresses {
+			out = append(out, ip.String())
+		}
+		return out
+	}()...)
+
+	// 统计证书链长度（文件里写了多少张证书）
+	chainLen := 1
+	if data, err := os.ReadFile(certFile); err == nil {
+		chainLen = bytes.Count(data, []byte("-----BEGIN CERTIFICATE-----"))
+	}
+	info.ChainLength = chainLen
+	info.Warnings = serverCertWarnings(leaf, chainLen)
+
+	caCert := leaf
+	if caFile != "" {
+		if c, err := loadCertFile(caFile); err == nil {
+			caCert = c
+			info.Downloadable = true
+		}
+	}
+	info.Fingerprint = certFingerprint(caCert)
+	info.NotAfter = caCert.NotAfter.Format("2006-01-02")
+	return info
+}
+
+// fileExists 判断文件是否存在（不区分是否可读）
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// ==================== 同端口 HTTP / HTTPS 自适应监听 ====================
+
+// peekedConn 把已经预读过的字节回放给上层（用于协议探测后的明文 HTTP 连接）
+type peekedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *peekedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+// detectListener 同端口协议自适应监听器：
+// 读首个字节判断是否为 TLS 握手记录（0x16），是则按 TLS 处理，否则按明文 HTTP 处理。
+// 这样客户端把 URL 写成 http:// 或 https:// 都能连同一个端口。
+//
+// ⚠️ 协议探测在独立 goroutine 中完成：若在 Accept 里同步 Peek，
+// 一个只连不发数据的慢连接就会卡住整个 Accept 循环（其它客户端全部排队）。
+type detectListener struct {
+	net.Listener
+	tlsCfg    *tls.Config
+	forceTLS  bool // true=只接受 TLS（ListenMode=https）
+	connCh    chan detectResult
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// detectResult 协议探测结果
+type detectResult struct {
+	conn net.Conn
+	err  error
+}
+
+// newDetectListener 创建自适应监听器并启动后台接受循环
+func newDetectListener(ln net.Listener, tlsCfg *tls.Config, forceTLS bool) *detectListener {
+	l := &detectListener{
+		Listener: ln,
+		tlsCfg:   tlsCfg,
+		forceTLS: forceTLS,
+		connCh:   make(chan detectResult, 256),
+		done:     make(chan struct{}),
+	}
+	go l.loop()
+	return l
+}
+
+func (l *detectListener) loop() {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			select {
+			case <-l.done:
+				return
+			case l.connCh <- detectResult{err: err}:
+			}
+			// Accept 连续报错时稍作退避，避免忙循环
+			select {
+			case <-l.done:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			continue
+		}
+		go func(c net.Conn) {
+			conn, ok := l.wrap(c)
+			if !ok {
+				_ = c.Close()
+				return
+			}
+			select {
+			case <-l.done:
+				_ = conn.Close()
+			case l.connCh <- detectResult{conn: conn}:
+			default:
+				_ = conn.Close() // 队列满（极端情况）：丢弃连接，让客户端重连
+			}
+		}(c)
+	}
+}
+
+// Accept 从探测结果队列取已就绪的连接
+func (l *detectListener) Accept() (net.Conn, error) {
+	select {
+	case <-l.done:
+		return nil, net.ErrClosed
+	case res := <-l.connCh:
+		if res.err != nil {
+			return nil, res.err
+		}
+		return res.conn, nil
+	}
+}
+
+func (l *detectListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return l.Listener.Close()
+}
+
+func (l *detectListener) wrap(c net.Conn) (net.Conn, bool) {
+	if l.forceTLS {
+		return tls.Server(c, l.tlsCfg), true
+	}
+	// 首个字节探测：TLS 1.x 握手记录类型为 0x16（SSLv2 ClientHello 为 0x80，极为罕见，按明文处理）
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReaderSize(c, 4096)
+	first, err := br.Peek(1)
+	_ = c.SetReadDeadline(time.Time{})
+	if err != nil {
+		return nil, false
+	}
+	pc := &peekedConn{Conn: c, r: br}
+	if first[0] == 0x16 {
+		return tls.Server(pc, l.tlsCfg), true
+	}
+	return pc, true
 }
 
 // ==================== 过载保护：并发闸门 ====================
@@ -2699,6 +3538,7 @@ func getDefaultConfig() Config {
 		ConnPool:      defaultConnPool,
 		ProxyLimit:    defaultProxyLimit,    // 过载保护（并发闸门 + 请求体上限），默认关闭
 		ServerTimeout: defaultServerTimeout, // 入站服务器超时（需重启生效）
+		ServerTLS:     defaultServerTLS,     // 入站 HTTPS 加密（默认关闭，需重启生效）
 		RealtimeLog:   defaultRealtimeLog,
 	}
 }
@@ -2797,6 +3637,19 @@ func printConfigHelp() {
 	fmt.Println("                           LimitIdle: 是否回收空闲连接, IdleTimeoutSec: 空闲回收秒(默认120),")
 	fmt.Println("                           LimitMaxHeader: 是否限请求头大小, MaxHeaderMB: 请求头上限MB(默认1)}")
 	fmt.Println("                     刻意不提供 WriteTimeout/ReadTimeout: 会切断 SSE 流式对话与大请求体上传")
+	fmt.Println(" ▼ ServerTLS        : 入站 HTTPS 加密(自签名证书 / 自定义 CA),修改需重启程序生效")
+	fmt.Println("                     格式: {Enable: 总开关, ListenMode: 监听模式(http=仅HTTP/both=同端口同时支持HTTP+HTTPS/https=仅HTTPS),")
+	fmt.Println("                           HTTPSPort: 额外专用 HTTPS 端口(留空=不额外监听), CertMode: 证书来源(auto=自动生成/file=自定义),")
+	fmt.Println("                           CertDir: 自动证书目录(默认 certs), CertFile: 证书文件, KeyFile: 私钥文件,")
+	fmt.Println("                           CAFile: CA 证书(并入证书链;开启 ClientAuth 时用于校验客户端), ClientAuth: 是否要求客户端证书(mTLS)}")
+	fmt.Println("                     auto 模式首次启动自动生成 certs/ca.crt + certs/server.crt(+key),服务器证书有效期 3 年、CA 10 年,")
+	fmt.Println("                     临近过期或主机名变化会自动续签;配置页「下载 CA 证书」可直接导出 CA 给客户端/系统信任")
+	fmt.Println("                     file 模式可使用 XCA / OpenSSL / mkcert 生成的证书;CAFile 留空则不附加证书链、也不支持 mTLS")
+	fmt.Println("                     ⚠️ XCA 手动签发的证书常常没有 SAN(使用者可选名称),Chrome/Edge 只认 SAN 不认 CN → 必然报证书错误;")
+	fmt.Println("                       此时配置 CAKeyFile(CA 私钥,需无密码)+ ReissueServerCert=true,程序会用你的 CA 重签一张 SAN 完整的证书")
+	fmt.Println("                       重签结果写入 CertDir/server.crt + server.key(有效期 3 年,由同一 CA 签发,客户端无需重新信任)")
+	fmt.Println("                     CAFile 可写多张证书(中间 CA + 根 CA),程序会把它们全部并入证书链,避免「证书链不完整」")
+	fmt.Println("                     both 模式按连接首字节自动识别 TLS 握手,客户端 URL 写 http:// 或 https:// 都能连同一端口")
 	fmt.Println(" ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)")
 	fmt.Println("                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,0=不截断,默认8000,上限5000000)}")
 	fmt.Println("                     记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量")
@@ -3086,6 +3939,13 @@ func loadConfig() {
 			needSave = true
 		}
 		stored.ServerTimeout = normalizeServerTimeout(stored.ServerTimeout)
+	}
+	// 入站 HTTPS 加密：缺字段时补默认（默认关闭 → 升级后保持原有 HTTP 行为）
+	if _, ok := rawMap["ServerTLS"]; !ok {
+		stored.ServerTLS = defaultCfg.ServerTLS
+		needSave = true
+	} else {
+		stored.ServerTLS = normalizeServerTLS(stored.ServerTLS)
 	}
 	if _, ok := rawMap["RealtimeLog"]; !ok {
 		stored.RealtimeLog = defaultCfg.RealtimeLog
@@ -4382,6 +5242,38 @@ func apiRevealProxyKeys(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "keys": keys})
 }
 
+// apiDownloadCA 下载用于客户端信任的 CA 证书（PEM）。
+// 自动模式返回 certs/ca.crt；自定义模式返回配置的 CAFile；无可用 CA 时返回 404。
+func apiDownloadCA(w http.ResponseWriter, r *http.Request) {
+	if !requireConfigAuth(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	st := normalizeServerTLS(cfg.ServerTLS)
+	caFile := st.CAFile
+	if st.CertMode == certModeAuto {
+		_, _, caFile = autoCertPaths(st.CertDir)
+	}
+	if caFile == "" {
+		http.Error(w, "未配置 CA 证书", http.StatusNotFound)
+		return
+	}
+	data, err := os.ReadFile(caFile)
+	if err != nil {
+		http.Error(w, "CA 证书不可读: "+err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Header().Set("Content-Disposition", `attachment; filename="remote-convert-ollama-ca.crt"`)
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodHead {
+		w.Write(data)
+	}
+}
+
 // proxyKeyView 代理密钥的前端视图（脱敏：不含密钥内容，仅含引用 KeyRef）
 type proxyKeyView struct {
 	Name   string `json:"Name"`             // 密钥名称
@@ -4411,7 +5303,8 @@ func apiGetConfig(w http.ResponseWriter, r *http.Request) {
 		OpenAIKeySet         bool           `json:"OPENAI_KEY_SET"`
 		WebConfigPasswordSet bool           `json:"WEB_CONFIG_PASSWORD_SET"`
 		ProxyAPIKeys         []proxyKeyView `json:"ProxyAPIKeys"`
-	}{Config: cfgCopy, OpenAIKeySet: keySet, WebConfigPasswordSet: pwSet, ProxyAPIKeys: proxyKeys})
+		TLS_CA               tlsCAInfo      `json:"TLS_CA"`
+	}{Config: cfgCopy, OpenAIKeySet: keySet, WebConfigPasswordSet: pwSet, ProxyAPIKeys: proxyKeys, TLS_CA: buildTLSInfo(cfgCopy.ServerTLS, cfgCopy.IP)})
 }
 
 // apiSaveConfig 保存配置到 config.json 并同步更新运行内存
@@ -4509,6 +5402,14 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.ProxyLimit = normalizeProxyLimit(newCfg.ProxyLimit)
 	// 规范化入站服务器超时（修改需重启生效）
 	newCfg.ServerTimeout = normalizeServerTimeout(newCfg.ServerTimeout)
+	// 规范化入站 HTTPS 加密配置；启用时立即校验/生成证书，避免保存后重启才发现问题
+	newCfg.ServerTLS = normalizeServerTLS(newCfg.ServerTLS)
+	if newCfg.ServerTLS.Enable {
+		if _, err := buildInboundTLSConfig(newCfg.ServerTLS, newCfg.IP); err != nil {
+			http.Error(w, "HTTPS 加密配置有误: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	// 规范化模型详细设置里的图片质量配置
 	for m, s := range newCfg.ModelDetailedSettings {
 		if s.VisionImageQuality != nil {
@@ -4611,6 +5512,9 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 
 	// 总开关已启用但无有效密钥时提示（否则入站鉴权不会生效）
 	msg := "✅ 配置已保存。IP/PORT 修改需重启程序生效，其余配置立即生效。"
+	if newCfg.ServerTLS.Enable {
+		msg += " 🔐 入站加密 ServerTLS 需重启程序生效。"
+	}
 	if newCfg.ProxyAPIKeyEnabled {
 		valid := 0
 		for _, e := range newPlainKeys {
@@ -4674,6 +5578,8 @@ func applyConfigToRuntime(newCfg Config) {
 	applyProxyLimitConfig(cfg.ProxyLimit)
 	// 应用入站服务器超时（仅存配置，http.Server 字段不允许在 Serve 后修改，需重启生效）
 	cfg.ServerTimeout = normalizeServerTimeout(newCfg.ServerTimeout)
+	// 应用入站 HTTPS 加密配置（证书与监听器在启动时构建，修改需重启生效）
+	cfg.ServerTLS = normalizeServerTLS(newCfg.ServerTLS)
 	// 应用实时请求查看配置（记录条数/截断长度，立即生效）
 	cfg.RealtimeLog = normalizeRealtimeLog(newCfg.RealtimeLog)
 }
@@ -8846,6 +9752,7 @@ func main() {
 	http.HandleFunc("/api/config/logout", apiConfigLogout)
 	http.HandleFunc("/api/config/test", apiTestConfig)
 	http.HandleFunc("/api/config/reveal", apiRevealProxyKeys)
+	http.HandleFunc("/api/config/ca", apiDownloadCA)
 	http.HandleFunc("/api/realtime", handleRealtimeAPI)
 	http.HandleFunc("/api/realtime/events", handleRealtimeEvents)
 
@@ -8857,7 +9764,11 @@ func main() {
 	if cfg.WebConfigPassword != "" {
 		pwHint = "（已启用访问密码 🔒）"
 	}
-	fmt.Println("⚙️ 配置管理页面: http://" + webHost + ":" + cfg.PORT + "/config " + pwHint)
+	webScheme := "http"
+	if cfg.ServerTLS.Enable && normalizeServerTLS(cfg.ServerTLS).ListenMode == listenModeHTTPS {
+		webScheme = "https"
+	}
+	fmt.Println("⚙️ 配置管理页面: " + webScheme + "://" + webHost + ":" + cfg.PORT + "/config " + pwHint)
 
 	if cfg.ProxyAPIKeyEnabled {
 		valid := 0
@@ -8905,7 +9816,88 @@ func main() {
 		IdleTimeout:       idleTimeout,       // 0 = 不限制；空闲 keep-alive 连接超时回收
 		MaxHeaderBytes:    maxHeaderBytes,    // 请求头上限（0 会被 Go 当成 1MB，所以不限制时给极大值）
 	}
+
+	// ==================== 入站 HTTPS 加密 ServerTLS ====================
+	// 证书与监听器只能在启动时构建（http.Server / tls.Config 无法在 Serve 之后替换），
+	// 因此「入站 HTTPS 加密」的配置修改需重启程序生效。
+	tlsSt := normalizeServerTLS(cfg.ServerTLS)
+	var inboundTLS *tls.Config
+	if tlsSt.Enable {
+		cfgTLS, err := buildInboundTLSConfig(tlsSt, cfg.IP)
+		if err != nil {
+			fmt.Printf("❌ HTTPS 加密启动失败: %v\n   已回退为仅 HTTP 服务，请在配置页修正证书设置后重启\n", err)
+		} else {
+			inboundTLS = cfgTLS
+			if tlsSt.ListenMode == listenModeHTTPS {
+				fmt.Println("🔒 入站加密: 已启用（仅 HTTPS，明文 HTTP 请求会被拒绝）")
+			} else {
+				fmt.Println("🔒 入站加密: 已启用（同一端口同时支持 HTTP 与 HTTPS，按首字节自动识别）")
+			}
+			if info := buildTLSInfo(tlsSt, cfg.IP); info.Fingerprint != "" {
+				fmt.Println("🔐 CA 证书指纹: " + info.Fingerprint + "（有效期至 " + info.NotAfter + "）")
+				fmt.Println("   客户端信任该 CA 后即可用 https:// 访问；配置页「下载 CA 证书」可直接导出")
+				if info.Reissued {
+					fmt.Println("🔐 服务器证书: 已用自定义 CA 重签（" + info.CertFile + "）")
+				}
+				for _, w := range info.Warnings {
+					fmt.Println("⚠️ HTTPS 证书提示: " + w)
+				}
+			}
+			if tlsSt.HTTPSPort != "" && tlsSt.HTTPSPort != cfg.PORT {
+				fmt.Println("🔒 额外 HTTPS 端口: " + cfg.IP + ":" + tlsSt.HTTPSPort)
+			}
+		}
+	}
+
+	if inboundTLS != nil {
+		ln, err := net.Listen("tcp", srv.Addr)
+		if err != nil {
+			fmt.Printf("服务异常退出: %v\n", err)
+			return
+		}
+		// 额外 HTTPS 专用端口（主端口仍按 ListenMode 工作，方便老客户端继续走 HTTP）
+		if port := tlsSt.HTTPSPort; port != "" && port != cfg.PORT {
+			go startExtraHTTPS(cfg.IP+":"+port, st, inboundTLS)
+		}
+		listener := newDetectListener(ln, inboundTLS, tlsSt.ListenMode == listenModeHTTPS)
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Printf("服务异常退出: %v\n", err)
+		}
+		return
+	}
+
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Printf("服务异常退出: %v\n", err)
+	}
+}
+
+// startExtraHTTPS 启动额外的专用 HTTPS 监听（与主服务共享路由），供需要固定加密端口的客户端使用。
+func startExtraHTTPS(addr string, st ServerTimeout, tlsCfg *tls.Config) {
+	var readHeaderTimeout, idleTimeout time.Duration
+	if st.LimitReadHeader {
+		readHeaderTimeout = time.Duration(st.ReadHeaderTimeoutSec) * time.Second
+	}
+	if st.LimitIdle {
+		idleTimeout = time.Duration(st.IdleTimeoutSec) * time.Second
+	}
+	maxHeaderBytes := int(^uint32(0) >> 1)
+	if st.LimitMaxHeader {
+		maxHeaderBytes = st.MaxHeaderMB << 20
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("❌ 额外 HTTPS 端口监听失败 %s: %v\n", addr, err)
+		return
+	}
+	fmt.Println("🔒 额外 HTTPS 端口已监听: " + addr)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           nil,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+	if err := srv.Serve(tls.NewListener(ln, tlsCfg)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Printf("额外 HTTPS 服务退出: %v\n", err)
 	}
 }

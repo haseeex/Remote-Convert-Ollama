@@ -154,6 +154,10 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .dlp-group{border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-top:4px;background:rgba(13,17,23,.35);display:flex;flex-direction:column;gap:10px}
 .dlp-group .row:first-child{margin-top:0}
 .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}
+.tls-info{font-size:11.5px;line-height:1.75;color:var(--muted);word-break:break-all;background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.tls-info .tls-err{color:var(--yellow)}
+.tls-info .tls-key{color:var(--muted)}
+.tls-info .tls-val{color:var(--text)}
 .empty{color:var(--muted);font-size:13px;text-align:center;padding:10px}
 .pkrow{display:grid;grid-template-columns:1fr 1.5fr auto auto auto auto;gap:8px;align-items:center}
 .pk-enable{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer;white-space:nowrap}
@@ -251,6 +255,46 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
         <div class="body grid2">
           <div class="row"><label data-i18n="lblIP">监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
           <div class="row"><label data-i18n="lblPort">监听端口 PORT</label><input type="text" id="PORT" placeholder="11434"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="tlsTitle">🔐 入站加密 ServerTLS <span class="hint" data-i18n="tlsHint">修改需重启程序生效；不启用时保持原有 HTTP 行为</span></div>
+        <div class="body">
+          <div class="row"><label class="switch"><input type="checkbox" id="TLSEnable" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsEnable">启用：代理服务端支持 HTTPS（自签名证书或自定义证书）</span></label></div>
+
+          <div class="row sub-row" id="rowTLSListenMode"><label data-i18n="tlsListenMode">监听模式 ListenMode</label>
+            <select id="TLSListenMode" onchange="toggleTLSInputs()">
+              <option value="http" data-i18n="tlsModeHttp">仅 HTTP（不加密，等同关闭）</option>
+              <option value="both" data-i18n="tlsModeBoth">同一端口同时支持 HTTP 与 HTTPS（推荐，按首字节自动识别）</option>
+              <option value="https" data-i18n="tlsModeHttps">仅 HTTPS（强制加密，明文请求被拒绝）</option>
+            </select>
+          </div>
+
+          <div class="row sub-row" id="rowTLSHttpsPort"><label data-i18n="tlsHttpsPort">额外 HTTPS 端口 HTTPSPort（留空 = 不额外监听）</label><input type="text" id="TLSHTTPSPort" placeholder="如 11443"></div>
+
+          <div class="row sub-row" id="rowTLSCertMode"><label data-i18n="tlsCertMode">证书来源 CertMode</label>
+            <select id="TLSCertMode" onchange="toggleTLSInputs()">
+              <option value="auto" data-i18n="tlsCertAuto">自动生成自签名证书（内置 CA，可下载信任）</option>
+              <option value="file" data-i18n="tlsCertFileMode">使用自定义证书文件（XCA / OpenSSL / mkcert）</option>
+            </select>
+          </div>
+
+          <div class="row sub-row" id="rowTLSCertDir"><label data-i18n="tlsCertDir">自动证书目录 CertDir（留空 = certs）</label><input type="text" id="TLSCertDir" placeholder="certs"></div>
+          <div class="row sub-row" id="rowTLSCertFile"><label data-i18n="tlsCertFileLbl">服务器证书 CertFile（PEM）</label><input type="text" id="TLSCertFile" placeholder="xca/127.0.0.1公钥.pem"></div>
+          <div class="row sub-row" id="rowTLSKeyFile"><label data-i18n="tlsKeyFileLbl">服务器私钥 KeyFile（PEM）</label><input type="text" id="TLSKeyFile" placeholder="xca/127.0.0.1私钥.pem"></div>
+          <div class="row sub-row" id="rowTLSCAFile"><label data-i18n="tlsCAFileLbl">CA 证书 CAFile（PEM，可选：补全证书链 / mTLS 校验）</label><input type="text" id="TLSCAFile" placeholder="xca/vancat组织.crt"></div>
+          <div class="row sub-row" id="rowTLSCAKeyFile"><label data-i18n="tlsCAKeyFileLbl">CA 私钥 CAKeyFile（PEM，需无密码；仅重签时使用）</label><input type="text" id="TLSCAKeyFile" placeholder="xca/中间CA私钥.pem"></div>
+
+          <div class="row sub-row" id="rowTLSReissue"><label class="switch"><input type="checkbox" id="TLSReissue" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsReissue">用 CA 重签服务器证书（修复缺少 SAN / 过期 / 主机名不匹配；XCA 的证书常常必须开）</span></label></div>
+
+          <div class="row sub-row" id="rowTLSClientAuth"><label class="switch"><input type="checkbox" id="TLSClientAuth"><span class="track"></span><span class="lbl" data-i18n="tlsClientAuth">要求客户端证书（mTLS，需要配置 CA 证书）</span></label></div>
+
+          <div class="row sub-row" id="rowTLSCAInfo">
+            <label data-i18n="tlsCAInfoLabel">CA 证书状态</label>
+            <div class="mono tls-info" id="tlsCAInfo">-</div>
+            <div><button class="btn small" id="btnDownloadCA" onclick="downloadCA()" data-i18n="btnDownloadCA">⬇️ 下载 CA 证书</button></div>
+          </div>
         </div>
       </div>
 
@@ -558,7 +602,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 </div>
 
 <script>
-var state = { aliases: [], details: [], rules: [], proxyKeys: [], modelOptions: [], modelsFetched: false };
+var state = { aliases: [], details: [], rules: [], proxyKeys: [], modelOptions: [], modelsFetched: false, tlsCA: null };
 // 实时请求状态提前声明：applyI18n（DOMContentLoaded 时调用）会重渲染列表
 var rtState = { items: [], open: {}, paused: false, es: null, lastId: 0, enabled: true, timer: null };
 
@@ -614,6 +658,30 @@ var I18N = {
     stLimitReadHeader: '限制读请求头时间（关闭 = 不限时）', stReadHeader: '读请求头超时秒 ReadHeaderTimeoutSec（默认 30）',
     stLimitIdle: '回收空闲连接（关闭 = 不回收）', stIdle: '空闲回收秒 IdleTimeoutSec（默认 120）',
     stLimitMaxHeader: '限制请求头大小（关闭 = 不限大小）', stMaxHeader: '请求头上限 MB MaxHeaderMB（默认 1）',
+    tlsTitle: '🔐 入站加密 ServerTLS', tlsHint: '修改需重启程序生效；不启用时保持原有 HTTP 行为',
+    tlsEnable: '启用：代理服务端支持 HTTPS（自签名证书或自定义证书）',
+    tlsListenMode: '监听模式 ListenMode',
+    tlsModeHttp: '仅 HTTP（不加密，等同关闭）',
+    tlsModeBoth: '同一端口同时支持 HTTP 与 HTTPS（推荐，按首字节自动识别）',
+    tlsModeHttps: '仅 HTTPS（强制加密，明文请求被拒绝）',
+    tlsHttpsPort: '额外 HTTPS 端口 HTTPSPort（留空 = 不额外监听）',
+    tlsCertMode: '证书来源 CertMode',
+    tlsCertAuto: '自动生成自签名证书（内置 CA，可下载信任）',
+    tlsCertFileMode: '使用自定义证书文件（XCA / OpenSSL / mkcert）',
+    tlsCertDir: '自动证书目录 CertDir（留空 = certs）',
+    tlsCertFileLbl: '服务器证书 CertFile（PEM）',
+    tlsKeyFileLbl: '服务器私钥 KeyFile（PEM）',
+    tlsCAFileLbl: 'CA 证书 CAFile（PEM，可选：补全证书链 / mTLS 校验）',
+    tlsCAKeyFileLbl: 'CA 私钥 CAKeyFile（PEM，需无密码；仅重签时使用）',
+    tlsReissue: '用 CA 重签服务器证书（修复缺少 SAN / 过期 / 主机名不匹配；XCA 的证书常常必须开）',
+    tlsClientAuth: '要求客户端证书（mTLS，需要配置 CA 证书）',
+    tlsCAInfoLabel: 'CA 证书状态',
+    btnDownloadCA: '⬇️ 下载 CA 证书',
+    tlsNoCert: '证书尚未生成（启用后保存配置会自动生成；自定义模式请先填好证书路径）',
+    tlsFingerprint: 'CA 指纹 SHA-256', tlsNotAfter: 'CA 有效期至', tlsServerDomains: '服务器证书覆盖域名/IP', tlsSep: '：',
+    tlsCADownloaded: '⬇️ CA 证书已开始下载', tlsCADownloadFail: '下载 CA 证书失败: ',
+    tlsChain: '证书链张数', tlsReissued: '已用 CA 重签', tlsServerSubject: '服务器证书主题',
+    tlsWarnings: '证书诊断告警：',
     secPw: '🔒 访问密码', secPwHint: '防止局域网内被他人乱改，留空保持不变',
     lblWebPw: '配置页面访问密码 WebConfigPassword', pwEnabled: '已启用', webPwPlaceholder: '留空保持不变；设置新密码后需重新登录',
     secPwTip: '💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改',
@@ -741,6 +809,30 @@ var I18N = {
     stLimitReadHeader: 'Limit read-header time (off = unlimited)', stReadHeader: 'Read header timeout (s) ReadHeaderTimeoutSec (default 30)',
     stLimitIdle: 'Reclaim idle connections (off = never reclaim)', stIdle: 'Idle timeout (s) IdleTimeoutSec (default 120)',
     stLimitMaxHeader: 'Limit request header size (off = unlimited)', stMaxHeader: 'Max header MB MaxHeaderMB (default 1)',
+    tlsTitle: '🔐 Inbound TLS ServerTLS', tlsHint: 'Changes require a restart; leaving it disabled keeps the original HTTP behavior',
+    tlsEnable: 'Enable: serve HTTPS on this proxy (self-signed or custom certificate)',
+    tlsListenMode: 'Listen mode ListenMode',
+    tlsModeHttp: 'HTTP only (no encryption, same as disabled)',
+    tlsModeBoth: 'HTTP and HTTPS on the same port (recommended, auto-detected)',
+    tlsModeHttps: 'HTTPS only (forced encryption; plaintext requests are rejected)',
+    tlsHttpsPort: 'Extra HTTPS port HTTPSPort (empty = no extra listener)',
+    tlsCertMode: 'Certificate source CertMode',
+    tlsCertAuto: 'Auto-generate self-signed certificate (built-in CA, downloadable)',
+    tlsCertFileMode: 'Use custom certificate files (XCA / OpenSSL / mkcert)',
+    tlsCertDir: 'Auto certificate directory CertDir (empty = certs)',
+    tlsCertFileLbl: 'Server certificate CertFile (PEM)',
+    tlsKeyFileLbl: 'Server private key KeyFile (PEM)',
+    tlsCAFileLbl: 'CA certificate CAFile (PEM, optional: chain completion / mTLS validation)',
+    tlsCAKeyFileLbl: 'CA private key CAKeyFile (PEM, must be unencrypted; used only when re-issuing)',
+    tlsReissue: 'Re-issue server certificate with the CA (fixes missing SAN / expiry / hostname mismatch; usually required for XCA certificates)',
+    tlsClientAuth: 'Require client certificate (mTLS; a CA certificate is required)',
+    tlsCAInfoLabel: 'CA certificate status',
+    btnDownloadCA: '⬇️ Download CA certificate',
+    tlsNoCert: 'Certificate not generated yet (saving with TLS enabled will generate it; for custom mode fill in the paths first)',
+    tlsFingerprint: 'CA SHA-256 fingerprint', tlsNotAfter: 'CA valid until', tlsServerDomains: 'Server certificate covers', tlsSep: ': ',
+    tlsCADownloaded: '⬇️ CA certificate download started', tlsCADownloadFail: 'Failed to download CA certificate: ',
+    tlsChain: 'Certificates in chain', tlsReissued: 'Re-issued by CA', tlsServerSubject: 'Server certificate subject',
+    tlsWarnings: 'Certificate diagnostics:',
     secPw: '🔒 Access Password', secPwHint: 'Prevent others on LAN from modifying; leave empty to keep',
     lblWebPw: 'Config page password WebConfigPassword', pwEnabled: 'Enabled', webPwPlaceholder: 'Leave empty to keep; new password requires re-login',
     secPwTip: '💡 After setting, /config requires password and all config APIs are protected',
@@ -869,6 +961,8 @@ function applyI18n(){
   // 模型选择器浮层：切语言时 renderDetails() 会重建卡片 DOM，
   // 旧输入框节点被销毁 → 浮层失去锚点，直接关闭最稳妥（下次点开自然重定位）
   if(typeof mpClose === 'function'){ mpClose(); }
+  // 入站加密的 CA 状态文本随语言切换刷新（内容含动态字段）
+  if(typeof renderTLSInfo === 'function' && state.tlsCA){ renderTLSInfo(state.tlsCA); }
   // 更新监听地址（含翻译）
   updateListenAddr();
 }
@@ -1362,6 +1456,23 @@ async function loadCfg(notify){
     $('StMaxHeader').value = st.MaxHeaderMB || 1;
     toggleServerTimeoutInputs();
 
+    // 入站 HTTPS 加密 ServerTLS（修改需重启生效）
+    var ts = c.ServerTLS || {};
+    $('TLSEnable').checked = !!ts.Enable;
+    $('TLSListenMode').value = (ts.ListenMode === 'both' || ts.ListenMode === 'https') ? ts.ListenMode : 'http';
+    $('TLSHTTPSPort').value = ts.HTTPSPort || '';
+    $('TLSCertMode').value = (ts.CertMode === 'file') ? 'file' : 'auto';
+    $('TLSCertDir').value = ts.CertDir || 'certs';
+    $('TLSCertFile').value = ts.CertFile || '';
+    $('TLSKeyFile').value = ts.KeyFile || '';
+    $('TLSCAFile').value = ts.CAFile || '';
+    $('TLSCAKeyFile').value = ts.CAKeyFile || '';
+    $('TLSReissue').checked = !!ts.ReissueServerCert;
+    $('TLSClientAuth').checked = !!ts.ClientAuth;
+    state.tlsCA = c.TLS_CA || null;
+    renderTLSInfo(state.tlsCA);
+    toggleTLSInputs();
+
     // 模型上下文信息注入
     var ctx = c.ModelContextPrompt || {};
     $('CtxEnable').checked = !!ctx.Enable;
@@ -1571,6 +1682,96 @@ function toggleLimitInputs(){
   });
 }
 
+// 入站 HTTPS 加密：总开关 / 监听模式 / 证书来源 三级联动
+function toggleTLSInputs(){
+  var on = $('TLSEnable').checked;
+  var modeHttp = $('TLSListenMode').value === 'http';
+  var active = on && !modeHttp; // 仅 HTTP 时无需证书配置
+  var fileMode = $('TLSCertMode').value === 'file';
+  // 始终可见但按启用状态置灰
+  ['rowTLSListenMode','rowTLSHttpsPort','rowTLSCertMode','rowTLSCAFile','rowTLSClientAuth','rowTLSCAInfo'].forEach(function(id){
+    var r = $(id); if(r){ r.classList.toggle('disabled-row', !on); }
+  });
+  // 证书来源二选一
+  var autoRow = $('rowTLSCertDir'), certRow = $('rowTLSCertFile'), keyRow = $('rowTLSKeyFile');
+  if(autoRow){ autoRow.classList.toggle('hidden', fileMode); autoRow.classList.toggle('disabled-row', !active); }
+  if(certRow){ certRow.classList.toggle('hidden', !fileMode); certRow.classList.toggle('disabled-row', !active); }
+  if(keyRow){ keyRow.classList.toggle('hidden', !fileMode); keyRow.classList.toggle('disabled-row', !active); }
+  // 重签开关与 CA 私钥（仅自定义证书模式有意义）
+  var reissueOn = $('TLSReissue').checked;
+  var rr = $('rowTLSReissue'), rk = $('rowTLSCAKeyFile');
+  if(rr){ rr.classList.toggle('hidden', !fileMode); rr.classList.toggle('disabled-row', !active); }
+  if(rk){
+    rk.classList.toggle('hidden', !fileMode || !reissueOn);
+    rk.classList.toggle('disabled-row', !active || !reissueOn);
+  }
+  // 仅 HTTP 模式下其余配置项一并置灰
+  ['rowTLSHttpsPort','rowTLSCertMode','rowTLSCAFile','rowTLSClientAuth','rowTLSCAInfo'].forEach(function(id){
+    var r = $(id); if(r){ r.classList.toggle('disabled-row', !active); }
+  });
+}
+
+// 渲染 CA 证书状态（指纹 / 有效期 / 覆盖域名）
+function renderTLSInfo(info){
+  var box = $('tlsCAInfo');
+  var btn = $('btnDownloadCA');
+  if(!box){ return; }
+  if(!info || !info.Available){
+    var msg = t('tlsNoCert');
+    if(info && info.Error){ msg += t('tlsSep') + info.Error; }
+    box.innerHTML = '<span class="tls-err">' + tlsEsc(msg) + '</span>';
+    if(btn){ btn.disabled = true; }
+    return;
+  }
+  var lines = [
+    [t('tlsFingerprint'), info.Fingerprint || '-'],
+    [t('tlsNotAfter'), info.NotAfter || '-'],
+    [t('tlsServerDomains'), (info.ServerDomains || []).join(', ') || '-']
+  ];
+  if(info.ServerSubject){ lines.push([t('tlsServerSubject'), info.ServerSubject]); }
+  if(info.ChainLength){ lines.push([t('tlsChain'), String(info.ChainLength)]); }
+  if(info.Reissued){ lines.push([t('tlsReissued'), info.CertFile || '-']); }
+  var body = lines.map(function(p){
+    return '<span class="tls-key">' + tlsEsc(p[0]) + tlsEsc(t('tlsSep')) + '</span><span class="tls-val mono">' + tlsEsc(p[1]) + '</span>';
+  }).join('<br>');
+  if(info.Warnings && info.Warnings.length){
+    body += '<br><span class="tls-err">' + tlsEsc(t('tlsWarnings')) + '</span><br>';
+    body += info.Warnings.map(function(w){ return '<span class="tls-err">⚠️ ' + tlsEsc(w) + '</span>'; }).join('<br>');
+  }
+  box.innerHTML = body;
+  if(btn){ btn.disabled = !info.Downloadable; }
+}
+
+function tlsEsc(s){
+  return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+  });
+}
+
+// 下载 CA 证书（带配置页会话鉴权；浏览器直接打开链接无法带请求头，故用 fetch + Blob）
+async function downloadCA(){
+  try{
+    var token = sessionStorage.getItem('cfg_token') || '';
+    var headers = {};
+    if(token){ headers['X-Config-Token'] = token; }
+    var res = await fetch('/api/config/ca', { headers: headers });
+    if(res.status === 401){ clearSession(); showLogin(); throw new Error(t('authExpired')); }
+    if(!res.ok){ throw new Error('HTTP ' + res.status); }
+    var blob = await res.blob();
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'remote-convert-ollama-ca.crt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 5000);
+    toast(t('tlsCADownloaded'), 'ok');
+  }catch(e){
+    toast(t('tlsCADownloadFail') + e.message, 'err');
+  }
+}
+
 // 服务器超时：每项限制开关联动对应数值框
 function toggleServerTimeoutInputs(){
   [['StLimitReadHeader','rowStReadHeader'],['StLimitIdle','rowStIdle'],['StLimitMaxHeader','rowStMaxHeader']].forEach(function(p){
@@ -1734,6 +1935,19 @@ function collectCfg(){
       IdleTimeoutSec: (function(){ var v = parseInt($('StIdle').value, 10); return isNaN(v) ? 120 : v; })(),
       LimitMaxHeader: $('StLimitMaxHeader').checked,
       MaxHeaderMB: (function(){ var v = parseInt($('StMaxHeader').value, 10); return isNaN(v) ? 1 : v; })()
+    },
+    ServerTLS: {
+      Enable: $('TLSEnable').checked,
+      ListenMode: $('TLSListenMode').value,
+      HTTPSPort: $('TLSHTTPSPort').value.trim(),
+      CertMode: $('TLSCertMode').value,
+      CertDir: $('TLSCertDir').value.trim(),
+      CertFile: $('TLSCertFile').value.trim(),
+      KeyFile: $('TLSKeyFile').value.trim(),
+      CAFile: $('TLSCAFile').value.trim(),
+      CAKeyFile: $('TLSCAKeyFile').value.trim(),
+      ReissueServerCert: $('TLSReissue').checked,
+      ClientAuth: $('TLSClientAuth').checked
     },
     OPENAI_BASE: $('OPENAI_BASE').value.trim(),
     OPENAI_KEY: $('OPENAI_KEY').value.trim(),

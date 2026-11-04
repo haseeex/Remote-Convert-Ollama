@@ -38,3 +38,6 @@ vision_cache/
 
 # 本地开发用的 XCA 证书目录（含私钥，绝不入库）
 xca/
+
+# 自动生成的入站 HTTPS 证书目录（含 CA 私钥，绝不入库）
+certs/
