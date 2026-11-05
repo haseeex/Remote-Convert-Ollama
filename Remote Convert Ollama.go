@@ -417,19 +417,27 @@ func migrateRequestPromptReplace(stored *Config, rawMap map[string]interface{}) 
 }
 
 type Config struct {
-	IP                string   `json:"IP"`
-	PORT              string   `json:"PORT"`
-	Log_Limit         int64    `json:"Log_Limit"`
-	Log_Responses     bool     `json:"Log_Responses"`
-	Log_Headers       bool     `json:"Log_Headers"`
-	Log_Body          bool     `json:"Log_Body"`
-	OpenAIPrefix      string   `json:"OpenAI_Prefix"`
-	OpenAISuffix      string   `json:"OpenAI_Suffix"`
-	StreamMode        string   `json:"StreamMode"`
-	Capabilities      []string `json:"Capabilities"`
-	OpenAIBase        string   `json:"OPENAI_BASE"`
-	OpenAIKey         string   `json:"OPENAI_KEY"`
-	WebConfigPassword string   `json:"WebConfigPassword,omitempty"` // 配置管理页面访问密码（空=不启用）
+	IP            string   `json:"IP"`
+	PORT          string   `json:"PORT"`
+	Log_Limit     int64    `json:"Log_Limit"`
+	Log_Responses bool     `json:"Log_Responses"`
+	Log_Headers   bool     `json:"Log_Headers"`
+	Log_Body      bool     `json:"Log_Body"`
+	OpenAIPrefix  string   `json:"OpenAI_Prefix"`
+	OpenAISuffix  string   `json:"OpenAI_Suffix"`
+	StreamMode    string   `json:"StreamMode"`
+	Capabilities  []string `json:"Capabilities"`
+	// DefaultContextLength / DefaultMaxOutputTokens 全局默认上下文长度 / 最大输出 token。
+	// 用途：上游没有返回模型元数据、且 ModelDetailedSettings 未单独配置该模型时，
+	// 作为 /v1/models、/api/tags、/api/show、/api/ps 与模型上下文注入的兜底值。
+	// 为什么可配置：不同上游（或中转网关）的模型上下文差别很大（8K / 128K / 1M），
+	// 写死 1M 会让客户端误以为可以塞百万 token，既可能被上游拒绝又白烧 token。
+	// 0 或负数 = 使用内置默认值（1000000 / 384000）。
+	DefaultContextLength   int64  `json:"DefaultContextLength"`
+	DefaultMaxOutputTokens int64  `json:"DefaultMaxOutputTokens"`
+	OpenAIBase             string `json:"OPENAI_BASE"`
+	OpenAIKey              string `json:"OPENAI_KEY"`
+	WebConfigPassword      string `json:"WebConfigPassword,omitempty"` // 配置管理页面访问密码（空=不启用）
 	// ProxyAPIKey 旧版单密钥字段（已迁移到 ProxyAPIKeys 列表；保留仅用于读取旧配置）
 	ProxyAPIKey string `json:"ProxyAPIKey,omitempty"`
 	// ProxyAPIKeys 代理请求密钥列表（多密钥入站鉴权）：每个客户端可分配独立密钥，
@@ -2065,10 +2073,10 @@ func getModelMetaFor(model string) (int64, int64) {
 	ctxLen := meta.ContextLength
 	maxOut := meta.MaxOutputTokens
 	if ctxLen <= 0 {
-		ctxLen = DefaultContextLength
+		ctxLen = defaultContextLength()
 	}
 	if maxOut <= 0 {
-		maxOut = DefaultMaxOutputTokens
+		maxOut = defaultMaxOutputTokens()
 	}
 	return ctxLen, maxOut
 }
@@ -2216,9 +2224,39 @@ const (
 // 推荐生成网站 https://www.uuidgenerator.net/ 生成一个随机的 UUID 来替换这个值。
 const secretUUID = "vancat-10a8bca6-fe6f-4bcd-8c9a-9a27d6ec1b16"
 
-// 上下文默认值，当上游 API 未返回模型元数据时使用
-const DefaultContextLength = 1000000
-const DefaultMaxOutputTokens = 384000
+// 上下文默认值，当上游 API 未返回模型元数据时使用（内置兜底值）。
+// 用户可在 config.json / 配置页的 DefaultContextLength、DefaultMaxOutputTokens 覆盖，
+// 运行时统一通过 defaultContextLength() / defaultMaxOutputTokens() 读取。
+const (
+	builtinDefaultContextLength   int64 = 1000000
+	builtinDefaultMaxOutputTokens int64 = 384000
+)
+
+// defaultContextLength 返回全局默认上下文长度（配置优先，未配置/非法时回退内置值）。
+func defaultContextLength() int64 {
+	if cfg.DefaultContextLength > 0 {
+		return cfg.DefaultContextLength
+	}
+	return builtinDefaultContextLength
+}
+
+// defaultMaxOutputTokens 返回全局默认最大输出 token（配置优先，未配置/非法时回退内置值）。
+func defaultMaxOutputTokens() int64 {
+	if cfg.DefaultMaxOutputTokens > 0 {
+		return cfg.DefaultMaxOutputTokens
+	}
+	return builtinDefaultMaxOutputTokens
+}
+
+// normalizeDefaultModelLimits 规范化全局默认上下文/输出上限：<=0 回退内置默认值。
+func normalizeDefaultModelLimits(c *Config) {
+	if c.DefaultContextLength <= 0 {
+		c.DefaultContextLength = builtinDefaultContextLength
+	}
+	if c.DefaultMaxOutputTokens <= 0 {
+		c.DefaultMaxOutputTokens = builtinDefaultMaxOutputTokens
+	}
+}
 
 // OllamaToolCall 是 Ollama 格式的工具调用
 // ID 非标准 Ollama 字段（omitempty），用于在响应中保留上游 tool_call id：
@@ -3762,7 +3800,9 @@ func getDefaultConfig() Config {
 		OpenAIPrefix:            "[VC反代] ",
 		OpenAISuffix:            "",
 		StreamMode:              streamModePreserve,
-		Capabilities:            []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
+		Capabilities:            []string{"tools", "vision"},   // vs2026 需要这个字段才能启用工具功能
+		DefaultContextLength:    builtinDefaultContextLength,   // 全局默认上下文长度（模型级配置优先）
+		DefaultMaxOutputTokens:  builtinDefaultMaxOutputTokens, // 全局默认最大输出 token（模型级配置优先）
 		OpenAIBase:              "https://api.openai.com/v1",
 		OpenAIKey:               "",
 		ProxyAPIKey:             "",                                             // 代理请求密钥（空=未设置，配合开关使用）
@@ -3823,6 +3863,9 @@ func printConfigHelp() {
 	fmt.Println(" ▼ OpenAI_Suffix   : 返回给客户端的模型名称后缀,仅影响模型名字显示")
 	fmt.Println(" ▼ StreamMode      : 流式策略 = 不覆写/强制流式/强制关闭 (preserve/force_stream/force_close)")
 	fmt.Println(" ▼ Capabilities    : 向客户端声明支持的能力列表 (tools, vision 等)")
+	fmt.Println(" ▼ DefaultContextLength / DefaultMaxOutputTokens : 全局默认上下文长度 / 最大输出 token")
+	fmt.Println("                     上游未返回模型元数据、且 ModelDetailedSettings 未单独配置该模型时使用(默认 1000000 / 384000)")
+	fmt.Println("                     影响 /v1/models、/api/tags、/api/show、/api/ps 展示值与模型上下文注入; 0=使用内置默认值")
 	fmt.Println(" ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)")
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
 	fmt.Println(" ▼ ProxyAPIKeys    : 代理请求密钥列表 (多密钥入站鉴权,每个客户端可分配独立密钥,便于区分请求来源)")
@@ -3973,10 +4016,10 @@ func printModelAliases() {
 		ctxLen := meta.ContextLength
 		maxOut := meta.MaxOutputTokens
 		if ctxLen <= 0 {
-			ctxLen = DefaultContextLength
+			ctxLen = defaultContextLength()
 		}
 		if maxOut <= 0 {
-			maxOut = DefaultMaxOutputTokens
+			maxOut = defaultMaxOutputTokens()
 		}
 
 		fmt.Printf("   🧩 %s\n", displayName)
@@ -4075,6 +4118,15 @@ func loadConfig() {
 	}
 	if _, ok := rawMap["Capabilities"]; !ok {
 		stored.Capabilities = defaultCfg.Capabilities
+		needSave = true
+	}
+	// 全局默认上下文长度 / 最大输出 token：旧配置缺字段或 <=0 时补默认并回写
+	if _, ok := rawMap["DefaultContextLength"]; !ok || stored.DefaultContextLength <= 0 {
+		stored.DefaultContextLength = defaultCfg.DefaultContextLength
+		needSave = true
+	}
+	if _, ok := rawMap["DefaultMaxOutputTokens"]; !ok || stored.DefaultMaxOutputTokens <= 0 {
+		stored.DefaultMaxOutputTokens = defaultCfg.DefaultMaxOutputTokens
 		needSave = true
 	}
 	if _, ok := rawMap["OPENAI_BASE"]; !ok {
@@ -5641,6 +5693,8 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.IP = strings.TrimSpace(newCfg.IP)
 	newCfg.PORT = strings.TrimSpace(newCfg.PORT)
 	newCfg.StreamMode = normalizeStreamMode(newCfg.StreamMode)
+	// 全局默认上下文/输出上限：<=0 回退内置默认值（上下文必须有值，不支持"不限制"）
+	normalizeDefaultModelLimits(&newCfg)
 
 	// 规范化替换规则模式：mode 枚举 + 兼容旧 force/replaceWhole 字段
 	var rawCfg map[string]interface{}
@@ -5886,6 +5940,13 @@ func applyConfigToRuntime(newCfg Config) {
 	cfg.OpenAISuffix = newCfg.OpenAISuffix
 	cfg.StreamMode = newCfg.StreamMode
 	cfg.Capabilities = newCfg.Capabilities
+	// 全局默认上下文长度 / 最大输出 token（旧页面不提交这两个字段 → 保持当前值，避免被清零）
+	if newCfg.DefaultContextLength > 0 {
+		cfg.DefaultContextLength = newCfg.DefaultContextLength
+	}
+	if newCfg.DefaultMaxOutputTokens > 0 {
+		cfg.DefaultMaxOutputTokens = newCfg.DefaultMaxOutputTokens
+	}
 	cfg.OpenAIBase = newCfg.OpenAIBase
 	// ProxyAPIKeys 密钥列表由调用方单独处理为明文；这里只同步总开关（立即生效，无需重启）
 	cfg.ProxyAPIKeyEnabled = newCfg.ProxyAPIKeyEnabled
@@ -6537,8 +6598,8 @@ func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 		}
 
 		info := upstreamModelMeta{
-			ContextLength:   DefaultContextLength,
-			MaxOutputTokens: DefaultMaxOutputTokens,
+			ContextLength:   defaultContextLength(),
+			MaxOutputTokens: defaultMaxOutputTokens(),
 		}
 
 		// 尝试从多种可能的字段名中提取上下文长度
@@ -8950,7 +9011,7 @@ func toAnthropicStopReason(fr string) string {
 
 // -------------------- OpenAI API: /v1/models --------------------
 func openaiModels(w http.ResponseWriter, r *http.Request) {
-	req, _ := http.NewRequest("GET", cfg.OpenAIBase+"/models", nil)
+	req, _ := http.NewRequestWithContext(r.Context(), "GET", cfg.OpenAIBase+"/models", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
 	client := &http.Client{Transport: getSharedTransport()}
@@ -8964,8 +9025,230 @@ func openaiModels(w http.ResponseWriter, r *http.Request) {
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Printf("UPSTREAM MODELS [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
 
+	// 补 Anthropic 兼容字段（type / display_name / created_at / has_more 等）
+	raw = enhanceModelsListCompat(raw)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
+}
+
+// modelCreatedAt 本地模型对象的 created / created_at 时间基准。
+//
+// 为什么固定在进程内：OpenAI 规范里 created 表示模型「最后修改时间」，
+// 若每次请求都返回 time.Now()，客户端可能误判模型发生变化而反复刷新模型列表。
+// 进程内固定一个值既稳定又无需额外请求上游。
+var modelCreatedAt = time.Now()
+
+// enhanceModelsListCompat 给上游模型列表补充 Anthropic 兼容字段。
+//
+// 为什么需要：/v1/models 这个路径同时被 OpenAI 与 Anthropic 两套客户端使用，
+// 但两者期望的响应字段不同：
+//   - OpenAI   ：{object:"list", data:[{id, object:"model", created, owned_by}]}
+//   - Anthropic：{data:[{type:"model", id, display_name, created_at}], has_more, first_id, last_id}
+//
+// 上游一般只返回 OpenAI 格式，Anthropic 客户端（Claude Code / anthropic-sdk）
+// 拿不到 type / display_name / created_at / has_more 时会解析失败。
+//
+// 这里只「补字段」不「删字段」：OpenAI 客户端会忽略未知字段，
+// 因此一份超集响应可以同时满足两套客户端。解析失败时原样返回（绝不破坏透传）。
+func enhanceModelsListCompat(raw []byte) []byte {
+	if len(raw) == 0 {
+		return raw
+	}
+	var top map[string]interface{}
+	if json.Unmarshal(raw, &top) != nil {
+		return raw
+	}
+	data, ok := top["data"].([]interface{})
+	if !ok {
+		return raw
+	}
+
+	nowRFC := modelCreatedAt.UTC().Format(time.RFC3339)
+	firstID, lastID := "", ""
+	touched := false
+	for _, item := range data {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		id, _ := m["id"].(string)
+		if _, has := m["object"]; !has {
+			m["object"] = "model"
+			touched = true
+		}
+		if _, has := m["type"]; !has {
+			m["type"] = "model"
+			touched = true
+		}
+		if _, has := m["display_name"]; !has {
+			m["display_name"] = id
+			touched = true
+		}
+		if _, has := m["created_at"]; !has {
+			m["created_at"] = nowRFC
+			touched = true
+		}
+		if firstID == "" {
+			firstID = id
+		}
+		lastID = id
+	}
+	if _, has := top["has_more"]; !has {
+		top["has_more"] = false
+		touched = true
+	}
+	if _, has := top["first_id"]; !has {
+		if firstID == "" {
+			top["first_id"] = nil
+		} else {
+			top["first_id"] = firstID
+		}
+		touched = true
+	}
+	if _, has := top["last_id"]; !has {
+		if lastID == "" {
+			top["last_id"] = nil
+		} else {
+			top["last_id"] = lastID
+		}
+		touched = true
+	}
+	if !touched {
+		return raw
+	}
+
+	// 用 Encoder + SetEscapeHTML(false)，避免中文/特殊字符被转义得面目全非
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(top); err != nil {
+		return raw
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n")
+}
+
+// -------------------- OpenAI API: /v1/models/{model} --------------------
+// OpenAI 规范的「查询单个模型」接口（GET /v1/models/{model}）。
+//
+// 为什么必须本地实现：部分客户端（Visual Studio 2026 的 BYOM 等）除了 GET /v1/models
+// 拉列表之外，还会单独查询某个模型的详情。早期版本没有这条路由 → 落到 default 分支
+// 原样转发上游，而 OPENAI_BASE 通常已经以 /v1 结尾，拼出来变成 /v1/v1/models/xxx，
+// 上游直接报 Invalid URL (GET /v1/v1/models/xxx)。
+//
+// 这里不依赖上游是否支持该端点：本地按模型元数据构建标准 OpenAI Model 对象，
+// 并附带上下文长度 / 最大输出 / 能力列表等扩展字段（对不认识它们的客户端无害）。
+func openaiModelGet(w http.ResponseWriter, r *http.Request, modelParam string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	modelID := strings.TrimSpace(modelParam)
+	if modelID == "" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "缺少模型 ID：GET /v1/models/{model}",
+				"type":    "invalid_request_error",
+				"param":   "model",
+				"code":    "invalid_model",
+			},
+		})
+		return
+	}
+
+	// 元数据查询用上游真实模型 ID（剥离显示前缀/后缀 + 反查别名），
+	// 响应里的 id 仍回客户端请求时用的名字，与 /v1/models 列表保持一致。
+	upstreamID := displayNameToUpstreamID(modelID)
+	ctxLen, maxOut := getModelMetaFor(upstreamID)
+	caps := getModelCapabilities(upstreamID)
+	hasVision := hasCapability(caps, "vision")
+	hasTools := hasCapability(caps, "tools")
+
+	out := map[string]interface{}{
+		"id": modelID,
+		// OpenAI 规范字段
+		"object":   "model",
+		"created":  modelCreatedAt.Unix(),
+		"owned_by": "library", // 与 Ollama 官方口径一致（Ollama 默认返回 library）
+		// Anthropic 规范字段：同一路径 /v1/models/{model} 也被 Anthropic 客户端使用
+		// （Claude Code / anthropic-sdk 读取 type / display_name / created_at）
+		"type":         "model",
+		"display_name": modelID,
+		"created_at":   modelCreatedAt.UTC().Format(time.RFC3339),
+		// 扩展字段：上下文长度与输出上限（VS2026 / 部分客户端会读取）
+		"context_length":        ctxLen,
+		"context_window":        ctxLen,
+		"prompt_tokens":         ctxLen,
+		"completion_tokens":     ctxLen,
+		"total_tokens":          ctxLen,
+		"max_input_tokens":      ctxLen,
+		"max_output_tokens":     maxOut,
+		"max_completion_tokens": maxOut,
+		"num_ctx":               ctxLen,
+		"capabilities":          caps,
+		// 扁平键：部分客户端按字面 key 取值
+		"capabilities.supports.vision":    hasVision,
+		"capabilities.supports.tools":     hasTools,
+		"capabilities.supports.reasoning": true,
+		"supports_vision":                 hasVision,
+		"supports_tools":                  hasTools,
+		"supports_reasoning":              true,
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		return
+	}
+	json.NewEncoder(w).Encode(out)
+}
+
+// displayNameToUpstreamID 把客户端使用的显示名还原为上游真实模型 ID：
+// 先剥离 OpenAI_Prefix / OpenAI_Suffix，再按 ModelAlias 反查（别名 → 上游 ID）。
+// 用于本地查询模型元数据（ModelDetailedSettings / 上游 /v1/models 都以上游 ID 为键）。
+func displayNameToUpstreamID(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	clean := name
+	if cfg.OpenAIPrefix != "" {
+		clean = strings.TrimPrefix(clean, cfg.OpenAIPrefix)
+	}
+	if cfg.OpenAISuffix != "" {
+		clean = strings.TrimSuffix(clean, cfg.OpenAISuffix)
+	}
+	clean = strings.TrimSpace(clean)
+	// 别名反查：ModelAlias 的 key 是上游模型 ID，value 是显示名称
+	for upstreamID, alias := range cfg.ModelAlias {
+		if a := strings.TrimSpace(alias); a != "" && a == clean {
+			return upstreamID
+		}
+	}
+	if clean != "" {
+		return clean
+	}
+	return name
+}
+
+// joinUpstreamURL 拼接上游地址，避免版本前缀重复。
+// 典型场景：OPENAI_BASE = "https://api.xxx.com/v1" 时，客户端请求 /v1/models/xxx 若直接
+// 拼成 base+path，会得到 /v1/v1/models/xxx 而被上游判为 Invalid URL。
+func joinUpstreamURL(base, path string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if path == "" {
+		return base
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	// base 已以 /v1 结尾 → 去掉 path 的 /v1 前缀（大小写不敏感）
+	if strings.HasSuffix(strings.ToLower(base), "/v1") && strings.HasPrefix(strings.ToLower(path), "/v1/") {
+		path = path[len("/v1"):]
+	}
+	return base + path
 }
 
 func ollamaVersion(w http.ResponseWriter, r *http.Request) {
@@ -8980,7 +9263,7 @@ func ollamaVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func openaiModelsLegacy(w http.ResponseWriter, r *http.Request) {
-	req, _ := http.NewRequest("GET", cfg.OpenAIBase+"/models", nil)
+	req, _ := http.NewRequestWithContext(r.Context(), "GET", cfg.OpenAIBase+"/models", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
 	client := &http.Client{Transport: getSharedTransport()}
@@ -8993,6 +9276,9 @@ func openaiModelsLegacy(w http.ResponseWriter, r *http.Request) {
 
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Printf("UPSTREAM LEGACY MODELS [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
+
+	// 同样补 Anthropic 兼容字段，旧路径也可能被 Anthropic 客户端使用
+	raw = enhanceModelsListCompat(raw)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
@@ -9030,8 +9316,8 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, exists := modelMeta[id]; !exists {
 			info := upstreamModelMeta{
-				ContextLength:   DefaultContextLength,
-				MaxOutputTokens: DefaultMaxOutputTokens,
+				ContextLength:   defaultContextLength(),
+				MaxOutputTokens: defaultMaxOutputTokens(),
 			}
 			for _, field := range []string{"context_length", "max_input_tokens", "max_input_length", "context_window", "max_context"} {
 				if v := extractNumeric(modelData, field); v > 0 {
@@ -9141,16 +9427,33 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 	}
 	json.Unmarshal(body, &req)
 
+	// Ollama 官方是 POST /api/show（body 带 model），
+	// 这里额外兼容 REST 风格的 GET /api/show?model=xxx / ?name=xxx，
+	// 方便只会发 GET 的客户端也能查到单模型详情。
+	if req.Model == "" {
+		req.Model = r.URL.Query().Get("model")
+	}
+	if req.Model == "" {
+		req.Model = r.URL.Query().Get("name")
+	}
+
 	modelID := req.Model
 	if modelID == "" {
 		modelID = "deepseek-v4-pro"
 	}
 
-	// 从上游获取该模型的元数据
+	// 从上游获取该模型的元数据（上游不可达 / 未返回元数据时用默认值兜底，
+	// 与 ollamaTags 保持一致，避免客户端拿到 context_length=0 而误判模型不可用）
 	meta := fetchUpstreamModelMeta()
 	modelMeta := meta[modelID]
 	ctxLen := modelMeta.ContextLength
 	maxOut := modelMeta.MaxOutputTokens
+	if ctxLen <= 0 {
+		ctxLen = defaultContextLength()
+	}
+	if maxOut <= 0 {
+		maxOut = defaultMaxOutputTokens()
+	}
 
 	// 获取该模型的能力列表：优先使用 ModelDetailedSettings 中的 Capabilities，否则使用全局 Capabilities
 	modelCaps := cfg.Capabilities
@@ -9239,10 +9542,10 @@ func ollamaPS(w http.ResponseWriter, r *http.Request) {
 		ctxLen := meta.ContextLength
 		maxOut := meta.MaxOutputTokens
 		if ctxLen <= 0 {
-			ctxLen = DefaultContextLength
+			ctxLen = defaultContextLength()
 		}
 		if maxOut <= 0 {
-			maxOut = DefaultMaxOutputTokens
+			maxOut = defaultMaxOutputTokens()
 		}
 
 		// 显示名称：优先使用 ModelAlias 中的别名，否则用上游 ID，再套上前后缀
@@ -9993,8 +10296,12 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		anthropicMessages(w, r)
 	case r.URL.Path == "/v1/models":
 		openaiModels(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/models/"): // OpenAI / Anthropic 单模型查询：GET /v1/models/{model}
+		openaiModelGet(w, r, strings.TrimPrefix(r.URL.Path, "/v1/models/"))
 	case r.URL.Path == "/models": // VSCode 旧版 API
 		openaiModelsLegacy(w, r)
+	case strings.HasPrefix(r.URL.Path, "/models/"): // 旧版单模型查询：GET /models/{model}
+		openaiModelGet(w, r, strings.TrimPrefix(r.URL.Path, "/models/"))
 	// case r.URL.Path == "/api/show": // VSCode 旧版 API
 	// 	ollamaShow(w, r)
 	default:
@@ -10004,9 +10311,10 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("方法:", r.Method)
 		fmt.Println("================================")
 
-		// 尝试转发到上游
+		// 尝试转发到上游（joinUpstreamURL 会剔除重复的 /v1 前缀，
+		// 避免 OPENAI_BASE 已含 /v1 时拼出 /v1/v1/xxx 被上游判为 Invalid URL）
 		if r.URL.Path != "/" {
-			req, _ := http.NewRequest(r.Method, cfg.OpenAIBase+r.URL.Path, bytes.NewBuffer(body))
+			req, _ := http.NewRequest(r.Method, joinUpstreamURL(cfg.OpenAIBase, r.URL.Path), bytes.NewBuffer(body))
 			req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 			req.Header.Set("Content-Type", "application/json")
 

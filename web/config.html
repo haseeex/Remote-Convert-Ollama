@@ -431,6 +431,10 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
               </div>
               <div class="row"><label data-i18n="lblCaps">能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
             </div>
+            <div class="grid2">
+              <div class="row"><label data-i18n="lblDefaultCtx">默认上下文长度 DefaultContextLength <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="defaultCtxHint">上游未返回元数据且模型未单独配置时使用；0=内置 1000000</span></label><input type="number" id="DefaultContextLength" min="0" max="100000000" value="1000000" placeholder="1000000"></div>
+              <div class="row"><label data-i18n="lblDefaultMaxOut">默认最大输出 DefaultMaxOutputTokens <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="defaultMaxOutHint">上游未返回元数据且模型未单独配置时使用；0=内置 384000</span></label><input type="number" id="DefaultMaxOutputTokens" min="0" max="10000000" value="384000" placeholder="384000"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -703,7 +707,7 @@ var I18N = {
     visionTitle: '🖼️ 视觉代理 Vision', visionHint: '主模型不支持图片时用代理模型识别；识别结果按「图片+提示词」缓存到本地，重复图片零消耗',
     lblPrefix: '模型名前缀 OpenAI_Prefix', lblSuffix: '模型名后缀 OpenAI_Suffix',
     lblStreamMode: '流式策略 StreamMode', smPreserve: 'preserve · 不覆写（默认）', smForceStream: 'force_stream · 强制流式', smForceClose: 'force_close · 强制关闭',
-    lblCaps: '能力声明 Capabilities（逗号分隔）',
+    lblCaps: '能力声明 Capabilities（逗号分隔）', lblDefaultCtx: '默认上下文长度 DefaultContextLength', defaultCtxHint: '上游未返回元数据且模型未单独配置时使用；0=内置 1000000', lblDefaultMaxOut: '默认最大输出 DefaultMaxOutputTokens', defaultMaxOutHint: '上游未返回元数据且模型未单独配置时使用；0=内置 384000',
     lblVisionPrompt: '全局视觉代理提示词 VisionProxyPrompt', visionPromptHint: '模型未自定义提示词时使用；留空=内置默认提示词', visionPromptPh: '请仔细查看这张图片，用简体中文详细描述图片中的全部内容...',
     lblVisionQuality: '全局图片质量 VisionImageQuality', visionQualityHint: '模型单独的图片质量优先；识别前统一压缩图片', vqOriginal: '原图 · 不压缩', vqHigh: '高质量 · JPEG 90%', vqBalanced: '平衡 · JPEG 70%（默认）', vqEco: '节省流量 · JPEG 40% + 最长边 1024', vqCustom: '自定义 · 压缩质量百分比',
     lblVisionCustomPercent: '自定义压缩质量百分比 CustomPercent（1-100）',
@@ -855,7 +859,7 @@ var I18N = {
     visionTitle: '🖼️ Vision Proxy', visionHint: 'Recognizes images with a proxy model when the main model lacks vision; results are cached locally by image + prompt',
     lblPrefix: 'Model name prefix OpenAI_Prefix', lblSuffix: 'Model name suffix OpenAI_Suffix',
     lblStreamMode: 'Stream mode StreamMode', smPreserve: 'preserve · no override (default)', smForceStream: 'force_stream · force streaming', smForceClose: 'force_close · force close',
-    lblCaps: 'Capabilities (comma separated)',
+    lblCaps: 'Capabilities (comma separated)', lblDefaultCtx: 'Default context length DefaultContextLength', defaultCtxHint: 'Used when upstream returns no model metadata and the model has no per-model setting; 0 = built-in 1000000', lblDefaultMaxOut: 'Default max output DefaultMaxOutputTokens', defaultMaxOutHint: 'Used when upstream returns no model metadata and the model has no per-model setting; 0 = built-in 384000',
     lblVisionPrompt: 'Global vision proxy prompt VisionProxyPrompt', visionPromptHint: 'Used when model has no custom prompt; empty = built-in default', visionPromptPh: 'Please look at this image carefully and describe all its contents in detail...',
     lblVisionQuality: 'Global image quality VisionImageQuality', visionQualityHint: 'Per-model quality takes priority; images are compressed before recognition', vqOriginal: 'Original · no compression', vqHigh: 'High · JPEG 90%', vqBalanced: 'Balanced · JPEG 70% (default)', vqEco: 'Eco · JPEG 40% + max edge 1024', vqCustom: 'Custom · compression quality %',
     lblVisionCustomPercent: 'Custom compression quality CustomPercent (1-100)',
@@ -1417,6 +1421,8 @@ async function loadCfg(notify){
     $('OpenAI_Suffix').value = c.OpenAI_Suffix || '';
     $('StreamMode').value = c.StreamMode || 'preserve';
     $('Capabilities').value = (c.Capabilities || []).join(', ');
+    $('DefaultContextLength').value = c.DefaultContextLength != null ? c.DefaultContextLength : 1000000;
+    $('DefaultMaxOutputTokens').value = c.DefaultMaxOutputTokens != null ? c.DefaultMaxOutputTokens : 384000;
     $('VisionProxyPrompt').value = c.VisionProxyPrompt || '';
     // 全局图片质量（枚举 + 自定义百分比）
     var vq = c.VisionImageQuality || {};
@@ -1896,6 +1902,8 @@ function collectCfg(){
     OpenAI_Suffix: $('OpenAI_Suffix').value,
     StreamMode: $('StreamMode').value,
     Capabilities: splitList($('Capabilities').value),
+    DefaultContextLength: parseInt($('DefaultContextLength').value, 10) || 1000000,
+    DefaultMaxOutputTokens: parseInt($('DefaultMaxOutputTokens').value, 10) || 384000,
     VisionProxyPrompt: $('VisionProxyPrompt').value.trim(),
     VisionImageQuality: {
       Quality: $('VisionImageQuality').value,
