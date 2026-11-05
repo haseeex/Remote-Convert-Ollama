@@ -251,27 +251,30 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
   <div class="panels">
     <div class="panel active" id="tab-conn">
       <div class="card">
-        <div class="head" data-i18n="connListen">🖥️ 监听设置 <span class="hint" data-i18n="connListenHint">修改 IP / PORT 需重启程序生效</span></div>
-        <div class="body grid2">
-          <div class="row"><label data-i18n="lblIP">监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
-          <div class="row"><label data-i18n="lblPort">监听端口 PORT</label><input type="text" id="PORT" placeholder="11434"></div>
+        <div class="head" data-i18n="connListen">🖥️ 监听设置 <span class="hint" data-i18n="connListenHint">修改 IP / PORT / 端口组合需重启程序生效</span></div>
+        <div class="body">
+          <div class="grid2">
+            <div class="row"><label data-i18n="lblIP">监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
+            <div class="row"><label data-i18n="lblPort">HTTP 端口 PORT（明文，始终启用）</label><input type="text" id="PORT" placeholder="11434"></div>
+          </div>
+
+          <div class="row"><label class="switch"><input type="checkbox" id="TLSEnable" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsEnable">启用入站加密：额外开放 HTTPS / 混合端口（证书在下方 ServerTLS 卡片配置）</span></label></div>
+          <div class="row"><span class="tt-role-hd" data-i18n="tlsPortsHint">三个端口必须互不相同：HTTP 端口就是上面的 PORT；HTTPS / 混合端口各自独立启用，端口号必填</span></div>
+
+          <div class="dlp-group" id="rowTLSPorts">
+            <div class="row" id="rowTLSHttpsPortEnable"><label class="switch"><input type="checkbox" id="TLSHttpsPortEnable" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsHttpsPortEnable">启用 HTTPS 端口（纯加密）</span></label></div>
+            <div class="row sub-row" id="rowTLSHttpsPort"><label data-i18n="tlsHttpsPort">HTTPS 端口 HTTPSPort</label><input type="text" id="TLSHttpsPort" placeholder="如 11443"></div>
+            <div class="row sub2-row" id="rowTLSHttpsRedirect"><label class="switch"><input type="checkbox" id="TLSHttpsRedirect"><span class="track"></span><span class="lbl" data-i18n="tlsHttpsRedirect">用 http:// 访问该端口时自动跳转到 https://（308 永久重定向）</span></label></div>
+
+            <div class="row" id="rowTLSMixedPortEnable" style="margin-top:6px"><label class="switch"><input type="checkbox" id="TLSMixedPortEnable" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsMixedPortEnable">启用混合端口（同一端口同时支持 HTTP 与 HTTPS）</span></label></div>
+            <div class="row sub-row" id="rowTLSMixedPort"><label data-i18n="tlsMixedPort">混合端口 MixedPort</label><input type="text" id="TLSMixedPort" placeholder="如 11435"></div>
+          </div>
         </div>
       </div>
 
       <div class="card">
-        <div class="head" data-i18n="tlsTitle">🔐 入站加密 ServerTLS <span class="hint" data-i18n="tlsHint">修改需重启程序生效；不启用时保持原有 HTTP 行为</span></div>
+        <div class="head" data-i18n="tlsTitle">🔐 入站加密 ServerTLS <span class="hint" data-i18n="tlsHint">证书与加密参数；修改需重启程序生效</span></div>
         <div class="body">
-          <div class="row"><label class="switch"><input type="checkbox" id="TLSEnable" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsEnable">启用：代理服务端支持 HTTPS（自签名证书或自定义证书）</span></label></div>
-
-          <div class="row sub-row" id="rowTLSListenMode"><label data-i18n="tlsListenMode">监听模式 ListenMode</label>
-            <select id="TLSListenMode" onchange="toggleTLSInputs()">
-              <option value="http" data-i18n="tlsModeHttp">仅 HTTP（不加密，等同关闭）</option>
-              <option value="both" data-i18n="tlsModeBoth">同一端口同时支持 HTTP 与 HTTPS（推荐，按首字节自动识别）</option>
-              <option value="https" data-i18n="tlsModeHttps">仅 HTTPS（强制加密，明文请求被拒绝）</option>
-            </select>
-          </div>
-
-          <div class="row sub-row" id="rowTLSHttpsPort"><label data-i18n="tlsHttpsPort">额外 HTTPS 端口 HTTPSPort（留空 = 不额外监听）</label><input type="text" id="TLSHTTPSPort" placeholder="如 11443"></div>
 
           <div class="row sub-row" id="rowTLSCertMode"><label data-i18n="tlsCertMode">证书来源 CertMode</label>
             <select id="TLSCertMode" onchange="toggleTLSInputs()">
@@ -639,8 +642,8 @@ var I18N = {
     rtProt_vision_proxy: '视觉代理识别', rtProt_ctx_inject: '模型上下文注入',
     rtProt_gif_normalize: 'GIF 直连转换',
     rtProt_prompt_replace: '提示词替换', rtProt_model_alias: '模型名还原',
-    connListen: '🖥️ 监听设置', connListenHint: '修改 IP / PORT 需重启程序生效',
-    lblIP: '监听地址 IP', lblPort: '监听端口 PORT',
+    connListen: '🖥️ 监听设置', connListenHint: '修改 IP / PORT / 端口组合需重启程序生效',
+    lblIP: '监听地址 IP', lblPort: 'HTTP 端口 PORT（明文，始终启用）',
     connUpstream: '📡 上游 API', connUpstreamHint: 'OPENAI_KEY 留空表示保持当前密钥',
     lblBase: 'OPENAI_BASE', lblKey: 'OPENAI_KEY', keyEncrypted: '已加密保存', keyPlaceholder: '留空保持不变；输入明文新密钥将自动加密保存',
     poolTitle: '🔌 连接池设置 ConnPool', poolHint: 'HTTP/2 + keep-alive 连接复用；0 值回退默认；保存后立即生效，无需重启',
@@ -658,13 +661,14 @@ var I18N = {
     stLimitReadHeader: '限制读请求头时间（关闭 = 不限时）', stReadHeader: '读请求头超时秒 ReadHeaderTimeoutSec（默认 30）',
     stLimitIdle: '回收空闲连接（关闭 = 不回收）', stIdle: '空闲回收秒 IdleTimeoutSec（默认 120）',
     stLimitMaxHeader: '限制请求头大小（关闭 = 不限大小）', stMaxHeader: '请求头上限 MB MaxHeaderMB（默认 1）',
-    tlsTitle: '🔐 入站加密 ServerTLS', tlsHint: '修改需重启程序生效；不启用时保持原有 HTTP 行为',
-    tlsEnable: '启用：代理服务端支持 HTTPS（自签名证书或自定义证书）',
-    tlsListenMode: '监听模式 ListenMode',
-    tlsModeHttp: '仅 HTTP（不加密，等同关闭）',
-    tlsModeBoth: '同一端口同时支持 HTTP 与 HTTPS（推荐，按首字节自动识别）',
-    tlsModeHttps: '仅 HTTPS（强制加密，明文请求被拒绝）',
-    tlsHttpsPort: '额外 HTTPS 端口 HTTPSPort（留空 = 不额外监听）',
+    tlsTitle: '🔐 入站加密 ServerTLS', tlsHint: '证书与加密参数；修改需重启程序生效',
+    tlsEnable: '启用入站加密：额外开放 HTTPS / 混合端口（证书在下方 ServerTLS 卡片配置）',
+    tlsPortsHint: '三个端口必须互不相同：HTTP 端口就是上面的 PORT；HTTPS / 混合端口各自独立启用，端口号必填',
+    tlsHttpsPortEnable: '启用 HTTPS 端口（纯加密）',
+    tlsHttpsPort: 'HTTPS 端口 HTTPSPort',
+    tlsHttpsRedirect: '用 http:// 访问该端口时自动跳转到 https://（308 永久重定向）',
+    tlsMixedPortEnable: '启用混合端口（同一端口同时支持 HTTP 与 HTTPS）',
+    tlsMixedPort: '混合端口 MixedPort',
     tlsCertMode: '证书来源 CertMode',
     tlsCertAuto: '自动生成自签名证书（内置 CA，可下载信任）',
     tlsCertFileMode: '使用自定义证书文件（XCA / OpenSSL / mkcert）',
@@ -790,8 +794,8 @@ var I18N = {
     rtProt_vision_proxy: 'Vision proxy', rtProt_ctx_inject: 'Model context injected',
     rtProt_gif_normalize: 'GIF direct conversion',
     rtProt_prompt_replace: 'Prompt replaced', rtProt_model_alias: 'Model name restored',
-    connListen: '🖥️ Listen Settings', connListenHint: 'IP / PORT changes require restart',
-    lblIP: 'Listen IP', lblPort: 'Listen Port',
+    connListen: '🖥️ Listen Settings', connListenHint: 'IP / PORT / port combination changes require restart',
+    lblIP: 'Listen IP', lblPort: 'HTTP port PORT (plaintext, always on)',
     connUpstream: '📡 Upstream API', connUpstreamHint: 'Leave OPENAI_KEY empty to keep current key',
     lblBase: 'OPENAI_BASE', lblKey: 'OPENAI_KEY', keyEncrypted: 'Encrypted', keyPlaceholder: 'Leave empty to keep; enter plaintext to auto-encrypt',
     poolTitle: '🔌 Connection Pool ConnPool', poolHint: 'HTTP/2 + keep-alive reuse; 0 = default; takes effect immediately after save',
@@ -809,13 +813,14 @@ var I18N = {
     stLimitReadHeader: 'Limit read-header time (off = unlimited)', stReadHeader: 'Read header timeout (s) ReadHeaderTimeoutSec (default 30)',
     stLimitIdle: 'Reclaim idle connections (off = never reclaim)', stIdle: 'Idle timeout (s) IdleTimeoutSec (default 120)',
     stLimitMaxHeader: 'Limit request header size (off = unlimited)', stMaxHeader: 'Max header MB MaxHeaderMB (default 1)',
-    tlsTitle: '🔐 Inbound TLS ServerTLS', tlsHint: 'Changes require a restart; leaving it disabled keeps the original HTTP behavior',
-    tlsEnable: 'Enable: serve HTTPS on this proxy (self-signed or custom certificate)',
-    tlsListenMode: 'Listen mode ListenMode',
-    tlsModeHttp: 'HTTP only (no encryption, same as disabled)',
-    tlsModeBoth: 'HTTP and HTTPS on the same port (recommended, auto-detected)',
-    tlsModeHttps: 'HTTPS only (forced encryption; plaintext requests are rejected)',
-    tlsHttpsPort: 'Extra HTTPS port HTTPSPort (empty = no extra listener)',
+    tlsTitle: '🔐 Inbound TLS ServerTLS', tlsHint: 'Certificates and encryption options; changes require a restart',
+    tlsEnable: 'Enable inbound encryption: expose extra HTTPS / mixed ports (certificates are configured in the ServerTLS card below)',
+    tlsPortsHint: 'The three ports must differ: the HTTP port is PORT above; HTTPS / mixed ports are toggled independently and require a port number',
+    tlsHttpsPortEnable: 'Enable HTTPS port (encrypted only)',
+    tlsHttpsPort: 'HTTPS port HTTPSPort',
+    tlsHttpsRedirect: 'Auto-redirect http:// accesses on this port to https:// (308 Permanent Redirect)',
+    tlsMixedPortEnable: 'Enable mixed port (HTTP and HTTPS on the same port)',
+    tlsMixedPort: 'Mixed port MixedPort',
     tlsCertMode: 'Certificate source CertMode',
     tlsCertAuto: 'Auto-generate self-signed certificate (built-in CA, downloadable)',
     tlsCertFileMode: 'Use custom certificate files (XCA / OpenSSL / mkcert)',
@@ -977,9 +982,15 @@ function toggleLang(){
 function updateListenAddr(){
   var ip = $('IP').value || '0.0.0.0';
   var port = $('PORT').value || '11434';
+  // 头部显示全部已启用的端口（HTTP 端口 = PORT，HTTPS / 混合端口各自独立）
+  var parts = ['http ' + ip + ':' + port];
+  var httpsOn = $('TLSHttpsPortEnable') && $('TLSHttpsPortEnable').checked;
+  var mixedOn = $('TLSMixedPortEnable') && $('TLSMixedPortEnable').checked;
+  if(httpsOn && $('TLSHttpsPort').value.trim()){ parts.push('https ' + ip + ':' + $('TLSHttpsPort').value.trim()); }
+  if(mixedOn && $('TLSMixedPort').value.trim()){ parts.push('mixed ' + ip + ':' + $('TLSMixedPort').value.trim()); }
   // 更新 sub 里的监听地址（subListen 含 {addr} 占位符）
   var sub = document.querySelector('[data-i18n="subListen"]');
-  if(sub){ sub.innerHTML = t('subListen', { addr: '<span id="listenAddr">' + ip + ':' + port + '</span>' }); }
+  if(sub){ sub.innerHTML = t('subListen', { addr: '<span id="listenAddr">' + parts.join(' · ') + '</span>' }); }
 }
 // ================= 中英文切换结束 =================
 
@@ -1456,11 +1467,14 @@ async function loadCfg(notify){
     $('StMaxHeader').value = st.MaxHeaderMB || 1;
     toggleServerTimeoutInputs();
 
-    // 入站 HTTPS 加密 ServerTLS（修改需重启生效）
+    // 入站加密（修改需重启生效）：HTTP 端口就是 PORT，HTTPS / 混合端口各自独立
     var ts = c.ServerTLS || {};
     $('TLSEnable').checked = !!ts.Enable;
-    $('TLSListenMode').value = (ts.ListenMode === 'both' || ts.ListenMode === 'https') ? ts.ListenMode : 'http';
-    $('TLSHTTPSPort').value = ts.HTTPSPort || '';
+    $('TLSHttpsPortEnable').checked = !!ts.HTTPSPortEnable;
+    $('TLSHttpsPort').value = ts.HTTPSPort || '';
+    $('TLSHttpsRedirect').checked = ts.HTTPSRedirect !== false;
+    $('TLSMixedPortEnable').checked = !!ts.MixedPortEnable;
+    $('TLSMixedPort').value = ts.MixedPort || '';
     $('TLSCertMode').value = (ts.CertMode === 'file') ? 'file' : 'auto';
     $('TLSCertDir').value = ts.CertDir || 'certs';
     $('TLSCertFile').value = ts.CertFile || '';
@@ -1682,33 +1696,40 @@ function toggleLimitInputs(){
   });
 }
 
-// 入站 HTTPS 加密：总开关 / 监听模式 / 证书来源 三级联动
+// 入站加密：总开关 / 两个加密端口 / 证书来源 逐级联动
 function toggleTLSInputs(){
   var on = $('TLSEnable').checked;
-  var modeHttp = $('TLSListenMode').value === 'http';
-  var active = on && !modeHttp; // 仅 HTTP 时无需证书配置
+  // 两个加密端口各自独立启停（HTTP 端口固定就是 PORT，不需要开关）
+  var httpsOn = on && $('TLSHttpsPortEnable').checked;
+  var mixedOn = on && $('TLSMixedPortEnable').checked;
+  // 任一加密端口启用 → 必须有证书配置
+  var needCert = httpsOn || mixedOn;
   var fileMode = $('TLSCertMode').value === 'file';
-  // 始终可见但按启用状态置灰
-  ['rowTLSListenMode','rowTLSHttpsPort','rowTLSCertMode','rowTLSCAFile','rowTLSClientAuth','rowTLSCAInfo'].forEach(function(id){
-    var r = $(id); if(r){ r.classList.toggle('disabled-row', !on); }
+
+  // 端口输入框：跟随各自开关
+  var pairs = [['rowTLSHttpsPortEnable', on], ['rowTLSMixedPortEnable', on], ['rowTLSHttpsPort', httpsOn], ['rowTLSHttpsRedirect', httpsOn], ['rowTLSMixedPort', mixedOn]];
+  pairs.forEach(function(p){
+    var r = $(p[0]); if(r){ r.classList.toggle('disabled-row', !p[1]); }
+  });
+  // 证书相关：只有存在加密端口时才需要
+  ['rowTLSCertMode','rowTLSCAFile','rowTLSClientAuth','rowTLSCAInfo'].forEach(function(id){
+    var r = $(id); if(r){ r.classList.toggle('disabled-row', !needCert); }
   });
   // 证书来源二选一
   var autoRow = $('rowTLSCertDir'), certRow = $('rowTLSCertFile'), keyRow = $('rowTLSKeyFile');
-  if(autoRow){ autoRow.classList.toggle('hidden', fileMode); autoRow.classList.toggle('disabled-row', !active); }
-  if(certRow){ certRow.classList.toggle('hidden', !fileMode); certRow.classList.toggle('disabled-row', !active); }
-  if(keyRow){ keyRow.classList.toggle('hidden', !fileMode); keyRow.classList.toggle('disabled-row', !active); }
+  if(autoRow){ autoRow.classList.toggle('hidden', fileMode); autoRow.classList.toggle('disabled-row', !needCert); }
+  if(certRow){ certRow.classList.toggle('hidden', !fileMode); certRow.classList.toggle('disabled-row', !needCert); }
+  if(keyRow){ keyRow.classList.toggle('hidden', !fileMode); keyRow.classList.toggle('disabled-row', !needCert); }
   // 重签开关与 CA 私钥（仅自定义证书模式有意义）
   var reissueOn = $('TLSReissue').checked;
   var rr = $('rowTLSReissue'), rk = $('rowTLSCAKeyFile');
-  if(rr){ rr.classList.toggle('hidden', !fileMode); rr.classList.toggle('disabled-row', !active); }
+  if(rr){ rr.classList.toggle('hidden', !fileMode); rr.classList.toggle('disabled-row', !needCert); }
   if(rk){
     rk.classList.toggle('hidden', !fileMode || !reissueOn);
-    rk.classList.toggle('disabled-row', !active || !reissueOn);
+    rk.classList.toggle('disabled-row', !needCert || !reissueOn);
   }
-  // 仅 HTTP 模式下其余配置项一并置灰
-  ['rowTLSHttpsPort','rowTLSCertMode','rowTLSCAFile','rowTLSClientAuth','rowTLSCAInfo'].forEach(function(id){
-    var r = $(id); if(r){ r.classList.toggle('disabled-row', !active); }
-  });
+  // 头部监听地址提示同步刷新
+  if(typeof updateListenAddr === 'function'){ updateListenAddr(); }
 }
 
 // 渲染 CA 证书状态（指纹 / 有效期 / 覆盖域名）
@@ -1938,8 +1959,11 @@ function collectCfg(){
     },
     ServerTLS: {
       Enable: $('TLSEnable').checked,
-      ListenMode: $('TLSListenMode').value,
-      HTTPSPort: $('TLSHTTPSPort').value.trim(),
+      HTTPSPortEnable: $('TLSHttpsPortEnable').checked,
+      HTTPSPort: $('TLSHttpsPort').value.trim(),
+      HTTPSRedirect: $('TLSHttpsRedirect').checked,
+      MixedPortEnable: $('TLSMixedPortEnable').checked,
+      MixedPort: $('TLSMixedPort').value.trim(),
       CertMode: $('TLSCertMode').value,
       CertDir: $('TLSCertDir').value.trim(),
       CertFile: $('TLSCertFile').value.trim(),

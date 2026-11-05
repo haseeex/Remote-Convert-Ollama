@@ -689,11 +689,18 @@ func normalizeServerTimeout(st ServerTimeout) ServerTimeout {
 
 // ==================== 入站 HTTPS 加密 ServerTLS ====================
 
-// 入站监听模式
+// 入站端口角色（三种端口可同时启用，各自独立）
 const (
-	listenModeHTTP  = "http"  // 仅明文 HTTP（默认，保持原有行为）
-	listenModeBoth  = "both"  // 同一端口同时接受 HTTP 与 HTTPS（按首个字节自动识别，推荐）
-	listenModeHTTPS = "https" // 仅 HTTPS（强制加密，明文客户端会被拒绝）
+	portRoleHTTP  = "http"  // 纯 HTTP 端口（明文）
+	portRoleHTTPS = "https" // 纯 HTTPS 端口（加密；收到明文 HTTP 时自动重定向到 https://）
+	portRoleMixed = "mixed" // 混合端口（同一端口按首字节自动识别 HTTP / HTTPS）
+)
+
+// 旧版单端口监听模式（仅用于迁移旧配置，新配置不再使用）
+const (
+	legacyListenModeHTTP  = "http"
+	legacyListenModeBoth  = "both"
+	legacyListenModeHTTPS = "https"
 )
 
 // 证书来源模式
@@ -705,22 +712,31 @@ const (
 // defaultTLSCertDir 自动证书默认存放目录
 const defaultTLSCertDir = "certs"
 
-// ServerTLS 入站 HTTPS 加密配置。
+// ServerTLS 入站加密配置。
 //
-// 设计目标：
-//   - 零配置可用：默认 CertMode=auto，首次启动自动生成 CA 与服务器证书（certs/ 目录），
-//     配置页可一键下载 CA 证书给客户端/系统信任；
-//   - 兼容已有证书：CertMode=file 时使用用户自己的证书（XCA、OpenSSL、mkcert 等签发）；
-//   - 同一端口可同时接受 HTTP 与 HTTPS（ListenMode=both）或强制 HTTPS（ListenMode=https），
-//     另可额外监听一个专用 HTTPS 端口，方便「老客户端走 HTTP、新客户端走 HTTPS」并存。
+// 端口模型（三种端口各自独立，端口号互不相同）：
+//   - HTTP 端口   ：就是 config.json 里的 PORT（主监听端口），永远是明文 HTTP，不可禁用
+//   - HTTPS 端口  ：ServerTLS.HTTPSPort，纯加密；若客户端误用 http:// 访问本端口，
+//     会自动返回 308 重定向到 https://同一端口（HTTPSRedirect 开关控制）
+//   - 混合端口    ：ServerTLS.MixedPort，按连接首字节自动识别 HTTP / HTTPS，一个端口两种协议
 //
+// ⚠️ 三个端口号必须互不相同（保存时会校验）；HTTPS / 混合端口启用时必须填写有效端口号。
 // ⚠️ 本组配置只在启动时读取（证书与监听器无法在运行中热切换），修改需重启程序生效。
 type ServerTLS struct {
 	Enable bool `json:"Enable"` // 总开关：关闭时完全保持原有 HTTP 行为
-	// ListenMode 主端口监听模式：http / both / https
-	ListenMode string `json:"ListenMode"`
-	// HTTPSPort 额外监听的专用 HTTPS 端口（留空=不额外监听；与主端口相同则忽略）
-	HTTPSPort string `json:"HTTPSPort,omitempty"`
+	// HTTPSPortEnable / HTTPSPort 纯 HTTPS 端口（明文访问自动重定向）
+	HTTPSPortEnable bool   `json:"HTTPSPortEnable"`
+	HTTPSPort       string `json:"HTTPSPort,omitempty"`
+	// HTTPSRedirect HTTPS 端口收到明文 HTTP 请求时自动 308 重定向到 https://
+	// （关闭后明文请求返回 400 提示，不再自动跳转）
+	HTTPSRedirect bool `json:"HTTPSRedirect"`
+	// MixedPortEnable / MixedPort 混合端口（同端口 HTTP + HTTPS 自动识别）
+	MixedPortEnable bool   `json:"MixedPortEnable"`
+	MixedPort       string `json:"MixedPort,omitempty"`
+	// LegacyListenMode 旧版单端口监听模式（http/both/https），仅用于迁移旧配置，不再写盘
+	LegacyListenMode string `json:"ListenMode,omitempty"`
+	// LegacyHTTPPort 旧版 HTTP 端口（HTTP 端口已固定为 config.json 的 PORT），仅用于读取旧配置
+	LegacyHTTPPort string `json:"HTTPPort,omitempty"`
 	// CertMode 证书来源：auto=自动生成 / file=使用自定义证书文件
 	CertMode string `json:"CertMode"`
 	// CertDir 自动证书目录（CertMode=auto 时生效，留空=certs）
@@ -745,22 +761,30 @@ type ServerTLS struct {
 
 // defaultServerTLS 入站加密内置默认值：默认关闭，保持原有透明转发行为
 var defaultServerTLS = ServerTLS{
-	Enable:     false,
-	ListenMode: listenModeHTTP,
-	CertMode:   certModeAuto,
-	CertDir:    defaultTLSCertDir,
+	Enable:          false,
+	HTTPSPortEnable: false,
+	HTTPSRedirect:   true, // HTTPS 端口遇到明文请求默认自动跳转
+	MixedPortEnable: false,
+	CertMode:        certModeAuto,
+	CertDir:         defaultTLSCertDir,
+}
+
+// sanitizePort 只保留数字端口（非法返回空串）
+func sanitizePort(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	for _, r := range p {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return p
 }
 
 // normalizeServerTLS 规范化入站加密配置：非法枚举回退默认值，端口只保留数字
 func normalizeServerTLS(st ServerTLS) ServerTLS {
-	switch strings.ToLower(strings.TrimSpace(st.ListenMode)) {
-	case listenModeBoth:
-		st.ListenMode = listenModeBoth
-	case listenModeHTTPS:
-		st.ListenMode = listenModeHTTPS
-	default:
-		st.ListenMode = listenModeHTTP
-	}
 	switch strings.ToLower(strings.TrimSpace(st.CertMode)) {
 	case certModeFile:
 		st.CertMode = certModeFile
@@ -771,12 +795,14 @@ func normalizeServerTLS(st ServerTLS) ServerTLS {
 	if st.CertDir == "" {
 		st.CertDir = defaultTLSCertDir
 	}
-	st.HTTPSPort = strings.TrimSpace(st.HTTPSPort)
-	for _, r := range st.HTTPSPort {
-		if r < '0' || r > '9' {
-			st.HTTPSPort = ""
-			break
-		}
+	st.HTTPSPort = sanitizePort(st.HTTPSPort)
+	st.MixedPort = sanitizePort(st.MixedPort)
+	// 端口号为空却勾了启用 → 视为未启用（端口必填，不再有「留空=主端口」语义）
+	if st.HTTPSPort == "" {
+		st.HTTPSPortEnable = false
+	}
+	if st.MixedPort == "" {
+		st.MixedPortEnable = false
 	}
 	st.CertFile = strings.TrimSpace(st.CertFile)
 	st.KeyFile = strings.TrimSpace(st.KeyFile)
@@ -787,7 +813,114 @@ func normalizeServerTLS(st ServerTLS) ServerTLS {
 		st.CertFile = ""
 		st.KeyFile = ""
 	}
+	st.LegacyListenMode = "" // 迁移后不再写盘
+	st.LegacyHTTPPort = ""
 	return st
+}
+
+// migrateServerTLSPorts 把旧版单端口 ListenMode 迁移为三端口模型。
+// 返回是否发生了迁移（需要写回 config.json）。
+//
+// 新模型的 HTTP 端口固定就是 config.json 的 PORT，因此旧版的「主端口」语义只影响
+// 加密端口的取舍：
+//
+//	http  → 不启用任何加密端口（主端口本来就是纯 HTTP）
+//	both  → 旧版额外 HTTPSPort 若存在则启用为混合端口（同端口双协议），否则不启用
+//	https → 旧版额外 HTTPSPort 若存在则启用为纯 HTTPS 端口，否则不启用
+//
+// ⚠️ 旧版 https 模式的加密是挂在主端口上的，新模型主端口固定为纯 HTTP，
+// 因此旧 https 配置若没有额外 HTTPSPort，升级后需要用户自行填写一个 HTTPS 端口。
+func migrateServerTLSPorts(st *ServerTLS, raw interface{}, mainPort string) bool {
+	rawMap, ok := raw.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	// 已有新字段 → 不需要迁移
+	if _, has := rawMap["MixedPortEnable"]; has {
+		st.LegacyListenMode = ""
+		st.LegacyHTTPPort = ""
+		return true
+	}
+	legacy := ""
+	if v, has := rawMap["ListenMode"].(string); has {
+		legacy = strings.ToLower(strings.TrimSpace(v))
+	}
+	extra := sanitizePort(st.HTTPSPort)
+	if extra == strings.TrimSpace(mainPort) {
+		extra = "" // 与主端口冲突的旧值直接丢弃
+	}
+	st.HTTPSPortEnable = false
+	st.MixedPortEnable = false
+	st.HTTPSPort = ""
+	st.MixedPort = ""
+	switch legacy {
+	case legacyListenModeBoth:
+		// 旧 both = 主端口双协议 → 用旧额外端口继续提供双协议
+		if extra != "" {
+			st.MixedPortEnable = true
+			st.MixedPort = extra
+		}
+	case legacyListenModeHTTPS:
+		if extra != "" {
+			st.HTTPSPortEnable = true
+			st.HTTPSPort = extra
+		}
+	default: // http 或字段缺失 → 保持原有纯 HTTP 行为
+	}
+	st.LegacyListenMode = ""
+	st.LegacyHTTPPort = ""
+	return true
+}
+
+// effectiveInboundPorts 计算实际要监听的端口列表。
+//
+// HTTP 端口固定为主监听端口 PORT 且始终监听；HTTPS / 混合端口各自独立启用。
+// 若用户把两个端口配成同一个数字（保存时已校验拦截，这里做兜底）：
+// 保留优先级更高的角色，避免同一端口被 Listen 两次而报错。
+func effectiveInboundPorts(st ServerTLS, mainPort string) []inboundPortSpec {
+	mainPort = strings.TrimSpace(mainPort)
+
+	type candidate struct {
+		role string
+		port string
+		prio int
+	}
+	// 优先级：mixed > https > http（端口号冲突时保留靠前的）
+	cands := []candidate{{portRoleHTTP, mainPort, 1}}
+	if st.MixedPortEnable && st.MixedPort != "" {
+		cands = append(cands, candidate{portRoleMixed, st.MixedPort, 3})
+	}
+	if st.HTTPSPortEnable && st.HTTPSPort != "" {
+		cands = append(cands, candidate{portRoleHTTPS, st.HTTPSPort, 2})
+	}
+	// 按优先级从高到低分配端口号，避免高优先级角色被低优先级抢占
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].prio > cands[j].prio })
+
+	seen := make(map[string]bool, len(cands))
+	out := make([]inboundPortSpec, 0, len(cands))
+	for _, c := range cands {
+		if c.port == "" || seen[c.port] {
+			continue
+		}
+		seen[c.port] = true
+		out = append(out, inboundPortSpec{Role: c.role, Port: c.port})
+	}
+	if len(out) == 0 {
+		// 兜底：主端口纯 HTTP，保证服务始终可访问
+		out = append(out, inboundPortSpec{Role: portRoleHTTP, Port: mainPort})
+	}
+	return out
+}
+
+// inboundPortSpec 一个实际监听的端口及其角色
+type inboundPortSpec struct {
+	Role string // http / https / mixed
+	Port string
+}
+
+// needsTLS 该端口角色是否需要证书
+func (s inboundPortSpec) needsTLS() bool {
+	return s.Role == portRoleHTTPS || s.Role == portRoleMixed
 }
 
 // tlsHostList 生成自动证书需要覆盖的主机名/IP 列表（至少包含 localhost 与 127.0.0.1）
@@ -1413,14 +1546,20 @@ func (c *peekedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 
 // detectListener 同端口协议自适应监听器：
 // 读首个字节判断是否为 TLS 握手记录（0x16），是则按 TLS 处理，否则按明文 HTTP 处理。
-// 这样客户端把 URL 写成 http:// 或 https:// 都能连同一个端口。
+//
+// 两种用途：
+//   - 混合端口（mode=portRoleMixed）：明文照常交给 HTTP 服务，一个端口两用
+//   - HTTPS 端口（mode=portRoleHTTPS）：明文请求不发服务，而是返回 308 重定向到
+//     https://同一端口（redirect=true 时），这样用户误用 http:// 访问也能自动跳转
 //
 // ⚠️ 协议探测在独立 goroutine 中完成：若在 Accept 里同步 Peek，
 // 一个只连不发数据的慢连接就会卡住整个 Accept 循环（其它客户端全部排队）。
 type detectListener struct {
 	net.Listener
 	tlsCfg    *tls.Config
-	forceTLS  bool // true=只接受 TLS（ListenMode=https）
+	mode      string // portRoleMixed / portRoleHTTPS
+	redirect  bool   // HTTPS 端口遇到明文时是否 308 重定向
+	portLabel string // 用于拼接重定向地址
 	connCh    chan detectResult
 	done      chan struct{}
 	closeOnce sync.Once
@@ -1432,14 +1571,25 @@ type detectResult struct {
 	err  error
 }
 
-// newDetectListener 创建自适应监听器并启动后台接受循环
-func newDetectListener(ln net.Listener, tlsCfg *tls.Config, forceTLS bool) *detectListener {
+// newMixedListener 创建混合端口监听器（同端口 HTTP + HTTPS）
+func newMixedListener(ln net.Listener, tlsCfg *tls.Config, port string) *detectListener {
+	return newDetectListener(ln, tlsCfg, portRoleMixed, true, port)
+}
+
+// newHTTPSPortListener 创建纯 HTTPS 端口监听器（明文请求自动重定向，或返回 400）
+func newHTTPSPortListener(ln net.Listener, tlsCfg *tls.Config, redirect bool, port string) *detectListener {
+	return newDetectListener(ln, tlsCfg, portRoleHTTPS, redirect, port)
+}
+
+func newDetectListener(ln net.Listener, tlsCfg *tls.Config, mode string, redirect bool, port string) *detectListener {
 	l := &detectListener{
-		Listener: ln,
-		tlsCfg:   tlsCfg,
-		forceTLS: forceTLS,
-		connCh:   make(chan detectResult, 256),
-		done:     make(chan struct{}),
+		Listener:  ln,
+		tlsCfg:    tlsCfg,
+		mode:      mode,
+		redirect:  redirect,
+		portLabel: port,
+		connCh:    make(chan detectResult, 256),
+		done:      make(chan struct{}),
 	}
 	go l.loop()
 	return l
@@ -1465,8 +1615,7 @@ func (l *detectListener) loop() {
 		go func(c net.Conn) {
 			conn, ok := l.wrap(c)
 			if !ok {
-				_ = c.Close()
-				return
+				return // wrap 内部已处理（重定向 / 直接关闭）
 			}
 			select {
 			case <-l.done:
@@ -1497,23 +1646,141 @@ func (l *detectListener) Close() error {
 	return l.Listener.Close()
 }
 
+// wrap 探测首字节：TLS 握手 → 按 TLS 处理；否则按明文处理
 func (l *detectListener) wrap(c net.Conn) (net.Conn, bool) {
-	if l.forceTLS {
-		return tls.Server(c, l.tlsCfg), true
-	}
 	// 首个字节探测：TLS 1.x 握手记录类型为 0x16（SSLv2 ClientHello 为 0x80，极为罕见，按明文处理）
-	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	br := bufio.NewReaderSize(c, 4096)
 	first, err := br.Peek(1)
 	_ = c.SetReadDeadline(time.Time{})
 	if err != nil {
+		_ = c.Close()
 		return nil, false
 	}
 	pc := &peekedConn{Conn: c, r: br}
 	if first[0] == 0x16 {
 		return tls.Server(pc, l.tlsCfg), true
 	}
-	return pc, true
+	// 明文 HTTP
+	if l.mode == portRoleHTTPS {
+		go l.handlePlainHTTP(c, br)
+		return nil, false
+	}
+	return pc, true // 混合端口：明文照常交给 HTTP 服务
+}
+
+// handlePlainHTTP 处理「用 http:// 访问 HTTPS 端口」的明文请求：
+// 默认返回 308 永久重定向到 https://同一端口（保留原始路径与查询串），
+// 关闭重定向时返回 400 并说明原因。响应后立即关闭连接。
+func (l *detectListener) handlePlainHTTP(c net.Conn, br *bufio.Reader) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(15 * time.Second))
+
+	// 读请求行：METHOD SP request-target SP HTTP/x.y
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	// 丢弃剩余请求头（最多 64KB，避免被恶意连接拖住），同时记下 Host 头
+	hostHeader := ""
+	for total := 0; total < 64<<10; {
+		h, err := br.ReadString('\n')
+		if err != nil {
+			break
+		}
+		total += len(h)
+		if h == "\r\n" || h == "\n" {
+			break
+		}
+		if i := strings.IndexByte(h, ':'); i > 0 {
+			if strings.EqualFold(strings.TrimSpace(h[:i]), "Host") {
+				hostHeader = strings.TrimSpace(strings.TrimRight(h[i+1:], "\r\n"))
+			}
+		}
+	}
+
+	fields := strings.Fields(strings.TrimRight(line, "\r\n"))
+	method, target := "GET", "/"
+	if len(fields) >= 1 {
+		method = fields[0]
+	}
+	if len(fields) >= 2 {
+		target = fields[1]
+	}
+
+	if !l.redirect {
+		msg := "此端口仅提供 HTTPS 加密服务，请改用 https:// 访问（明文 HTTP 已被拒绝）\n"
+		fmt.Fprintf(c, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+			len(msg), msg)
+		return
+	}
+
+	// 绝对形式（GET http://host/path HTTP/1.1）时取其中的 path
+	path := target
+	if i := strings.Index(path, "://"); i >= 0 {
+		if j := strings.Index(path[i+3:], "/"); j >= 0 {
+			path = path[i+3+j:]
+		} else {
+			path = "/"
+		}
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	// 重定向目标主机：优先用客户端请求的 Host 头（保留它访问用的 IP / 域名），
+	// 去掉其中原有端口后换成 HTTPS 端口 —— 这样局域网 IP 访问也能跳到正确的地址
+	host := l.portLabel
+	if hostHeader != "" {
+		h := hostHeader
+		if strings.HasPrefix(h, "[") { // IPv6 字面量 [::1]:port
+			if end := strings.Index(h, "]"); end > 0 {
+				h = h[:end+1]
+			}
+		} else if i := strings.LastIndex(h, ":"); i > 0 {
+			h = h[:i] // 去掉端口
+		}
+		if strings.TrimSpace(h) != "" {
+			host = strings.TrimSpace(h)
+		}
+	}
+	// 没有 Host 头时退回配置的监听 IP；0.0.0.0 / :: 这类通配地址对客户端无意义，用 localhost
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = cfg.IP
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			host = "localhost"
+		}
+	}
+	location := "https://" + joinHostPort(host, l.portLabel) + path
+
+	body := ""
+	status := "308 Permanent Redirect"
+	if method == "HEAD" {
+		body = ""
+	} else {
+		body = "Redirecting to " + location + "\n"
+	}
+	fmt.Fprintf(c, "HTTP/1.1 %s\r\nLocation: %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		status, location, len(body), body)
+	fmt.Printf("🔁 明文访问 HTTPS 端口 %s → 已重定向至 %s\n", l.portLabel, location)
+}
+
+// joinHostPort 拼接 host:port（IP 含冒号时加方括号，默认端口省略）
+func joinHostPort(host, port string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "localhost"
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	if port == "" {
+		return host
+	}
+	if port == "443" {
+		return host
+	}
+	return host + ":" + port
 }
 
 // ==================== 过载保护：并发闸门 ====================
@@ -3638,8 +3905,12 @@ func printConfigHelp() {
 	fmt.Println("                           LimitMaxHeader: 是否限请求头大小, MaxHeaderMB: 请求头上限MB(默认1)}")
 	fmt.Println("                     刻意不提供 WriteTimeout/ReadTimeout: 会切断 SSE 流式对话与大请求体上传")
 	fmt.Println(" ▼ ServerTLS        : 入站 HTTPS 加密(自签名证书 / 自定义 CA),修改需重启程序生效")
-	fmt.Println("                     格式: {Enable: 总开关, ListenMode: 监听模式(http=仅HTTP/both=同端口同时支持HTTP+HTTPS/https=仅HTTPS),")
-	fmt.Println("                           HTTPSPort: 额外专用 HTTPS 端口(留空=不额外监听), CertMode: 证书来源(auto=自动生成/file=自定义),")
+	fmt.Println("                     三种端口各自独立,端口号必须互不相同:")
+	fmt.Println("                       HTTP 端口   : 就是上面的 PORT(主监听端口),永远明文 HTTP,不可禁用")
+	fmt.Println("                       HTTPS 端口  : HTTPSPortEnable + HTTPSPort,纯加密;用 http:// 访问会自动 308 跳转到 https://")
+	fmt.Println("                       混合端口    : MixedPortEnable  + MixedPort,同端口按首字节自动识别 HTTP / HTTPS")
+	fmt.Println("                     HTTPSRedirect: HTTPS 端口收到明文请求时是否自动跳转(true=308 跳转/false=返回 400)")
+	fmt.Println("                     其它字段: CertMode: 证书来源(auto=自动生成/file=自定义),")
 	fmt.Println("                           CertDir: 自动证书目录(默认 certs), CertFile: 证书文件, KeyFile: 私钥文件,")
 	fmt.Println("                           CAFile: CA 证书(并入证书链;开启 ClientAuth 时用于校验客户端), ClientAuth: 是否要求客户端证书(mTLS)}")
 	fmt.Println("                     auto 模式首次启动自动生成 certs/ca.crt + certs/server.crt(+key),服务器证书有效期 3 年、CA 10 年,")
@@ -3649,7 +3920,7 @@ func printConfigHelp() {
 	fmt.Println("                       此时配置 CAKeyFile(CA 私钥,需无密码)+ ReissueServerCert=true,程序会用你的 CA 重签一张 SAN 完整的证书")
 	fmt.Println("                       重签结果写入 CertDir/server.crt + server.key(有效期 3 年,由同一 CA 签发,客户端无需重新信任)")
 	fmt.Println("                     CAFile 可写多张证书(中间 CA + 根 CA),程序会把它们全部并入证书链,避免「证书链不完整」")
-	fmt.Println("                     both 模式按连接首字节自动识别 TLS 握手,客户端 URL 写 http:// 或 https:// 都能连同一端口")
+	fmt.Println("                     旧版单端口字段 ListenMode(http/both/https)会在启动时自动迁移为上述三端口配置")
 	fmt.Println(" ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)")
 	fmt.Println("                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,0=不截断,默认8000,上限5000000)}")
 	fmt.Println("                     记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量")
@@ -3945,6 +4216,19 @@ func loadConfig() {
 		stored.ServerTLS = defaultCfg.ServerTLS
 		needSave = true
 	} else {
+		// 旧版单端口 ListenMode(http/both/https) → 三端口模型（HTTPPort / HTTPSPort / MixedPort）
+		if migrateServerTLSPorts(&stored.ServerTLS, rawMap["ServerTLS"], stored.PORT) {
+			needSave = true
+			fmt.Println("🔄 检测到旧版 ServerTLS.ListenMode，已迁移为三个独立端口配置")
+		}
+		// 旧配置没有 HTTPSRedirect 字段 → 反序列化为 false，
+		// 与默认「明文访问 HTTPS 端口自动跳转」不一致，缺失时补默认 true
+		if rawTLS, ok := rawMap["ServerTLS"].(map[string]interface{}); ok {
+			if _, has := rawTLS["HTTPSRedirect"]; !has {
+				stored.ServerTLS.HTTPSRedirect = defaultCfg.ServerTLS.HTTPSRedirect
+				needSave = true
+			}
+		}
 		stored.ServerTLS = normalizeServerTLS(stored.ServerTLS)
 	}
 	if _, ok := rawMap["RealtimeLog"]; !ok {
@@ -5402,12 +5686,67 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.ProxyLimit = normalizeProxyLimit(newCfg.ProxyLimit)
 	// 规范化入站服务器超时（修改需重启生效）
 	newCfg.ServerTimeout = normalizeServerTimeout(newCfg.ServerTimeout)
+	// 入站加密：先校验「启用就必须填端口」，避免 normalize 静默把开关关掉让用户困惑
+	if newCfg.ServerTLS.Enable {
+		if newCfg.ServerTLS.HTTPSPortEnable && sanitizePort(newCfg.ServerTLS.HTTPSPort) == "" {
+			http.Error(w, "已启用 HTTPS 端口但未填写端口号（HTTPS 端口为必填，且不能与 PORT / 混合端口相同）", http.StatusBadRequest)
+			return
+		}
+		if newCfg.ServerTLS.MixedPortEnable && sanitizePort(newCfg.ServerTLS.MixedPort) == "" {
+			http.Error(w, "已启用混合端口但未填写端口号（混合端口为必填，且不能与 PORT / HTTPS 端口相同）", http.StatusBadRequest)
+			return
+		}
+	}
+	// 旧页面保存时可能仍带 ListenMode（新页面已不再提交）→ 先按旧模式迁移，再规范化
+	if newCfg.ServerTLS.LegacyListenMode != "" {
+		rawTLS := map[string]interface{}{"ListenMode": newCfg.ServerTLS.LegacyListenMode}
+		migrateServerTLSPorts(&newCfg.ServerTLS, rawTLS, newCfg.PORT)
+	}
 	// 规范化入站 HTTPS 加密配置；启用时立即校验/生成证书，避免保存后重启才发现问题
 	newCfg.ServerTLS = normalizeServerTLS(newCfg.ServerTLS)
 	if newCfg.ServerTLS.Enable {
-		if _, err := buildInboundTLSConfig(newCfg.ServerTLS, newCfg.IP); err != nil {
-			http.Error(w, "HTTPS 加密配置有误: "+err.Error(), http.StatusBadRequest)
+		// 三个端口必须互不相同（HTTP 端口 = PORT，HTTPS / 混合端口各自独立）
+		ports := map[string]string{}
+		addPort := func(role, port string) error {
+			n, perr := strconv.Atoi(port)
+			if perr != nil || n < 1 || n > 65535 {
+				return fmt.Errorf("%s 端口号无效：%q（应为 1-65535 的数字）", role, port)
+			}
+			if prev, dup := ports[port]; dup {
+				return fmt.Errorf("%s 端口与 %s 端口重复（都是 %s），三个端口必须互不相同", role, prev, port)
+			}
+			ports[port] = role
+			return nil
+		}
+		if err := addPort("HTTP", newCfg.PORT); err != nil {
+			http.Error(w, "监听端口配置有误: "+err.Error(), http.StatusBadRequest)
 			return
+		}
+		if newCfg.ServerTLS.HTTPSPortEnable {
+			if err := addPort("HTTPS", newCfg.ServerTLS.HTTPSPort); err != nil {
+				http.Error(w, "HTTPS 端口配置有误: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if newCfg.ServerTLS.MixedPortEnable {
+			if err := addPort("混合", newCfg.ServerTLS.MixedPort); err != nil {
+				http.Error(w, "混合端口配置有误: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		// 只有存在加密端口时才需要校验证书
+		needTLS := false
+		for _, p := range effectiveInboundPorts(newCfg.ServerTLS, newCfg.PORT) {
+			if p.needsTLS() {
+				needTLS = true
+				break
+			}
+		}
+		if needTLS {
+			if _, err := buildInboundTLSConfig(newCfg.ServerTLS, newCfg.IP); err != nil {
+				http.Error(w, "HTTPS 加密配置有误: "+err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
 	}
 	// 规范化模型详细设置里的图片质量配置
@@ -9764,11 +10103,6 @@ func main() {
 	if cfg.WebConfigPassword != "" {
 		pwHint = "（已启用访问密码 🔒）"
 	}
-	webScheme := "http"
-	if cfg.ServerTLS.Enable && normalizeServerTLS(cfg.ServerTLS).ListenMode == listenModeHTTPS {
-		webScheme = "https"
-	}
-	fmt.Println("⚙️ 配置管理页面: " + webScheme + "://" + webHost + ":" + cfg.PORT + "/config " + pwHint)
 
 	if cfg.ProxyAPIKeyEnabled {
 		valid := 0
@@ -9793,46 +10127,34 @@ func main() {
 	// 以上参数来自配置页「服务器超时 ServerTimeout」，修改需重启程序生效
 	// （Go 的 http.Server 字段不允许在 Serve 之后修改，无法热更新）。
 	st := normalizeServerTimeout(cfg.ServerTimeout)
-	// 三项均为「布尔开关 + 数值」：开关关闭时用零值（Go 的零值就是不限制）。
-	// ⚠ MaxHeaderBytes 特殊：Go 把 0 当作「使用 DefaultMaxHeaderBytes(1MB)」而不是不限制，
-	// 因此不限制时必须显式给一个极大值（约 2GB）。
-	var readHeaderTimeout, idleTimeout time.Duration
-	if st.LimitReadHeader {
-		readHeaderTimeout = time.Duration(st.ReadHeaderTimeoutSec) * time.Second
-	}
-	if st.LimitIdle {
-		idleTimeout = time.Duration(st.IdleTimeoutSec) * time.Second
-	}
-	maxHeaderBytes := 0
-	if st.LimitMaxHeader {
-		maxHeaderBytes = st.MaxHeaderMB << 20
-	} else {
-		maxHeaderBytes = int(^uint32(0) >> 1) // 2147483647（约 2GB，实际等同于不限制）
-	}
-	srv := &http.Server{
-		Addr:              cfg.IP + ":" + cfg.PORT,
-		Handler:           nil,               // nil = 使用 http.DefaultServeMux（上面注册的 handler）
-		ReadHeaderTimeout: readHeaderTimeout, // 0 = 不限制；只限制请求头读取（慢速攻击防护，不影响流式）
-		IdleTimeout:       idleTimeout,       // 0 = 不限制；空闲 keep-alive 连接超时回收
-		MaxHeaderBytes:    maxHeaderBytes,    // 请求头上限（0 会被 Go 当成 1MB，所以不限制时给极大值）
+
+	// ==================== 入站端口（HTTP / HTTPS / 混合，可任意组合） ====================
+	// 证书与监听器只能在启动时构建（http.Server / tls.Config 无法在 Serve 之后替换），
+	// 因此「入站加密」相关配置修改需重启程序生效。
+	tlsSt := normalizeServerTLS(cfg.ServerTLS)
+	ports := []inboundPortSpec{{Role: portRoleHTTP, Port: cfg.PORT}}
+	if tlsSt.Enable {
+		ports = effectiveInboundPorts(tlsSt, cfg.PORT)
 	}
 
-	// ==================== 入站 HTTPS 加密 ServerTLS ====================
-	// 证书与监听器只能在启动时构建（http.Server / tls.Config 无法在 Serve 之后替换），
-	// 因此「入站 HTTPS 加密」的配置修改需重启程序生效。
-	tlsSt := normalizeServerTLS(cfg.ServerTLS)
+	needTLS := false
+	for _, p := range ports {
+		if p.needsTLS() {
+			needTLS = true
+			break
+		}
+	}
+
 	var inboundTLS *tls.Config
-	if tlsSt.Enable {
+	if needTLS {
 		cfgTLS, err := buildInboundTLSConfig(tlsSt, cfg.IP)
 		if err != nil {
-			fmt.Printf("❌ HTTPS 加密启动失败: %v\n   已回退为仅 HTTP 服务，请在配置页修正证书设置后重启\n", err)
+			fmt.Printf("❌ HTTPS 加密启动失败: %v\n   加密端口已降级为明文 HTTP 服务，请在配置页修正证书设置后重启\n", err)
+			for i := range ports {
+				ports[i].Role = portRoleHTTP
+			}
 		} else {
 			inboundTLS = cfgTLS
-			if tlsSt.ListenMode == listenModeHTTPS {
-				fmt.Println("🔒 入站加密: 已启用（仅 HTTPS，明文 HTTP 请求会被拒绝）")
-			} else {
-				fmt.Println("🔒 入站加密: 已启用（同一端口同时支持 HTTP 与 HTTPS，按首字节自动识别）")
-			}
 			if info := buildTLSInfo(tlsSt, cfg.IP); info.Fingerprint != "" {
 				fmt.Println("🔐 CA 证书指纹: " + info.Fingerprint + "（有效期至 " + info.NotAfter + "）")
 				fmt.Println("   客户端信任该 CA 后即可用 https:// 访问；配置页「下载 CA 证书」可直接导出")
@@ -9843,36 +10165,71 @@ func main() {
 					fmt.Println("⚠️ HTTPS 证书提示: " + w)
 				}
 			}
-			if tlsSt.HTTPSPort != "" && tlsSt.HTTPSPort != cfg.PORT {
-				fmt.Println("🔒 额外 HTTPS 端口: " + cfg.IP + ":" + tlsSt.HTTPSPort)
+		}
+	}
+
+	// 打印端口清单，并挑一个「最适合浏览器打开配置页」的地址做提示
+	webURL := ""
+	for _, p := range ports {
+		addr := cfg.IP + ":" + p.Port
+		switch p.Role {
+		case portRoleMixed:
+			fmt.Printf("🌐 混合端口: %s（同一端口同时支持 HTTP 与 HTTPS，按首字节自动识别）\n", addr)
+			webURL = "https://" + webHost + ":" + p.Port + "/config"
+		case portRoleHTTPS:
+			if tlsSt.HTTPSRedirect {
+				fmt.Printf("🔒 HTTPS 端口: %s（仅加密；用 http:// 访问会自动跳转到 https://）\n", addr)
+			} else {
+				fmt.Printf("🔒 HTTPS 端口: %s（仅加密；明文请求返回 400）\n", addr)
+			}
+			webURL = "https://" + webHost + ":" + p.Port + "/config"
+		default:
+			if inboundTLS == nil {
+				fmt.Printf("🔓 HTTP 端口: %s（明文）\n", addr)
+			} else {
+				fmt.Printf("🔓 HTTP 端口: %s（明文；加密端口在其它端口）\n", addr)
+			}
+			if webURL == "" {
+				webURL = "http://" + webHost + ":" + p.Port + "/config"
 			}
 		}
 	}
+	if webURL == "" {
+		webURL = "http://" + webHost + ":" + cfg.PORT + "/config"
+	}
+	fmt.Println("⚙️ 配置管理页面: " + webURL + " " + pwHint)
 
-	if inboundTLS != nil {
-		ln, err := net.Listen("tcp", srv.Addr)
-		if err != nil {
-			fmt.Printf("服务异常退出: %v\n", err)
+	// 逐个端口启动监听：第一个在主 goroutine 阻塞，其余在后台 goroutine
+	for i, p := range ports {
+		serve := func() error { return serveInboundPort(p, st, inboundTLS, tlsSt.HTTPSRedirect) }
+		if i == len(ports)-1 {
+			if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Printf("服务异常退出: %v\n", err)
+			}
 			return
 		}
-		// 额外 HTTPS 专用端口（主端口仍按 ListenMode 工作，方便老客户端继续走 HTTP）
-		if port := tlsSt.HTTPSPort; port != "" && port != cfg.PORT {
-			go startExtraHTTPS(cfg.IP+":"+port, st, inboundTLS)
-		}
-		listener := newDetectListener(ln, inboundTLS, tlsSt.ListenMode == listenModeHTTPS)
-		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Printf("服务异常退出: %v\n", err)
-		}
-		return
-	}
-
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fmt.Printf("服务异常退出: %v\n", err)
+		go func(role, port string) {
+			if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Printf("❌ %s 端口 %s 异常退出: %v\n", role, port, err)
+			}
+		}(p.Role, p.Port)
 	}
 }
 
-// startExtraHTTPS 启动额外的专用 HTTPS 监听（与主服务共享路由），供需要固定加密端口的客户端使用。
-func startExtraHTTPS(addr string, st ServerTimeout, tlsCfg *tls.Config) {
+// serveInboundPort 按端口角色启动监听：
+//
+//	http  → 纯明文 HTTP
+//	https → 纯 TLS；明文请求按 redirect 决定「308 跳转」还是「400 拒绝」
+//	mixed → 同端口协议自适应（HTTP 与 HTTPS 共存）
+func serveInboundPort(p inboundPortSpec, st ServerTimeout, tlsCfg *tls.Config, redirect bool) error {
+	addr := cfg.IP + ":" + p.Port
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("❌ 端口 %s 监听失败（%s）: %v\n", p.Port, p.Role, err)
+		return err
+	}
+
+	// 超时参数沿用「服务器超时 ServerTimeout」
 	var readHeaderTimeout, idleTimeout time.Duration
 	if st.LimitReadHeader {
 		readHeaderTimeout = time.Duration(st.ReadHeaderTimeoutSec) * time.Second
@@ -9880,24 +10237,32 @@ func startExtraHTTPS(addr string, st ServerTimeout, tlsCfg *tls.Config) {
 	if st.LimitIdle {
 		idleTimeout = time.Duration(st.IdleTimeoutSec) * time.Second
 	}
+	// ⚠ MaxHeaderBytes 特殊：Go 把 0 当作「使用 DefaultMaxHeaderBytes(1MB)」而不是不限制，
+	// 因此不限制时必须显式给一个极大值（约 2GB）。
 	maxHeaderBytes := int(^uint32(0) >> 1)
 	if st.LimitMaxHeader {
 		maxHeaderBytes = st.MaxHeaderMB << 20
 	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		fmt.Printf("❌ 额外 HTTPS 端口监听失败 %s: %v\n", addr, err)
-		return
-	}
-	fmt.Println("🔒 额外 HTTPS 端口已监听: " + addr)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           nil,
-		ReadHeaderTimeout: readHeaderTimeout,
-		IdleTimeout:       idleTimeout,
+		Handler:           nil,               // nil = 使用 http.DefaultServeMux（共享同一套路由）
+		ReadHeaderTimeout: readHeaderTimeout, // 0 = 不限制；只限制请求头读取（慢速攻击防护，不影响流式）
+		IdleTimeout:       idleTimeout,       // 0 = 不限制；空闲 keep-alive 连接超时回收
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
-	if err := srv.Serve(tls.NewListener(ln, tlsCfg)); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fmt.Printf("额外 HTTPS 服务退出: %v\n", err)
+
+	switch p.Role {
+	case portRoleMixed:
+		if tlsCfg == nil {
+			return srv.Serve(ln)
+		}
+		return srv.Serve(newMixedListener(ln, tlsCfg, p.Port))
+	case portRoleHTTPS:
+		if tlsCfg == nil {
+			return srv.Serve(ln)
+		}
+		return srv.Serve(newHTTPSPortListener(ln, tlsCfg, redirect, p.Port))
+	default:
+		return srv.Serve(ln)
 	}
 }
