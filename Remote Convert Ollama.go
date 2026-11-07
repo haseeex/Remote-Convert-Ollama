@@ -11,15 +11,22 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"image"
@@ -29,6 +36,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,6 +52,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -58,6 +67,9 @@ type ModelDetailedSetting struct {
 	VisionProxyPrompt string `json:"VisionProxyPrompt,omitempty"`
 	// VisionImageQuality 本模型图片质量配置：优先于全局 VisionImageQuality（留空=使用全局）
 	VisionImageQuality *VisionQuality `json:"VisionImageQuality,omitempty"`
+	// GifNormalize 本模型是否把 GIF 动图转换为 PNG 首帧再转发给主模型（部分上游不接受 GIF）
+	// 三态：nil=跟随全局 Config.GifNormalize（默认关闭）/ true=开启 / false=关闭
+	GifNormalize *bool `json:"GifNormalize,omitempty"`
 }
 
 // PromptReplaceRule 定义请求提示词替换规则
@@ -95,7 +107,8 @@ type ModelContextPrompt struct {
 //     客户端把含裸 </thinking> 的 assistant 消息回放给上游后，上游 prompt 渲染器会在裸
 //     </thinking> 处截断该消息历史 → 模型丢上下文 → 复现垃圾输出 → 死循环。
 //     本开关在转发边界把裸标签替换为 [THINK-START]/[THINK-END]：响应侧防脏历史进入客户端，
-//     请求侧防上游截断历史。只处理"裸"标签（计数不配对），配对的教学示例不误伤。
+//     请求侧防上游截断历史。只处理裸闭标签（无配对开标签的 </thinking>），
+//     裸开标签与配对完整的 <thinking>...</thinking> 不影响上游渲染，无需处理。
 //     （独立于 Enable 生效，默认开启：正常对话零影响，只替换异常泄漏）
 type DoomLoopProtection struct {
 	Enable      bool   `json:"Enable"`               // 总开关
@@ -104,23 +117,141 @@ type DoomLoopProtection struct {
 	Warn        bool   `json:"Warn"`                 // 跨请求警告注入（C 方案）：熔断/复读后下一轮注入 system 警告
 	MaxRepeat   int    `json:"MaxRepeat,omitempty"`  // 连续重复熔断阈值（>=2 生效，默认 3）
 	WarnPrompt  string `json:"WarnPrompt,omitempty"` // 跨请求注入的警告提示词（留空=内置默认）
-	// ThinkTag 思考标签消毒：裸 <thinking>/</thinking> 泄漏替换为 [THINK-START]/[THINK-END]
+	// ThinkTag 思考标签消毒总开关：裸 <thinking>/</thinking> 泄漏替换为 [THINK-START]/[THINK-END]
 	// （ollama cloud 死循环防护，独立于 Enable 生效，默认开启）
 	// ⚠️ 不能用 omitempty：bool 零值 false 会被省略 → 用户关闭后保存，
 	// config.json 里没有该字段 → 前端重新加载拿到 undefined 被 "!== false" 误判为开启
 	// （开关"关不掉"），且重启时"旧配置升级"逻辑还会把缺失字段补回默认开启
 	ThinkTag bool `json:"ThinkTag"`
+	// ThinkTagRequest 请求侧消毒开关（客户端历史 → 上游）。
+	// 作用：客户端把已污染的裸标签回放给上游前替换掉，防止上游 prompt 渲染器截断 assistant 历史。
+	// 关掉它可避免「客户端历史里本来就有裸标签」时每轮都被处理（只保留响应侧根治）。
+	ThinkTagRequest bool `json:"ThinkTagRequest"`
+	// ThinkTagResponse 响应侧消毒开关（上游 → 客户端）。
+	// 作用：上游泄漏的裸标签在进入客户端会话前替换掉，阻止脏数据污染历史（根治源头）。
+	ThinkTagResponse bool `json:"ThinkTagResponse"`
+	// 请求侧消毒的生效角色（仅 ThinkTagRequest=true 时有效）。
+	// 为什么可配：死循环的真正污染源是 assistant 历史被回放后遭上游截断；
+	// 而 tool（工具输出）/user（用户提问）/system 里出现的裸标签多属内容的一部分
+	// （如技术文档、功能说明、读取源码时工具返回的文本），
+	// 一并处理会频繁误触发。
+	// 默认只处理 assistant，需要彻底清扫时再勾选其他角色。
+	ThinkTagRoleAssistant bool `json:"ThinkTagRoleAssistant"` // 只清 AI 自己回放的历史（默认开启）
+	ThinkTagRoleUser      bool `json:"ThinkTagRoleUser"`      // 用户消息（默认关闭）
+	ThinkTagRoleSystem    bool `json:"ThinkTagRoleSystem"`    // system 消息（含 Anthropic 顶层 system，默认关闭）
+	ThinkTagRoleTool      bool `json:"ThinkTagRoleTool"`      // tool / function 工具结果（默认关闭）
+	// RepeatMaxEntries 跨请求复读记录的会话数上限（LimitRepeatEntries=true 时生效）
+	LimitRepeatEntries bool `json:"LimitRepeatEntries"` // true=限制条数 / false=不限条数（map 可无限增长）
+	RepeatMaxEntries   int  `json:"RepeatMaxEntries"`   // 会话数上限（0=默认 256，上限 10000；记录只存 SHA-256 摘要）
+	// RepeatTTLMin 跨请求复读记录的有效期
+	LimitRepeatTTL bool `json:"LimitRepeatTTL"` // true=按 RepeatTTLMin 过期 / false=永不过期
+	RepeatTTLMin   int  `json:"RepeatTTLMin"`   // 有效期分钟（0=默认 30，上限 1440）
 }
 
 // defaultDoomLoopWarnPrompt 默认跨请求警告提示词
 const defaultDoomLoopWarnPrompt = "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"
 
-// normalizeDoomLoop 规范化配置：MaxRepeat 非法值回退为 3
+// 跨请求复读记录的默认上限（配置缺失/非法时的兜底值）
+const (
+	defaultRepeatMaxEntries = 256     // 最多跟踪的会话数
+	defaultRepeatTTLMin     = 30      // 记录有效期（分钟）
+	maxRepeatMaxEntries     = 10000   // 会话数上限（防误配置吃内存）
+	maxRepeatTTLMin         = 24 * 60 // 有效期上限（分钟，24 小时）
+)
+
+// normalizeDoomLoop 规范化配置：
+// MaxRepeat 非法值回退为 3；复读记录上限 0/越界回退默认；旧版 -1 迁移为「不限制」
 func normalizeDoomLoop(d DoomLoopProtection) DoomLoopProtection {
-	if d.MaxRepeat < 2 {
+	if d.MaxRepeat < 2 || d.MaxRepeat > 20 {
 		d.MaxRepeat = 3
 	}
+	// 请求侧角色不做强制回退：若用户把四个角色全关，等于主动放弃请求侧消毒
+	// （仍有 ThinkTagRequest 总开关兜底），尊重用户的显式选择；
+	// 旧配置缺字段的情况在 loadConfig 的迁移逻辑里补默认（assistant）。
+	// 旧版用 -1 表示不限制（负数），迁移为布尔开关
+	if d.RepeatMaxEntries < 0 {
+		d.LimitRepeatEntries = false
+		d.RepeatMaxEntries = defaultRepeatMaxEntries
+	} else if d.RepeatMaxEntries == 0 || d.RepeatMaxEntries > maxRepeatMaxEntries {
+		d.RepeatMaxEntries = defaultRepeatMaxEntries
+	}
+	if d.RepeatTTLMin < 0 {
+		d.LimitRepeatTTL = false
+		d.RepeatTTLMin = defaultRepeatTTLMin
+	} else if d.RepeatTTLMin == 0 || d.RepeatTTLMin > maxRepeatTTLMin {
+		d.RepeatTTLMin = defaultRepeatTTLMin
+	}
 	return d
+}
+
+// thinkTagRequestEnabled 请求侧思考标签消毒是否生效（总开关 + 请求侧子开关）。
+func thinkTagRequestEnabled() bool {
+	return cfg.DoomLoopProtection.ThinkTag && cfg.DoomLoopProtection.ThinkTagRequest
+}
+
+// thinkTagResponseEnabled 响应侧思考标签消毒是否生效（总开关 + 响应侧子开关）。
+func thinkTagResponseEnabled() bool {
+	return cfg.DoomLoopProtection.ThinkTag && cfg.DoomLoopProtection.ThinkTagResponse
+}
+
+// thinkTagRoles 请求侧消毒的生效角色集合（运行时读配置）。
+type thinkTagRoles struct {
+	Assistant bool
+	User      bool
+	System    bool
+	Tool      bool
+}
+
+// currentThinkTagRoles 读取当前配置的生效角色。
+func currentThinkTagRoles() thinkTagRoles {
+	d := cfg.DoomLoopProtection
+	return thinkTagRoles{
+		Assistant: d.ThinkTagRoleAssistant,
+		User:      d.ThinkTagRoleUser,
+		System:    d.ThinkTagRoleSystem,
+		Tool:      d.ThinkTagRoleTool,
+	}
+}
+
+// allows 判断某 role 的消息是否参与请求侧消毒。
+// role 缺失（异常客户端）按 assistant 处理——那是最需要防护的对象，宁可多清一次。
+func (t thinkTagRoles) allows(role string) bool {
+	switch role {
+	case "user":
+		return t.User
+	case "system":
+		return t.System
+	case "tool", "function":
+		return t.Tool
+	default: // assistant / developer / 空 role
+		return t.Assistant
+	}
+}
+
+// repeatEntryLimit 复读记录会话数上限（运行时读配置）。
+// 第二个返回值 false 表示不限制条数（LimitRepeatEntries 关闭）。
+func repeatEntryLimit() (int, bool) {
+	if !cfg.DoomLoopProtection.LimitRepeatEntries {
+		return 0, false
+	}
+	n := cfg.DoomLoopProtection.RepeatMaxEntries
+	if n <= 0 || n > maxRepeatMaxEntries {
+		n = defaultRepeatMaxEntries
+	}
+	return n, true
+}
+
+// repeatTTL 复读记录有效期（运行时读配置）。
+// 第二个返回值 false 表示不过期（LimitRepeatTTL 关闭）。
+func repeatTTL() (time.Duration, bool) {
+	if !cfg.DoomLoopProtection.LimitRepeatTTL {
+		return 0, false
+	}
+	n := cfg.DoomLoopProtection.RepeatTTLMin
+	if n <= 0 || n > maxRepeatTTLMin {
+		n = defaultRepeatTTLMin
+	}
+	return time.Duration(n) * time.Minute, true
 }
 
 // 末日循环保护：跨请求提醒状态（C 方案）
@@ -287,19 +418,27 @@ func migrateRequestPromptReplace(stored *Config, rawMap map[string]interface{}) 
 }
 
 type Config struct {
-	IP                string   `json:"IP"`
-	PORT              string   `json:"PORT"`
-	Log_Limit         int64    `json:"Log_Limit"`
-	Log_Responses     bool     `json:"Log_Responses"`
-	Log_Headers       bool     `json:"Log_Headers"`
-	Log_Body          bool     `json:"Log_Body"`
-	OpenAIPrefix      string   `json:"OpenAI_Prefix"`
-	OpenAISuffix      string   `json:"OpenAI_Suffix"`
-	StreamMode        string   `json:"StreamMode"`
-	Capabilities      []string `json:"Capabilities"`
-	OpenAIBase        string   `json:"OPENAI_BASE"`
-	OpenAIKey         string   `json:"OPENAI_KEY"`
-	WebConfigPassword string   `json:"WebConfigPassword,omitempty"` // 配置管理页面访问密码（空=不启用）
+	IP            string   `json:"IP"`
+	PORT          string   `json:"PORT"`
+	Log_Limit     int64    `json:"Log_Limit"`
+	Log_Responses bool     `json:"Log_Responses"`
+	Log_Headers   bool     `json:"Log_Headers"`
+	Log_Body      bool     `json:"Log_Body"`
+	OpenAIPrefix  string   `json:"OpenAI_Prefix"`
+	OpenAISuffix  string   `json:"OpenAI_Suffix"`
+	StreamMode    string   `json:"StreamMode"`
+	Capabilities  []string `json:"Capabilities"`
+	// DefaultContextLength / DefaultMaxOutputTokens 全局默认上下文长度 / 最大输出 token。
+	// 用途：上游没有返回模型元数据、且 ModelDetailedSettings 未单独配置该模型时，
+	// 作为 /v1/models、/api/tags、/api/show、/api/ps 与模型上下文注入的兜底值。
+	// 为什么可配置：不同上游（或中转网关）的模型上下文差别很大（8K / 128K / 1M），
+	// 写死 1M 会让客户端误以为可以塞百万 token，既可能被上游拒绝又白烧 token。
+	// 0 或负数 = 使用内置默认值（1000000 / 384000）。
+	DefaultContextLength   int64  `json:"DefaultContextLength"`
+	DefaultMaxOutputTokens int64  `json:"DefaultMaxOutputTokens"`
+	OpenAIBase             string `json:"OPENAI_BASE"`
+	OpenAIKey              string `json:"OPENAI_KEY"`
+	WebConfigPassword      string `json:"WebConfigPassword,omitempty"` // 配置管理页面访问密码（空=不启用）
 	// ProxyAPIKey 旧版单密钥字段（已迁移到 ProxyAPIKeys 列表；保留仅用于读取旧配置）
 	ProxyAPIKey string `json:"ProxyAPIKey,omitempty"`
 	// ProxyAPIKeys 代理请求密钥列表（多密钥入站鉴权）：每个客户端可分配独立密钥，
@@ -320,12 +459,23 @@ type Config struct {
 	// 再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命。
 	// 0=禁用内存缓存（仅磁盘缓存）；启动时按修改时间预加载最近的 N 条到内存。
 	VisionProxyMemCacheSize int `json:"VisionProxyMemCacheSize,omitempty"`
+	// GifNormalize 主模型 GIF 转换开关（默认关闭）：主模型原生支持视觉、或未配置视觉代理时，
+	// 请求体里的 GIF 动图会原样转发；部分上游/中转网关不接受 GIF（返回 400 invalid image input），
+	// 开启后在转发前统一转为 PNG 首帧。可用 ModelDetailedSettings[模型].GifNormalize 单独覆盖。
+	// ⚠️ bool 字段不能加 omitempty（false 是零值会被静默丢弃，导致"关不掉"类 bug）
+	GifNormalize bool `json:"GifNormalize"`
 	// ModelContextPrompt 模型上下文信息注入：自动附加当前模型信息到提示词，帮助模型自我认知
 	ModelContextPrompt ModelContextPrompt `json:"ModelContextPrompt,omitempty"`
 	// DoomLoopProtection 末日循环保护：上游内容重复检测 + 熔断 + 跨请求提醒 AI
 	DoomLoopProtection DoomLoopProtection `json:"DoomLoopProtection,omitempty"`
 	// ConnPool 上游连接池设置（HTTP/2 + keep-alive），保存后立即生效，无需重启
 	ConnPool ConnPool `json:"ConnPool,omitempty"`
+	// ProxyLimit 过载保护：并发闸门 + 请求体上限（防高并发 OOM），保存后立即生效
+	ProxyLimit ProxyLimit `json:"ProxyLimit,omitempty"`
+	// ServerTimeout 入站 HTTP 服务器超时（防慢速连接堆积），修改需重启程序生效
+	ServerTimeout ServerTimeout `json:"ServerTimeout,omitempty"`
+	// ServerTLS 入站 HTTPS 加密（自签名证书 / 自定义 CA），修改需重启程序生效
+	ServerTLS ServerTLS `json:"ServerTLS,omitempty"`
 	// RealtimeLog 实时请求查看：内存记录最近的请求与响应，供配置页面实时查看
 	RealtimeLog RealtimeLog `json:"RealtimeLog,omitempty"`
 	// ModelMetaProbe 模型元数据探测：上游 /models 列表缺少上下文长度/最大输出时，逐个向上游查询补全
@@ -398,6 +548,1437 @@ func normalizeRealtimeLog(rl RealtimeLog) RealtimeLog {
 		rl.MaxBodyLen = 5000000
 	}
 	return rl
+}
+
+// ProxyLimit 过载保护：并发闸门 + 请求体上限。
+//
+// 为什么需要：高并发场景（尤其是带图片的请求）单个请求体可达数十 MB，
+// 若没有任何上限，内存占用会随并发数线性增长，最终被系统当作 OOM 静默杀掉
+// （进程直接消失、服务停止，日志里看不到任何错误）。两道闸门配合才能治本：
+//   - 并发闸门：同时处理的请求数超过上限时排队，排队超时返回 503，避免内存无限堆积
+//   - 请求体上限：超过限制直接返回 413，不做任何解析（连读都不读完）
+//
+// 两项均运行时立即生效（保存配置即可，无需重启）。
+//
+// 配置设计：「是否限制」用布尔开关表达，「限制值」用整数表达。
+// 不用魔法数字（如 -1=不限制 / 0=默认）——那种写法人和 AI 都容易误判。
+type ProxyLimit struct {
+	Enable bool `json:"Enable"` // 总开关
+
+	// 并发闸门：LimitConcurrency=false 时完全不限并发（所有请求直接放行）
+	LimitConcurrency bool `json:"LimitConcurrency"` // true=按 MaxConcurrent 限制 / false=不限并发
+	MaxConcurrent    int  `json:"MaxConcurrent"`    // 最大并发请求数（0=默认 32，上限 4096）
+
+	// 排队超时：LimitQueueTimeout=false 时排队不限时（只等客户端断开）
+	LimitQueueTimeout bool `json:"LimitQueueTimeout"` // true=排队超时返回 503 / false=不限时
+	QueueTimeoutSec   int  `json:"QueueTimeoutSec"`   // 排队超时秒数（0=默认 60，上限 3600）
+
+	// 请求体上限：LimitRequestBody=false 时完全不限请求体大小
+	LimitRequestBody bool `json:"LimitRequestBody"` // true=超限返回 413 / false=不限大小
+	MaxRequestBodyMB int  `json:"MaxRequestBodyMB"` // 单请求体上限 MB（0=默认 32，上限 4096）
+}
+
+// defaultProxyLimit 过载保护内置默认值。
+// 默认不限制请求体大小：带图片的请求体本来就大，默认拦截反而可能误伤
+var defaultProxyLimit = ProxyLimit{
+	Enable:            false, // 默认关闭：不改变任何转发行为，用户主动开启才生效
+	LimitConcurrency:  true,
+	MaxConcurrent:     32,
+	LimitQueueTimeout: true,
+	QueueTimeoutSec:   60,
+	LimitRequestBody:  false,
+	MaxRequestBodyMB:  32,
+}
+
+// migrateProxyLimitSwitches 把旧版 ProxyLimit（用负数魔法值表示「不限制」）迁移为布尔开关结构。
+// 只在旧配置（缺少 LimitXxx 字段）时生效，返回是否发生了迁移（需要写回 config.json）。
+//
+// 为什么必须迁移：LimitXxx 是本版新增的 bool 字段，旧配置里不存在 →
+// 反序列化得到 false（= 不限制），若不修正会让原本「限制 32 并发」的配置
+// 在升级后静默变成「不限并发」。推断规则按旧版语义：
+//
+//	旧值 < 0  → 开关 = false（旧版用它表示不限制）
+//	旧值 >= 0 → 开关 = true （旧版有数值即视为限制，含 0=使用默认值）
+func migrateProxyLimitSwitches(pl *ProxyLimit, raw interface{}) bool {
+	rawMap, ok := raw.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	migrated := false
+	// 返回旧字段的数值（缺失视为 0 → 视为「限制」）
+	oldNum := func(key string) float64 {
+		if v, has := rawMap[key].(float64); has {
+			return v
+		}
+		return 0
+	}
+	if _, has := rawMap["LimitConcurrency"]; !has {
+		pl.LimitConcurrency = oldNum("MaxConcurrent") >= 0
+		migrated = true
+	}
+	if _, has := rawMap["LimitQueueTimeout"]; !has {
+		pl.LimitQueueTimeout = oldNum("QueueTimeoutSec") >= 0
+		migrated = true
+	}
+	if _, has := rawMap["LimitRequestBody"]; !has {
+		// ⚠️ 这一项特殊：MaxRequestBodyMB 在历史版本中出现过两种「不限制」写法
+		// （早期版本 0=不限制，后改为 -1=不限制），所以 <= 0 一律视为不限制，
+		// 只有正数才代表用户确实想限制请求体大小。
+		pl.LimitRequestBody = oldNum("MaxRequestBodyMB") > 0
+		migrated = true
+	}
+	return migrated
+}
+
+// migrateServerTimeoutSwitches 同 migrateProxyLimitSwitches，作用于 ServerTimeout 的三个开关
+func migrateServerTimeoutSwitches(st *ServerTimeout, raw interface{}) bool {
+	rawMap, ok := raw.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	migrated := false
+	oldNum := func(key string) float64 {
+		if v, has := rawMap[key].(float64); has {
+			return v
+		}
+		return 0
+	}
+	if _, has := rawMap["LimitReadHeader"]; !has {
+		st.LimitReadHeader = oldNum("ReadHeaderTimeoutSec") >= 0
+		migrated = true
+	}
+	if _, has := rawMap["LimitIdle"]; !has {
+		st.LimitIdle = oldNum("IdleTimeoutSec") >= 0
+		migrated = true
+	}
+	if _, has := rawMap["LimitMaxHeader"]; !has {
+		st.LimitMaxHeader = oldNum("MaxHeaderMB") >= 0
+		migrated = true
+	}
+	return migrated
+}
+
+// normalizeProxyLimit 规范化过载保护配置：数值 0/越界回退默认；旧版 -1 迁移为「不限制」
+func normalizeProxyLimit(pl ProxyLimit) ProxyLimit {
+	if pl.MaxConcurrent < 0 {
+		pl.LimitConcurrency = false
+		pl.MaxConcurrent = defaultProxyLimit.MaxConcurrent
+	} else if pl.MaxConcurrent == 0 || pl.MaxConcurrent > 4096 {
+		pl.MaxConcurrent = defaultProxyLimit.MaxConcurrent
+	}
+	if pl.QueueTimeoutSec < 0 {
+		pl.LimitQueueTimeout = false
+		pl.QueueTimeoutSec = defaultProxyLimit.QueueTimeoutSec
+	} else if pl.QueueTimeoutSec == 0 || pl.QueueTimeoutSec > 3600 {
+		pl.QueueTimeoutSec = defaultProxyLimit.QueueTimeoutSec
+	}
+	if pl.MaxRequestBodyMB < 0 {
+		pl.LimitRequestBody = false
+		pl.MaxRequestBodyMB = defaultProxyLimit.MaxRequestBodyMB
+	} else if pl.MaxRequestBodyMB == 0 || pl.MaxRequestBodyMB > 4096 {
+		pl.MaxRequestBodyMB = defaultProxyLimit.MaxRequestBodyMB
+	}
+	return pl
+}
+
+// ServerTimeout 入站 HTTP 服务器超时设置（防慢速连接堆积，需重启程序生效）。
+// ⚠️ Go 的 http.Server 字段不允许在 Serve 之后修改，因此本组配置只在启动时读取。
+// ⚠️ 不提供 WriteTimeout / ReadTimeout：会切断 SSE 流式对话与大请求体上传。
+type ServerTimeout struct {
+	LimitReadHeader      bool `json:"LimitReadHeader"`      // true=按 ReadHeaderTimeoutSec 超时 / false=不限时
+	ReadHeaderTimeoutSec int  `json:"ReadHeaderTimeoutSec"` // 读请求头超时秒（0=默认 30，上限 3600）
+	LimitIdle            bool `json:"LimitIdle"`            // true=按 IdleTimeoutSec 回收 / false=不回收
+	IdleTimeoutSec       int  `json:"IdleTimeoutSec"`       // 空闲 keep-alive 连接回收秒（0=默认 120，上限 86400）
+	LimitMaxHeader       bool `json:"LimitMaxHeader"`       // true=按 MaxHeaderMB 限制 / false=不限大小
+	MaxHeaderMB          int  `json:"MaxHeaderMB"`          // 请求头上限 MB（0=默认 1，上限 64）
+}
+
+// defaultServerTimeout 服务器超时内置默认值（三项默认均启用）
+var defaultServerTimeout = ServerTimeout{
+	LimitReadHeader:      true,
+	ReadHeaderTimeoutSec: 30,
+	LimitIdle:            true,
+	IdleTimeoutSec:       120,
+	LimitMaxHeader:       true,
+	MaxHeaderMB:          1,
+}
+
+// normalizeServerTimeout 规范化服务器超时配置：数值 0/越界回退默认；旧版 -1 迁移为「不限制」
+func normalizeServerTimeout(st ServerTimeout) ServerTimeout {
+	if st.ReadHeaderTimeoutSec < 0 {
+		st.LimitReadHeader = false
+		st.ReadHeaderTimeoutSec = defaultServerTimeout.ReadHeaderTimeoutSec
+	} else if st.ReadHeaderTimeoutSec == 0 || st.ReadHeaderTimeoutSec > 3600 {
+		st.ReadHeaderTimeoutSec = defaultServerTimeout.ReadHeaderTimeoutSec
+	}
+	if st.IdleTimeoutSec < 0 {
+		st.LimitIdle = false
+		st.IdleTimeoutSec = defaultServerTimeout.IdleTimeoutSec
+	} else if st.IdleTimeoutSec == 0 || st.IdleTimeoutSec > 86400 {
+		st.IdleTimeoutSec = defaultServerTimeout.IdleTimeoutSec
+	}
+	if st.MaxHeaderMB < 0 {
+		st.LimitMaxHeader = false
+		st.MaxHeaderMB = defaultServerTimeout.MaxHeaderMB
+	} else if st.MaxHeaderMB == 0 || st.MaxHeaderMB > 64 {
+		st.MaxHeaderMB = defaultServerTimeout.MaxHeaderMB
+	}
+	return st
+}
+
+// ==================== 入站 HTTPS 加密 ServerTLS ====================
+
+// 入站端口角色（三种端口可同时启用，各自独立）
+const (
+	portRoleHTTP  = "http"  // 纯 HTTP 端口（明文）
+	portRoleHTTPS = "https" // 纯 HTTPS 端口（加密；收到明文 HTTP 时自动重定向到 https://）
+	portRoleMixed = "mixed" // 混合端口（同一端口按首字节自动识别 HTTP / HTTPS）
+)
+
+// 旧版单端口监听模式（仅用于迁移旧配置，新配置不再使用）
+const (
+	legacyListenModeHTTP  = "http"
+	legacyListenModeBoth  = "both"
+	legacyListenModeHTTPS = "https"
+)
+
+// 证书来源模式
+const (
+	certModeAuto = "auto" // 自动生成本机自签名 CA 与服务器证书（默认，可在配置页下载 CA）
+	certModeFile = "file" // 使用用户提供的证书文件（如 XCA / OpenSSL 生成）
+)
+
+// defaultTLSCertDir 自动证书默认存放目录
+const defaultTLSCertDir = "certs"
+
+// ServerTLS 入站加密配置。
+//
+// 端口模型（三种端口各自独立，端口号互不相同）：
+//   - HTTP 端口   ：就是 config.json 里的 PORT（主监听端口），永远是明文 HTTP，不可禁用
+//   - HTTPS 端口  ：ServerTLS.HTTPSPort，纯加密；若客户端误用 http:// 访问本端口，
+//     会自动返回 308 重定向到 https://同一端口（HTTPSRedirect 开关控制）
+//   - 混合端口    ：ServerTLS.MixedPort，按连接首字节自动识别 HTTP / HTTPS，一个端口两种协议
+//
+// ⚠️ 三个端口号必须互不相同（保存时会校验）；HTTPS / 混合端口启用时必须填写有效端口号。
+// ⚠️ 本组配置只在启动时读取（证书与监听器无法在运行中热切换），修改需重启程序生效。
+type ServerTLS struct {
+	Enable bool `json:"Enable"` // 总开关：关闭时完全保持原有 HTTP 行为
+	// HTTPSPortEnable / HTTPSPort 纯 HTTPS 端口（明文访问自动重定向）
+	HTTPSPortEnable bool   `json:"HTTPSPortEnable"`
+	HTTPSPort       string `json:"HTTPSPort,omitempty"`
+	// HTTPSRedirect HTTPS 端口收到明文 HTTP 请求时自动 308 重定向到 https://
+	// （关闭后明文请求返回 400 提示，不再自动跳转）
+	HTTPSRedirect bool `json:"HTTPSRedirect"`
+	// MixedPortEnable / MixedPort 混合端口（同端口 HTTP + HTTPS 自动识别）
+	MixedPortEnable bool   `json:"MixedPortEnable"`
+	MixedPort       string `json:"MixedPort,omitempty"`
+	// LegacyListenMode 旧版单端口监听模式（http/both/https），仅用于迁移旧配置，不再写盘
+	LegacyListenMode string `json:"ListenMode,omitempty"`
+	// LegacyHTTPPort 旧版 HTTP 端口（HTTP 端口已固定为 config.json 的 PORT），仅用于读取旧配置
+	LegacyHTTPPort string `json:"HTTPPort,omitempty"`
+	// CertMode 证书来源：auto=自动生成 / file=使用自定义证书文件
+	CertMode string `json:"CertMode"`
+	// CertDir 自动证书目录（CertMode=auto 时生效，留空=certs）
+	CertDir string `json:"CertDir,omitempty"`
+	// CertFile 服务器证书文件（PEM，CertMode=file 时必填，可包含中间证书）
+	CertFile string `json:"CertFile,omitempty"`
+	// KeyFile 服务器私钥文件（PEM，CertMode=file 时必填）
+	KeyFile string `json:"KeyFile,omitempty"`
+	// CAFile CA 证书文件（PEM）：既作为服务器证书链补充发送给客户端，
+	// 也在 ClientAuth=true 时用于校验客户端证书（mTLS）。CertMode=auto 时留空=使用自动生成的 CA
+	CAFile string `json:"CAFile,omitempty"`
+	// CAKeyFile CA 私钥文件（PEM，需无密码）：配合 ReissueServerCert 使用——
+	// 当现有证书缺少 SAN（可选名称）扩展时，Chrome/Edge 会报 NET::ERR_CERT_COMMON_NAME_INVALID，
+	// 可用 CA 私钥重新签发一张带 SAN 的服务器证书（自动写入 CertDir）
+	CAKeyFile string `json:"CAKeyFile,omitempty"`
+	// ReissueServerCert 用 CA 私钥重新签发服务器证书（修正缺失 SAN / 过期 / 主机名不匹配问题）。
+	// ⚠️ bool 字段不能加 omitempty
+	ReissueServerCert bool `json:"ReissueServerCert"`
+	// ClientAuth 要求客户端提供证书（mTLS）；开启时必须能读取到 CA 证书
+	ClientAuth bool `json:"ClientAuth"`
+}
+
+// defaultServerTLS 入站加密内置默认值：默认关闭，保持原有透明转发行为
+var defaultServerTLS = ServerTLS{
+	Enable:          false,
+	HTTPSPortEnable: false,
+	HTTPSRedirect:   true, // HTTPS 端口遇到明文请求默认自动跳转
+	MixedPortEnable: false,
+	CertMode:        certModeAuto,
+	CertDir:         defaultTLSCertDir,
+}
+
+// sanitizePort 只保留数字端口（非法返回空串）
+func sanitizePort(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	for _, r := range p {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return p
+}
+
+// normalizeServerTLS 规范化入站加密配置：非法枚举回退默认值，端口只保留数字
+func normalizeServerTLS(st ServerTLS) ServerTLS {
+	switch strings.ToLower(strings.TrimSpace(st.CertMode)) {
+	case certModeFile:
+		st.CertMode = certModeFile
+	default:
+		st.CertMode = certModeAuto
+	}
+	st.CertDir = strings.TrimSpace(st.CertDir)
+	if st.CertDir == "" {
+		st.CertDir = defaultTLSCertDir
+	}
+	st.HTTPSPort = sanitizePort(st.HTTPSPort)
+	st.MixedPort = sanitizePort(st.MixedPort)
+	// 端口号为空却勾了启用 → 视为未启用（端口必填，不再有「留空=主端口」语义）
+	if st.HTTPSPort == "" {
+		st.HTTPSPortEnable = false
+	}
+	if st.MixedPort == "" {
+		st.MixedPortEnable = false
+	}
+	st.CertFile = strings.TrimSpace(st.CertFile)
+	st.KeyFile = strings.TrimSpace(st.KeyFile)
+	st.CAFile = strings.TrimSpace(st.CAFile)
+	st.CAKeyFile = strings.TrimSpace(st.CAKeyFile)
+	if st.CertMode != certModeFile {
+		// auto 模式不保存自定义路径（避免残留旧值造成困惑）
+		st.CertFile = ""
+		st.KeyFile = ""
+	}
+	st.LegacyListenMode = "" // 迁移后不再写盘
+	st.LegacyHTTPPort = ""
+	return st
+}
+
+// migrateServerTLSPorts 把旧版单端口 ListenMode 迁移为三端口模型。
+// 返回是否发生了迁移（需要写回 config.json）。
+//
+// 新模型的 HTTP 端口固定就是 config.json 的 PORT，因此旧版的「主端口」语义只影响
+// 加密端口的取舍：
+//
+//	http  → 不启用任何加密端口（主端口本来就是纯 HTTP）
+//	both  → 旧版额外 HTTPSPort 若存在则启用为混合端口（同端口双协议），否则不启用
+//	https → 旧版额外 HTTPSPort 若存在则启用为纯 HTTPS 端口，否则不启用
+//
+// ⚠️ 旧版 https 模式的加密是挂在主端口上的，新模型主端口固定为纯 HTTP，
+// 因此旧 https 配置若没有额外 HTTPSPort，升级后需要用户自行填写一个 HTTPS 端口。
+func migrateServerTLSPorts(st *ServerTLS, raw interface{}, mainPort string) bool {
+	rawMap, ok := raw.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	// 已有新字段 → 不需要迁移
+	if _, has := rawMap["MixedPortEnable"]; has {
+		st.LegacyListenMode = ""
+		st.LegacyHTTPPort = ""
+		return true
+	}
+	legacy := ""
+	if v, has := rawMap["ListenMode"].(string); has {
+		legacy = strings.ToLower(strings.TrimSpace(v))
+	}
+	extra := sanitizePort(st.HTTPSPort)
+	if extra == strings.TrimSpace(mainPort) {
+		extra = "" // 与主端口冲突的旧值直接丢弃
+	}
+	st.HTTPSPortEnable = false
+	st.MixedPortEnable = false
+	st.HTTPSPort = ""
+	st.MixedPort = ""
+	switch legacy {
+	case legacyListenModeBoth:
+		// 旧 both = 主端口双协议 → 用旧额外端口继续提供双协议
+		if extra != "" {
+			st.MixedPortEnable = true
+			st.MixedPort = extra
+		}
+	case legacyListenModeHTTPS:
+		if extra != "" {
+			st.HTTPSPortEnable = true
+			st.HTTPSPort = extra
+		}
+	default: // http 或字段缺失 → 保持原有纯 HTTP 行为
+	}
+	st.LegacyListenMode = ""
+	st.LegacyHTTPPort = ""
+	return true
+}
+
+// effectiveInboundPorts 计算实际要监听的端口列表。
+//
+// HTTP 端口固定为主监听端口 PORT 且始终监听；HTTPS / 混合端口各自独立启用。
+// 若用户把两个端口配成同一个数字（保存时已校验拦截，这里做兜底）：
+// 保留优先级更高的角色，避免同一端口被 Listen 两次而报错。
+func effectiveInboundPorts(st ServerTLS, mainPort string) []inboundPortSpec {
+	mainPort = strings.TrimSpace(mainPort)
+
+	type candidate struct {
+		role string
+		port string
+		prio int
+	}
+	// 优先级：mixed > https > http（端口号冲突时保留靠前的）
+	cands := []candidate{{portRoleHTTP, mainPort, 1}}
+	if st.MixedPortEnable && st.MixedPort != "" {
+		cands = append(cands, candidate{portRoleMixed, st.MixedPort, 3})
+	}
+	if st.HTTPSPortEnable && st.HTTPSPort != "" {
+		cands = append(cands, candidate{portRoleHTTPS, st.HTTPSPort, 2})
+	}
+	// 按优先级从高到低分配端口号，避免高优先级角色被低优先级抢占
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].prio > cands[j].prio })
+
+	seen := make(map[string]bool, len(cands))
+	out := make([]inboundPortSpec, 0, len(cands))
+	for _, c := range cands {
+		if c.port == "" || seen[c.port] {
+			continue
+		}
+		seen[c.port] = true
+		out = append(out, inboundPortSpec{Role: c.role, Port: c.port})
+	}
+	if len(out) == 0 {
+		// 兜底：主端口纯 HTTP，保证服务始终可访问
+		out = append(out, inboundPortSpec{Role: portRoleHTTP, Port: mainPort})
+	}
+	return out
+}
+
+// inboundPortSpec 一个实际监听的端口及其角色
+type inboundPortSpec struct {
+	Role string // http / https / mixed
+	Port string
+}
+
+// needsTLS 该端口角色是否需要证书
+func (s inboundPortSpec) needsTLS() bool {
+	return s.Role == portRoleHTTPS || s.Role == portRoleMixed
+}
+
+// tlsHostList 生成自动证书需要覆盖的主机名/IP 列表（至少包含 localhost 与 127.0.0.1）
+func tlsHostList(listenIP string) []string {
+	hosts := []string{"localhost", "127.0.0.1", "::1"}
+	if h, err := os.Hostname(); err == nil && strings.TrimSpace(h) != "" {
+		hosts = append(hosts, strings.TrimSpace(h))
+	}
+	if ip := strings.TrimSpace(listenIP); ip != "" {
+		if parsed := net.ParseIP(ip); parsed != nil && !parsed.IsUnspecified() {
+			hosts = append(hosts, ip)
+		}
+	}
+	// 去重
+	seen := make(map[string]bool, len(hosts))
+	out := hosts[:0]
+	for _, h := range hosts {
+		if h == "" || seen[h] {
+			continue
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	return out
+}
+
+// autoCertPaths 自动证书文件路径
+func autoCertPaths(dir string) (certFile, keyFile, caFile string) {
+	if dir == "" {
+		dir = defaultTLSCertDir
+	}
+	return filepath.Join(dir, "server.crt"), filepath.Join(dir, "server.key"), filepath.Join(dir, "ca.crt")
+}
+
+// writePEMFile 以指定权限写入 PEM 文件（先写临时文件再原子替换，避免中断损坏）
+func writePEMFile(path, blockType string, der []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(f, &pem.Block{Type: blockType, Bytes: der}); err != nil {
+		f.Close()
+		os.Remove(path + ".tmp")
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path + ".tmp")
+		return err
+	}
+	return os.Rename(path+".tmp", path)
+}
+
+// loadCertFile 读取并解析 PEM 证书文件中的第一张证书
+func loadCertFile(path string) (*x509.Certificate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("不是有效的 PEM 证书文件: " + path)
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// loadECKeyFile 读取 ECDSA 私钥（兼容 SEC1 与 PKCS#8）
+func loadECKeyFile(path string) (*ecdsa.PrivateKey, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			return nil, errors.New("不是有效的 PEM 私钥文件: " + path)
+		}
+		if k, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
+			return k, nil
+		}
+		if k8, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+			if k, ok := k8.(*ecdsa.PrivateKey); ok {
+				return k, nil
+			}
+		}
+		data = rest
+	}
+}
+
+// loadSignerFile 读取私钥文件，支持 ECDSA / RSA / Ed25519（SEC1 / PKCS#1 / PKCS#8）。
+// ⚠️ 不支持带密码的私钥（Go 标准库不提供口令解密）——遇到时给出明确提示。
+func loadSignerFile(path string) (crypto.Signer, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	encrypted := false
+	for {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if strings.Contains(block.Type, "ENCRYPTED") {
+			encrypted = true
+		}
+		if !strings.Contains(block.Type, "PRIVATE KEY") {
+			data = rest
+			continue
+		}
+		if k, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
+			return k, nil
+		}
+		if k, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+			return k, nil
+		}
+		if k, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+			if signer, ok := k.(crypto.Signer); ok {
+				return signer, nil
+			}
+			return nil, errors.New("私钥类型不受支持（仅支持 RSA / ECDSA / Ed25519）: " + path)
+		}
+		data = rest
+	}
+	if encrypted {
+		return nil, errors.New("私钥被口令加密，无法直接使用——请在 XCA / OpenSSL 中导出「无密码（不加密）」的私钥: " + path)
+	}
+	return nil, errors.New("不是有效的 PEM 私钥文件: " + path)
+}
+
+// ecKeyMatchesCert 判断私钥是否与证书匹配
+func ecKeyMatchesCert(cert *x509.Certificate, key *ecdsa.PrivateKey) bool {
+	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return false
+	}
+	return pub.X.Cmp(key.PublicKey.X) == 0 && pub.Y.Cmp(key.PublicKey.Y) == 0
+}
+
+// signerMatchesCert 判断任意私钥是否与证书公钥匹配
+func signerMatchesCert(cert *x509.Certificate, signer crypto.Signer) bool {
+	a, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return false
+	}
+	b, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(a, b)
+}
+
+// randomSerial 生成 128 位随机证书序列号
+func randomSerial() (*big.Int, error) {
+	limit := new(big.Int).Lsh(big.NewInt(1), 128)
+	return rand.Int(rand.Reader, limit)
+}
+
+// loadOrCreateCA 读取 CA 证书与私钥；不存在或损坏时重新生成（ECDSA P-256，有效期 10 年）
+func loadOrCreateCA(certPath, keyPath string) (*x509.Certificate, *ecdsa.PrivateKey, error) {
+	if cert, err := loadCertFile(certPath); err == nil && cert.IsCA {
+		if key, err := loadECKeyFile(keyPath); err == nil && ecKeyMatchesCert(cert, key) {
+			return cert, key, nil
+		}
+	}
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	serial, err := randomSerial()
+	if err != nil {
+		return nil, nil, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "Remote Convert Ollama Local CA", Organization: []string{"Remote Convert Ollama"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := writePEMFile(certPath, "CERTIFICATE", der, 0644); err != nil {
+		return nil, nil, err
+	}
+	if err := writePEMFile(keyPath, "EC PRIVATE KEY", keyDER, 0600); err != nil {
+		return nil, nil, err
+	}
+	fmt.Println("🔐 已生成自签名 CA 证书:", certPath)
+	return cert, key, nil
+}
+
+// serverCertUsable 判断现有服务器证书能否继续复用（未临近过期 + 由当前 CA 签发 + 覆盖全部主机名）
+func serverCertUsable(cert, ca *x509.Certificate, hosts []string) bool {
+	if time.Now().After(cert.NotAfter.Add(-30 * 24 * time.Hour)) {
+		return false
+	}
+	if err := cert.CheckSignatureFrom(ca); err != nil {
+		return false
+	}
+	for _, h := range hosts {
+		if err := cert.VerifyHostname(h); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// createServerCert 用 CA 签发服务器证书（证书链 = 服务器证书 + CA 证书），有效期 3 年
+func createServerCert(certPath, keyPath string, ca *x509.Certificate, caKey *ecdsa.PrivateKey, hosts []string) error {
+	return createServerCertWith(certPath, keyPath, ca, caKey, nil, hosts)
+}
+
+// createServerCertWith 用任意类型的 CA 私钥签发服务器证书，并把 extraChain（中间证书等）一并写入证书链。
+//
+// 为什么需要它：XCA / OpenSSL 手工签发的证书常常**没有 SAN（Subject Alternative Name）**，
+// 现代浏览器（Chrome 58+ / Edge）完全忽略 CN，只认 SAN → 必然报 NET::ERR_CERT_COMMON_NAME_INVALID。
+// 这里用用户自己的 CA 私钥重签一张 SAN 完整、有效期 3 年的服务器证书，客户端无需重新信任 CA。
+func createServerCertWith(certPath, keyPath string, ca *x509.Certificate, caKey crypto.Signer, extraChain [][]byte, hosts []string) error {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	serial, err := randomSerial()
+	if err != nil {
+		return err
+	}
+	cn := "localhost"
+	if len(hosts) > 0 {
+		cn = hosts[0]
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: cn, Organization: []string{"Remote Convert Ollama"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(3, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, h)
+		}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+	if err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+
+	// 证书链文件：服务器证书 + CA 证书 + 额外中间证书
+	var chain bytes.Buffer
+	if err := pem.Encode(&chain, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		return err
+	}
+	if err := pem.Encode(&chain, &pem.Block{Type: "CERTIFICATE", Bytes: ca.Raw}); err != nil {
+		return err
+	}
+	for _, extra := range extraChain {
+		if len(extra) == 0 || bytes.Equal(extra, ca.Raw) {
+			continue
+		}
+		if err := pem.Encode(&chain, &pem.Block{Type: "CERTIFICATE", Bytes: extra}); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(certPath+".tmp", chain.Bytes(), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(certPath+".tmp", certPath); err != nil {
+		return err
+	}
+	return writePEMFile(keyPath, "EC PRIVATE KEY", keyDER, 0600)
+}
+
+// loadCAChain 读取 CA 文件：返回第一张证书（用于签名校验 / mTLS）与其余证书（仅用于补链）
+func loadCAChain(path string) (*x509.Certificate, [][]byte, []byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var first *x509.Certificate
+	var rest [][]byte
+	raw := data
+	for {
+		block, next := pem.Decode(raw)
+		if block == nil {
+			break
+		}
+		raw = next
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		if first == nil {
+			c, perr := x509.ParseCertificate(block.Bytes)
+			if perr != nil {
+				return nil, nil, nil, perr
+			}
+			first = c
+			continue
+		}
+		rest = append(rest, block.Bytes)
+	}
+	if first == nil {
+		return nil, nil, nil, errors.New("CA 文件不含有效证书: " + path)
+	}
+	return first, rest, data, nil
+}
+
+// reissueServerCertIfNeeded 用用户提供的 CA 证书 + CA 私钥，重新签发一张 SAN 完整的服务器证书。
+// 输出到 dir/server.crt 与 dir/server.key，返回实际使用的证书路径。
+func reissueServerCertIfNeeded(st ServerTLS, dir string, hosts []string) (certFile, keyFile string, warnings []string, err error) {
+	if st.CAFile == "" {
+		return "", "", nil, errors.New("「用 CA 重签服务器证书」需要配置 CA 证书 CAFile")
+	}
+	if st.CAKeyFile == "" {
+		return "", "", nil, errors.New("「用 CA 重签服务器证书」需要配置 CA 私钥 CAKeyFile（需无密码）")
+	}
+	caCert, extraChain, _, err := loadCAChain(st.CAFile)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("读取 CA 证书失败: %w", err)
+	}
+	if !caCert.IsCA {
+		return "", "", nil, errors.New("CAFile 里的第一张证书不是 CA 证书（缺少 BasicConstraints CA:TRUE）")
+	}
+	caKey, err := loadSignerFile(st.CAKeyFile)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("读取 CA 私钥失败: %w", err)
+	}
+	if !signerMatchesCert(caCert, caKey) {
+		return "", "", nil, errors.New("CA 私钥与 CA 证书不匹配，请检查是否选错了文件")
+	}
+
+	if dir == "" {
+		dir = defaultTLSCertDir
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", "", nil, fmt.Errorf("创建证书目录失败: %w", err)
+	}
+	certFile = filepath.Join(dir, "server.crt")
+	keyFile = filepath.Join(dir, "server.key")
+
+	// 已存在由同一 CA 签发且 SAN 完整的证书 → 直接复用（避免每次启动都换证书）
+	if existing, err := loadCertFile(certFile); err == nil {
+		if existing.CheckSignatureFrom(caCert) == nil && serverCertUsable(existing, caCert, hosts) {
+			return certFile, keyFile, nil, nil
+		}
+	}
+	if err := createServerCertWith(certFile, keyFile, caCert, caKey, extraChain, hosts); err != nil {
+		return "", "", nil, fmt.Errorf("重签服务器证书失败: %w", err)
+	}
+	fmt.Println("🔐 已用自定义 CA 重签服务器证书:", certFile)
+	return certFile, keyFile, nil, nil
+}
+
+// serverCertWarnings 诊断服务器证书的常见问题（返回可直接展示给用户的中文提示）
+func serverCertWarnings(leaf *x509.Certificate, chainLen int) []string {
+	var warns []string
+	now := time.Now()
+	if len(leaf.DNSNames) == 0 && len(leaf.IPAddresses) == 0 {
+		warns = append(warns, "证书缺少「使用者可选名称 SAN」扩展：Chrome / Edge 只认 SAN 不认 CN，访问时会报 NET::ERR_CERT_COMMON_NAME_INVALID。请开启「用 CA 重签服务器证书」，或用 XCA 重新签发并在「Subject Alternative Name」里填写 127.0.0.1 / localhost")
+	}
+	if now.After(leaf.NotAfter) {
+		warns = append(warns, "服务器证书已过期（"+leaf.NotAfter.Format("2006-01-02")+"），请重签或续期")
+	} else if now.Before(leaf.NotBefore) {
+		warns = append(warns, "服务器证书尚未生效（生效时间 "+leaf.NotBefore.Format("2006-01-02 15:04")+"），请检查系统时间或证书")
+	} else if leaf.NotAfter.Sub(now) < 30*24*time.Hour {
+		warns = append(warns, "服务器证书将在 30 天内过期（"+leaf.NotAfter.Format("2006-01-02")+"），建议提前重签")
+	}
+	if chainLen <= 1 && !bytes.Equal(leaf.RawIssuer, leaf.RawSubject) {
+		warns = append(warns, "服务器证书未携带中间证书：若客户端未预装中间 CA，会报「证书链不完整」。请把中间 CA 与根 CA 合并写入 CAFile")
+	}
+	if len(leaf.CRLDistributionPoints) == 0 && len(leaf.OCSPServer) == 0 {
+		warns = append(warns, "证书不含吊销信息（CRL / OCSP）：Windows schannel 客户端（如 curl、.NET）可能报 CRYPT_E_NO_REVOCATION_CHECK；浏览器一般不受影响，命令行验证可加 --ssl-no-revoke")
+	}
+	return warns
+}
+
+// ensureAutoCert 确保自动证书存在且可用（必要时自动生成 / 续期），返回证书、私钥与 CA 路径
+func ensureAutoCert(dir string, hosts []string) (certFile, keyFile, caFile string, err error) {
+	if dir == "" {
+		dir = defaultTLSCertDir
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", "", "", fmt.Errorf("创建证书目录失败: %w", err)
+	}
+	certFile, keyFile, caFile = autoCertPaths(dir)
+	caCertPath := filepath.Join(dir, "ca.crt")
+	caKeyPath := filepath.Join(dir, "ca.key")
+
+	caCert, caKey, err := loadOrCreateCA(caCertPath, caKeyPath)
+	if err != nil {
+		return "", "", "", fmt.Errorf("加载/生成 CA 失败: %w", err)
+	}
+
+	// 现有服务器证书仍可用则不重建（避免每次启动都换证书导致客户端信任失效）
+	if cert, err := loadCertFile(certFile); err == nil {
+		if _, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil && serverCertUsable(cert, caCert, hosts) {
+			return certFile, keyFile, caFile, nil
+		}
+	}
+
+	if err := createServerCert(certFile, keyFile, caCert, caKey, hosts); err != nil {
+		return "", "", "", fmt.Errorf("签发服务器证书失败: %w", err)
+	}
+	fmt.Println("🔐 已生成服务器证书:", certFile)
+	return certFile, keyFile, caFile, nil
+}
+
+// buildInboundTLSConfig 根据配置构建入站 TLS 配置。
+// listenIP 用于自动证书生成时确定需要覆盖的 IP。
+func buildInboundTLSConfig(st ServerTLS, listenIP string) (*tls.Config, error) {
+	st = normalizeServerTLS(st)
+	hosts := tlsHostList(listenIP)
+
+	certFile, keyFile, caFile := st.CertFile, st.KeyFile, st.CAFile
+	if st.CertMode == certModeAuto {
+		var err error
+		certFile, keyFile, caFile, err = ensureAutoCert(st.CertDir, hosts)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if certFile == "" || keyFile == "" {
+			return nil, errors.New("证书文件与私钥文件路径不能为空")
+		}
+		// 用自定义 CA 重签：修正「缺少 SAN / 过期 / 主机名不匹配」的证书
+		// （XCA 手动签发常常没有 SAN，浏览器会直接拒绝）
+		if st.ReissueServerCert {
+			newCert, newKey, warns, err := reissueServerCertIfNeeded(st, st.CertDir, hosts)
+			if err != nil {
+				return nil, err
+			}
+			certFile, keyFile = newCert, newKey
+			for _, w := range warns {
+				fmt.Println("⚠️ " + w)
+			}
+		}
+	}
+	if _, err := os.Stat(certFile); err != nil {
+		return nil, fmt.Errorf("证书文件不可读: %w", err)
+	}
+	if _, err := os.Stat(keyFile); err != nil {
+		return nil, fmt.Errorf("私钥文件不可读: %w", err)
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("加载证书失败（私钥可能带密码或格式不匹配）: %w", err)
+	}
+
+	var caPool *x509.CertPool
+	if caFile != "" {
+		if _, err := os.Stat(caFile); err != nil {
+			return nil, fmt.Errorf("CA 证书文件不可读: %w", err)
+		}
+		caFirst, caRest, caPEM, err := loadCAChain(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("读取 CA 证书失败: %w", err)
+		}
+		caPool = x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(caPEM) {
+			return nil, errors.New("CA 证书文件不是有效的 PEM 证书")
+		}
+		// 证书链里只有服务器证书时，把 CAFile 中的全部证书（CA + 中间证书）追加进去，
+		// 客户端才能完整验证；注意跳过与链中已有的重复项。
+		if len(cert.Certificate) == 1 {
+			cert.Certificate = append(cert.Certificate, caFirst.Raw)
+			for _, extra := range caRest {
+				if !bytes.Equal(extra, caFirst.Raw) {
+					cert.Certificate = append(cert.Certificate, extra)
+				}
+			}
+		}
+	}
+
+	cfgTLS := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+	if st.ClientAuth {
+		if caPool == nil {
+			return nil, errors.New("开启「要求客户端证书」时必须配置 CA 证书")
+		}
+		cfgTLS.ClientAuth = tls.RequireAndVerifyClientCert
+		cfgTLS.ClientCAs = caPool
+	}
+	return cfgTLS, nil
+}
+
+// certFingerprint 返回证书 SHA-256 指纹（AA:BB:CC 形式，便于人工核对）
+func certFingerprint(cert *x509.Certificate) string {
+	sum := sha256.Sum256(cert.Raw)
+	hexStr := strings.ToUpper(hex.EncodeToString(sum[:]))
+	parts := make([]string, 0, len(hexStr)/2)
+	for i := 0; i+1 < len(hexStr); i += 2 {
+		parts = append(parts, hexStr[i:i+2])
+	}
+	return strings.Join(parts, ":")
+}
+
+// tlsCAInfo 证书状态视图（供配置页展示 CA 指纹与下载入口）
+type tlsCAInfo struct {
+	Available      bool     `json:"Available"`
+	CertMode       string   `json:"CertMode"`
+	CertFile       string   `json:"CertFile,omitempty"`
+	KeyFile        string   `json:"KeyFile,omitempty"`
+	CAFile         string   `json:"CAFile,omitempty"`
+	Subject        string   `json:"Subject,omitempty"`
+	Issuer         string   `json:"Issuer,omitempty"`
+	Fingerprint    string   `json:"Fingerprint,omitempty"`
+	NotAfter       string   `json:"NotAfter,omitempty"`
+	ServerDomains  []string `json:"ServerDomains,omitempty"`
+	ServerNotAfter string   `json:"ServerNotAfter,omitempty"`
+	ServerSubject  string   `json:"ServerSubject,omitempty"`
+	ServerIssuer   string   `json:"ServerIssuer,omitempty"`
+	ChainLength    int      `json:"ChainLength,omitempty"`
+	Reissued       bool     `json:"Reissued"`
+	Warnings       []string `json:"Warnings,omitempty"`
+	Error          string   `json:"Error,omitempty"`
+	Downloadable   bool     `json:"Downloadable"`
+}
+
+// buildTLSInfo 读取证书文件并生成配置页展示信息（不生成证书，仅在保存/启动时生成）
+func buildTLSInfo(st ServerTLS, listenIP string) tlsCAInfo {
+	st = normalizeServerTLS(st)
+	info := tlsCAInfo{Available: false, CertMode: st.CertMode, CertFile: st.CertFile, KeyFile: st.KeyFile, CAFile: st.CAFile}
+	certFile, caFile := st.CertFile, st.CAFile
+	if st.CertMode == certModeAuto {
+		certFile, _, caFile = autoCertPaths(st.CertDir)
+		info.CertFile = certFile
+		info.CAFile = caFile
+	} else if st.ReissueServerCert {
+		// 重签模式：运行时实际使用的是 CertDir 下的重签证书
+		dir := st.CertDir
+		if dir == "" {
+			dir = defaultTLSCertDir
+		}
+		if reissued := filepath.Join(dir, "server.crt"); fileExists(reissued) {
+			certFile = reissued
+			info.CertFile = reissued
+			info.Reissued = true
+		}
+	}
+
+	leaf, err := loadCertFile(certFile)
+	if err != nil {
+		info.Error = err.Error()
+		return info
+	}
+	info.Available = true
+	info.Subject = leaf.Subject.String()
+	info.Issuer = leaf.Issuer.String()
+	info.ServerSubject = leaf.Subject.String()
+	info.ServerIssuer = leaf.Issuer.String()
+	info.ServerNotAfter = leaf.NotAfter.Format("2006-01-02")
+	info.ServerDomains = append(leaf.DNSNames, func() []string {
+		out := make([]string, 0, len(leaf.IPAddresses))
+		for _, ip := range leaf.IPAddresses {
+			out = append(out, ip.String())
+		}
+		return out
+	}()...)
+
+	// 统计证书链长度（文件里写了多少张证书）
+	chainLen := 1
+	if data, err := os.ReadFile(certFile); err == nil {
+		chainLen = bytes.Count(data, []byte("-----BEGIN CERTIFICATE-----"))
+	}
+	info.ChainLength = chainLen
+	info.Warnings = serverCertWarnings(leaf, chainLen)
+
+	caCert := leaf
+	if caFile != "" {
+		if c, err := loadCertFile(caFile); err == nil {
+			caCert = c
+			info.Downloadable = true
+		}
+	}
+	info.Fingerprint = certFingerprint(caCert)
+	info.NotAfter = caCert.NotAfter.Format("2006-01-02")
+	return info
+}
+
+// fileExists 判断文件是否存在（不区分是否可读）
+func fileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// ==================== 同端口 HTTP / HTTPS 自适应监听 ====================
+
+// peekedConn 把已经预读过的字节回放给上层（用于协议探测后的明文 HTTP 连接）
+type peekedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *peekedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+// detectListener 同端口协议自适应监听器：
+// 读首个字节判断是否为 TLS 握手记录（0x16），是则按 TLS 处理，否则按明文 HTTP 处理。
+//
+// 两种用途：
+//   - 混合端口（mode=portRoleMixed）：明文照常交给 HTTP 服务，一个端口两用
+//   - HTTPS 端口（mode=portRoleHTTPS）：明文请求不发服务，而是返回 308 重定向到
+//     https://同一端口（redirect=true 时），这样用户误用 http:// 访问也能自动跳转
+//
+// ⚠️ 协议探测在独立 goroutine 中完成：若在 Accept 里同步 Peek，
+// 一个只连不发数据的慢连接就会卡住整个 Accept 循环（其它客户端全部排队）。
+type detectListener struct {
+	net.Listener
+	tlsCfg    *tls.Config
+	mode      string // portRoleMixed / portRoleHTTPS
+	redirect  bool   // HTTPS 端口遇到明文时是否 308 重定向
+	portLabel string // 用于拼接重定向地址
+	connCh    chan detectResult
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// detectResult 协议探测结果
+type detectResult struct {
+	conn net.Conn
+	err  error
+}
+
+// newMixedListener 创建混合端口监听器（同端口 HTTP + HTTPS）
+func newMixedListener(ln net.Listener, tlsCfg *tls.Config, port string) *detectListener {
+	return newDetectListener(ln, tlsCfg, portRoleMixed, true, port)
+}
+
+// newHTTPSPortListener 创建纯 HTTPS 端口监听器（明文请求自动重定向，或返回 400）
+func newHTTPSPortListener(ln net.Listener, tlsCfg *tls.Config, redirect bool, port string) *detectListener {
+	return newDetectListener(ln, tlsCfg, portRoleHTTPS, redirect, port)
+}
+
+func newDetectListener(ln net.Listener, tlsCfg *tls.Config, mode string, redirect bool, port string) *detectListener {
+	l := &detectListener{
+		Listener:  ln,
+		tlsCfg:    tlsCfg,
+		mode:      mode,
+		redirect:  redirect,
+		portLabel: port,
+		connCh:    make(chan detectResult, 256),
+		done:      make(chan struct{}),
+	}
+	go l.loop()
+	return l
+}
+
+func (l *detectListener) loop() {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			select {
+			case <-l.done:
+				return
+			case l.connCh <- detectResult{err: err}:
+			}
+			// Accept 连续报错时稍作退避，避免忙循环
+			select {
+			case <-l.done:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			continue
+		}
+		go func(c net.Conn) {
+			conn, ok := l.wrap(c)
+			if !ok {
+				return // wrap 内部已处理（重定向 / 直接关闭）
+			}
+			select {
+			case <-l.done:
+				_ = conn.Close()
+			case l.connCh <- detectResult{conn: conn}:
+			default:
+				_ = conn.Close() // 队列满（极端情况）：丢弃连接，让客户端重连
+			}
+		}(c)
+	}
+}
+
+// Accept 从探测结果队列取已就绪的连接
+func (l *detectListener) Accept() (net.Conn, error) {
+	select {
+	case <-l.done:
+		return nil, net.ErrClosed
+	case res := <-l.connCh:
+		if res.err != nil {
+			return nil, res.err
+		}
+		return res.conn, nil
+	}
+}
+
+func (l *detectListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return l.Listener.Close()
+}
+
+// wrap 探测首字节：TLS 握手 → 按 TLS 处理；否则按明文处理
+func (l *detectListener) wrap(c net.Conn) (net.Conn, bool) {
+	// 首个字节探测：TLS 1.x 握手记录类型为 0x16（SSLv2 ClientHello 为 0x80，极为罕见，按明文处理）
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	br := bufio.NewReaderSize(c, 4096)
+	first, err := br.Peek(1)
+	_ = c.SetReadDeadline(time.Time{})
+	if err != nil {
+		_ = c.Close()
+		return nil, false
+	}
+	pc := &peekedConn{Conn: c, r: br}
+	if first[0] == 0x16 {
+		return tls.Server(pc, l.tlsCfg), true
+	}
+	// 明文 HTTP
+	if l.mode == portRoleHTTPS {
+		go l.handlePlainHTTP(c, br)
+		return nil, false
+	}
+	return pc, true // 混合端口：明文照常交给 HTTP 服务
+}
+
+// handlePlainHTTP 处理「用 http:// 访问 HTTPS 端口」的明文请求：
+// 默认返回 308 永久重定向到 https://同一端口（保留原始路径与查询串），
+// 关闭重定向时返回 400 并说明原因。响应后立即关闭连接。
+func (l *detectListener) handlePlainHTTP(c net.Conn, br *bufio.Reader) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(15 * time.Second))
+
+	// 读请求行：METHOD SP request-target SP HTTP/x.y
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	// 丢弃剩余请求头（最多 64KB，避免被恶意连接拖住），同时记下 Host 头
+	hostHeader := ""
+	for total := 0; total < 64<<10; {
+		h, err := br.ReadString('\n')
+		if err != nil {
+			break
+		}
+		total += len(h)
+		if h == "\r\n" || h == "\n" {
+			break
+		}
+		if i := strings.IndexByte(h, ':'); i > 0 {
+			if strings.EqualFold(strings.TrimSpace(h[:i]), "Host") {
+				hostHeader = strings.TrimSpace(strings.TrimRight(h[i+1:], "\r\n"))
+			}
+		}
+	}
+
+	fields := strings.Fields(strings.TrimRight(line, "\r\n"))
+	method, target := "GET", "/"
+	if len(fields) >= 1 {
+		method = fields[0]
+	}
+	if len(fields) >= 2 {
+		target = fields[1]
+	}
+
+	if !l.redirect {
+		msg := "此端口仅提供 HTTPS 加密服务，请改用 https:// 访问（明文 HTTP 已被拒绝）\n"
+		fmt.Fprintf(c, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+			len(msg), msg)
+		return
+	}
+
+	// 绝对形式（GET http://host/path HTTP/1.1）时取其中的 path
+	path := target
+	if i := strings.Index(path, "://"); i >= 0 {
+		if j := strings.Index(path[i+3:], "/"); j >= 0 {
+			path = path[i+3+j:]
+		} else {
+			path = "/"
+		}
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	// 重定向目标主机：优先用客户端请求的 Host 头（保留它访问用的 IP / 域名），
+	// 去掉其中原有端口后换成 HTTPS 端口 —— 这样局域网 IP 访问也能跳到正确的地址
+	host := l.portLabel
+	if hostHeader != "" {
+		h := hostHeader
+		if strings.HasPrefix(h, "[") { // IPv6 字面量 [::1]:port
+			if end := strings.Index(h, "]"); end > 0 {
+				h = h[:end+1]
+			}
+		} else if i := strings.LastIndex(h, ":"); i > 0 {
+			h = h[:i] // 去掉端口
+		}
+		if strings.TrimSpace(h) != "" {
+			host = strings.TrimSpace(h)
+		}
+	}
+	// 没有 Host 头时退回配置的监听 IP；0.0.0.0 / :: 这类通配地址对客户端无意义，用 localhost
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = cfg.IP
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			host = "localhost"
+		}
+	}
+	location := "https://" + joinHostPort(host, l.portLabel) + path
+
+	body := ""
+	status := "308 Permanent Redirect"
+	if method == "HEAD" {
+		body = ""
+	} else {
+		body = "Redirecting to " + location + "\n"
+	}
+	fmt.Fprintf(c, "HTTP/1.1 %s\r\nLocation: %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		status, location, len(body), body)
+	fmt.Printf("🔁 明文访问 HTTPS 端口 %s → 已重定向至 %s\n", l.portLabel, location)
+}
+
+// joinHostPort 拼接 host:port（IP 含冒号时加方括号，默认端口省略）
+func joinHostPort(host, port string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		host = "localhost"
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	if port == "" {
+		return host
+	}
+	if port == "443" {
+		return host
+	}
+	return host + ":" + port
+}
+
+// ==================== 过载保护：并发闸门 ====================
+// proxySem 并发信号量（带缓冲 channel 充当计数信号量）。
+//
+// 热更新策略：容量变化时换一个新的 channel，老 channel 不关闭——
+// 已经持有旧槽位的请求在 releaseProxySlot 时归还到自己当初获取的那个 channel，
+// 因此调整并发数既不会 panic，也不会阻塞任何在途请求。
+var (
+	proxySemMu sync.RWMutex
+	proxySem   = make(chan struct{}, defaultProxyLimit.MaxConcurrent)
+)
+
+// getProxySem 取当前并发信号量（读锁保护引用替换）
+func getProxySem() chan struct{} {
+	proxySemMu.RLock()
+	defer proxySemMu.RUnlock()
+	return proxySem
+}
+
+// applyProxyLimitConfig 应用并发上限：容量变化时重建信号量，立即生效。
+// 不限制并发时建容量 1 的占位信号量（acquireProxySlot 不会用到它）。
+func applyProxyLimitConfig(pl ProxyLimit) {
+	pl = normalizeProxyLimit(pl)
+	size := pl.MaxConcurrent
+	if !pl.LimitConcurrency || size <= 0 || size > 4096 {
+		size = 1
+	}
+	proxySemMu.Lock()
+	if cap(proxySem) != size {
+		proxySem = make(chan struct{}, size)
+	}
+	proxySemMu.Unlock()
+}
+
+// acquireProxySlot 获取一个并发槽位。返回的 channel 必须原样传给 releaseProxySlot。
+// 排队超过 QueueTimeoutSec 或客户端断开时返回 false。
+//
+// 两个开关均为 false 时不限制：
+//   - LimitConcurrency=false：直接放行，返回 nil channel（releaseProxySlot 对 nil 安全）
+//   - LimitQueueTimeout=false：排队不限时，只等客户端断开
+func acquireProxySlot(ctx context.Context) (chan struct{}, bool) {
+	// 不限并发：不占任何槽位，直接放行
+	if !cfg.ProxyLimit.LimitConcurrency {
+		return nil, true
+	}
+	ch := getProxySem()
+	if !cfg.ProxyLimit.LimitQueueTimeout {
+		// 排队不限时：只等槽位或客户端断开
+		select {
+		case ch <- struct{}{}:
+			return ch, true
+		case <-ctx.Done():
+			return nil, false
+		}
+	}
+	timeoutSec := cfg.ProxyLimit.QueueTimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = defaultProxyLimit.QueueTimeoutSec
+	}
+	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+	defer timer.Stop()
+	select {
+	case ch <- struct{}{}:
+		return ch, true
+	case <-timer.C:
+		return nil, false
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
+// releaseProxySlot 归还并发槽位（必须用 acquireProxySlot 返回的那个 channel）
+func releaseProxySlot(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case <-ch:
+	default:
+		// 槽位已被归还（理论上不会发生）：静默忽略，绝不阻塞请求收尾
+	}
+}
+
+// errRequestBodyTooLarge 请求体超过 ProxyLimit.MaxRequestBodyMB
+var errRequestBodyTooLarge = errors.New("request body too large")
+
+// drainMaxBytes 超限时最多丢弃的请求体字节数（让客户端能读到 413 响应）。
+//
+// 为什么要丢：客户端还在发送大请求体时，若服务端直接返回并关连接，
+// Go 的 net/http 只能读掉 256KB，剩余部分会导致连接被 RST，
+// 客户端看到的是“连接被重置”而不是我们的 413 +中文提示。
+// 丢到 Discard 不占内存（内置 32KB 缓冲区），但会消耗带宽，因此设上限。
+const drainMaxBytes = 64 << 20 // 最多丢弃 64MB
+
+// drainRequestBody 丢弃请求体剩余部分（有上限），确保错误响应能被客户端读到
+func drainRequestBody(r *http.Request) {
+	if r == nil || r.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, drainMaxBytes))
+}
+
+// readRequestBodyLimited 读取请求体，超过 ProxyLimit.MaxRequestBodyMB 时返回 errRequestBodyTooLarge。
+// LimitRequestBody=false 表示不限制。
+// 同时防住两种形态：① 声明了超大 Content-Length（直接拒绝，一字节不读）
+// ② 未声明长度（chunked）的超大请求（LimitReader 多读 1 字节判断是否超限）
+func readRequestBodyLimited(r *http.Request) ([]byte, error) {
+	if !cfg.ProxyLimit.LimitRequestBody {
+		return io.ReadAll(r.Body)
+	}
+	limitMB := cfg.ProxyLimit.MaxRequestBodyMB
+	if limitMB <= 0 {
+		limitMB = defaultProxyLimit.MaxRequestBodyMB
+	}
+	limitBytes := int64(limitMB) * 1024 * 1024
+	if r.ContentLength > limitBytes {
+		return nil, errRequestBodyTooLarge
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limitBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limitBytes {
+		return nil, errRequestBodyTooLarge
+	}
+	return body, nil
+}
+
+// writeOverloadError 返回过载保护拒绝响应（按端点风格选择错误格式，与鉴权失败保持一致）。
+// status 取 503（并发排队超时）或 413（请求体过大）。
+func writeOverloadError(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "5")
+	}
+	w.WriteHeader(status)
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"type": "error",
+			"error": map[string]string{
+				"type":    "overloaded_error",
+				"message": msg,
+			},
+		})
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/") {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": msg,
+				"type":    "server_error",
+				"param":   nil,
+				"code":    "overloaded",
+			},
+		})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // ConnPool 上游连接池设置（HTTP/2 + keep-alive 连接复用）
@@ -525,10 +2106,10 @@ func getModelMetaFor(model string) (int64, int64) {
 	ctxLen := meta.ContextLength
 	maxOut := meta.MaxOutputTokens
 	if ctxLen <= 0 {
-		ctxLen = DefaultContextLength
+		ctxLen = defaultContextLength()
 	}
 	if maxOut <= 0 {
-		maxOut = DefaultMaxOutputTokens
+		maxOut = defaultMaxOutputTokens()
 	}
 	return ctxLen, maxOut
 }
@@ -568,26 +2149,100 @@ func proxyKeysHasValid() bool {
 	return false
 }
 
-// lastReasoningContent 存储上一个 assistant 响应的 reasoning_content，
-// 因为 DeepSeek 思考模式要求客户端下次请求时必须传回这个字段。
-// 如果 Cherry Studio 没有自动带上，我们就在转发时自动注入。
-var (
-	lastReasoningContent string
-	rcMutex              sync.RWMutex
+// ==================== DeepSeek 思考模式：reasoning_content 跨请求追踪 ====================
+//
+// 背景：DeepSeek 思考模式要求客户端下次请求时把上一轮的 reasoning_content 传回上游，
+// 但部分客户端（Cherry Studio 等）不会自动带上，因此网关在转发时做兜底注入。
+//
+// ⚠️ 旧实现是一个全局字符串变量，存在三个严重问题：
+//
+//	① 多模型串号：deepseek 的推理内容会被注入给 gpt-4o 等不相干的模型
+//	② 多客户端串号：A 客户端的推理内容会注入到 B 客户端的请求里
+//	③ 历史污染：给所有 assistant 消息都塞同一段推理（应只给最后一条）
+//
+// 现改为按 【会话(IP+UA指纹) | 模型ID】 隔离：
+//   - 按模型隔离 → 推理内容绝不会跨模型串号（按模型ID严格匹配）
+//   - 保留有效期 → 思考内容只对紧接的下一轮有意义，超时自动失效
+//   - 条数上限   → 防止长期运行后 map 无限增长
+const (
+	reasoningMaxEntries = 256              // 最多跟踪的「会话|模型」组合数
+	reasoningTTL        = 30 * time.Minute // 记录有效期（超过则视为陈旧，不再注入）
 )
 
-// setLastReasoningContent 线程安全地设置 lastReasoningContent
-func setLastReasoningContent(rc string) {
-	rcMutex.Lock()
-	lastReasoningContent = rc
-	rcMutex.Unlock()
+type reasoningEntry struct {
+	content string
+	at      time.Time
 }
 
-// getLastReasoningContent 线程安全地获取 lastReasoningContent
-func getLastReasoningContent() string {
-	rcMutex.RLock()
-	defer rcMutex.RUnlock()
-	return lastReasoningContent
+var lastReasoning = struct {
+	sync.Mutex
+	m map[string]reasoningEntry
+}{m: make(map[string]reasoningEntry)}
+
+// reasoningKey 生成 reasoning 记录的键：会话(IP+UA指纹) + 模型ID。
+// 返回空串表示无法定位（缺少请求或模型），调用方应跳过存取。
+func reasoningKey(r *http.Request, model string) string {
+	if r == nil || model == "" {
+		return ""
+	}
+	return clientSessionKey(r) + "|" + model
+}
+
+// setLastReasoning 保存某会话某模型最近一轮的 reasoning_content。
+// 超上限时先清理过期项，仍超限则淘汰最旧的一条。
+func setLastReasoning(r *http.Request, model, rc string) {
+	if rc == "" {
+		return
+	}
+	key := reasoningKey(r, model)
+	if key == "" {
+		return
+	}
+	now := time.Now()
+
+	lastReasoning.Lock()
+	defer lastReasoning.Unlock()
+	if len(lastReasoning.m) >= reasoningMaxEntries {
+		for k, e := range lastReasoning.m {
+			if now.Sub(e.at) > reasoningTTL {
+				delete(lastReasoning.m, k)
+			}
+		}
+		if len(lastReasoning.m) >= reasoningMaxEntries {
+			oldestKey := ""
+			var oldestAt time.Time
+			first := true
+			for k, e := range lastReasoning.m {
+				if first || e.at.Before(oldestAt) {
+					oldestKey, oldestAt, first = k, e.at, false
+				}
+			}
+			if oldestKey != "" {
+				delete(lastReasoning.m, oldestKey)
+			}
+		}
+	}
+	lastReasoning.m[key] = reasoningEntry{content: rc, at: now}
+}
+
+// getLastReasoning 取某会话某模型最近一轮的 reasoning_content，
+// 取不到或已超过有效期时返回空串（调用方据此跳过注入）。
+func getLastReasoning(r *http.Request, model string) string {
+	key := reasoningKey(r, model)
+	if key == "" {
+		return ""
+	}
+	lastReasoning.Lock()
+	defer lastReasoning.Unlock()
+	e, ok := lastReasoning.m[key]
+	if !ok {
+		return ""
+	}
+	if time.Since(e.at) > reasoningTTL {
+		delete(lastReasoning.m, key)
+		return ""
+	}
+	return e.content
 }
 
 const encryptedKeyPrefix = "已加密|"
@@ -602,9 +2257,39 @@ const (
 // 推荐生成网站 https://www.uuidgenerator.net/ 生成一个随机的 UUID 来替换这个值。
 const secretUUID = "vancat-10a8bca6-fe6f-4bcd-8c9a-9a27d6ec1b16"
 
-// 上下文默认值，当上游 API 未返回模型元数据时使用
-const DefaultContextLength = 1000000
-const DefaultMaxOutputTokens = 384000
+// 上下文默认值，当上游 API 未返回模型元数据时使用（内置兜底值）。
+// 用户可在 config.json / 配置页的 DefaultContextLength、DefaultMaxOutputTokens 覆盖，
+// 运行时统一通过 defaultContextLength() / defaultMaxOutputTokens() 读取。
+const (
+	builtinDefaultContextLength   int64 = 1000000
+	builtinDefaultMaxOutputTokens int64 = 384000
+)
+
+// defaultContextLength 返回全局默认上下文长度（配置优先，未配置/非法时回退内置值）。
+func defaultContextLength() int64 {
+	if cfg.DefaultContextLength > 0 {
+		return cfg.DefaultContextLength
+	}
+	return builtinDefaultContextLength
+}
+
+// defaultMaxOutputTokens 返回全局默认最大输出 token（配置优先，未配置/非法时回退内置值）。
+func defaultMaxOutputTokens() int64 {
+	if cfg.DefaultMaxOutputTokens > 0 {
+		return cfg.DefaultMaxOutputTokens
+	}
+	return builtinDefaultMaxOutputTokens
+}
+
+// normalizeDefaultModelLimits 规范化全局默认上下文/输出上限：<=0 回退内置默认值。
+func normalizeDefaultModelLimits(c *Config) {
+	if c.DefaultContextLength <= 0 {
+		c.DefaultContextLength = builtinDefaultContextLength
+	}
+	if c.DefaultMaxOutputTokens <= 0 {
+		c.DefaultMaxOutputTokens = builtinDefaultMaxOutputTokens
+	}
+}
 
 // OllamaToolCall 是 Ollama 格式的工具调用
 // ID 非标准 Ollama 字段（omitempty），用于在响应中保留上游 tool_call id：
@@ -834,16 +2519,96 @@ func extractToolCalls(msg map[string]interface{}) []OllamaToolCall {
 	return result
 }
 
+// injectReasoningIntoOpenAIBody 给 OpenAI 协议的请求体补齐 reasoning_content。
+//
+// 为什么需要单独的函数：openaiChat / openaiChatStream 是【透传模式】，
+// 原样把客户端 body 转发上游，不经过 convertMessagesToOpenAI（那是 Ollama 协议专用），
+// 所以 reasoning_content 的兜底注入在 OpenAI 路径上原本完全缺失。
+//
+// 规则与 convertMessagesToOpenAI 保持一致：
+//   - 只给【最后一条】assistant 消息补齐（历史消息带旧推理会污染语义、白涨 token）
+//   - 客户端已自带 reasoning_content 时不覆盖
+//   - 按【会话+模型】取，不同模型/不同客户端互不串号
+//
+// [高并发内存安全] 先用字节标记预检，无 assistant 消息（如首轮）直接返回，不反序列化。
+func injectReasoningIntoOpenAIBody(body []byte, r *http.Request, model string) []byte {
+	if len(body) == 0 || model == "" {
+		return body
+	}
+	if !bytes.Contains(body, []byte(`"assistant"`)) {
+		return body // 没有 assistant 消息，无需注入
+	}
+	rc := getLastReasoning(r, model)
+	if rc == "" {
+		return body
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	messages, ok := req["messages"].([]interface{})
+	if !ok || len(messages) == 0 {
+		return body
+	}
+
+	// 定位最后一条 assistant 消息
+	lastIdx := -1
+	for i, raw := range messages {
+		if m, ok := raw.(map[string]interface{}); ok {
+			if role, _ := m["role"].(string); role == "assistant" {
+				lastIdx = i
+			}
+		}
+	}
+	if lastIdx < 0 {
+		return body
+	}
+	target, ok := messages[lastIdx].(map[string]interface{})
+	if !ok {
+		return body
+	}
+	if _, has := target["reasoning_content"]; has {
+		return body // 客户端已经带了，尊重客户端值
+	}
+	target["reasoning_content"] = rc
+	req["messages"] = messages
+
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	fmt.Printf("🧠 reasoning 兜底注入 [%s]: 已补齐最后一条 assistant 消息\n", model)
+	return newBody
+}
+
 // convertMessagesToOpenAI 将 Ollama 格式的消息列表转为 OpenAI 格式
 // 关键：维护 tool_call_id 闭环 —— assistant.tool_calls[].id 与后续 tool 消息的
 // tool_call_id 必须严格配对，否则上游 API 无法关联工具结果，
 // 模型会认为"调用没有返回结果"而反复重试同一调用（Agent 死循环的根源）
-func convertMessagesToOpenAI(messages []interface{}) []interface{} {
+//
+// r / model 用于 DeepSeek 思考模式的 reasoning_content 兜底注入：
+// 按【会话+模型】取本轮的推理内容，只给【最后一条】assistant 消息注入。
+func convertMessagesToOpenAI(messages []interface{}, r *http.Request, model string) []interface{} {
 	var result []interface{}
 	toolCallSeq := 0            // 本请求内 tool_call id 生成序号
 	var pendingToolIDs []string // 待消费的 tool_call id 队列（assistant 声明 → tool 消息按序消费）
 
-	for _, msg := range messages {
+	// 定位最后一条 assistant 消息的下标：
+	// 思考内容只属于最近一轮，旧实现给所有历史 assistant 消息都塞同一段推理，
+	// 既让上下文白涨（推理文本常几千字 × N 条），又让早期回复带上后期推理而语义错乱。
+	lastAssistantIdx := -1
+	for i, msg := range messages {
+		if m, ok := msg.(map[string]interface{}); ok {
+			if role, _ := m["role"].(string); role == "assistant" {
+				lastAssistantIdx = i
+			}
+		}
+	}
+	// 按【会话+模型】取本轮的 reasoning；取不到（无记录/已过期/模型不匹配）则为空，不注入
+	pendingReasoning := getLastReasoning(r, model)
+
+	for idx, msg := range messages {
 		msgMap, ok := msg.(map[string]interface{})
 		if !ok {
 			result = append(result, msg)
@@ -879,15 +2644,18 @@ func convertMessagesToOpenAI(messages []interface{}) []interface{} {
 
 		// 处理 assistant 消息中的 tool_calls（转换为 OpenAI 格式）
 		if role == "assistant" {
-			// DeepSeek 思考模式：如果客户端没带 reasoning_content，但我们有存储，就自动注入
-			if _, hasRC := msgMap["reasoning_content"]; !hasRC && getLastReasoningContent() != "" {
-				// 创建一个新 map 避免修改原始 msg 的 map
-				newMsg := make(map[string]interface{})
-				for k, v := range msgMap {
-					newMsg[k] = v
+			// DeepSeek 思考模式：只给最后一条 assistant 消息补齐 reasoning_content
+			// （客户端未带、且本会话本模型确有上一轮推理时才补）
+			if idx == lastAssistantIdx && pendingReasoning != "" {
+				if _, hasRC := msgMap["reasoning_content"]; !hasRC {
+					// 创建一个新 map 避免修改原始 msg 的 map
+					newMsg := make(map[string]interface{})
+					for k, v := range msgMap {
+						newMsg[k] = v
+					}
+					newMsg["reasoning_content"] = pendingReasoning
+					msgMap = newMsg
 				}
-				newMsg["reasoning_content"] = getLastReasoningContent()
-				msgMap = newMsg
 			}
 
 			tcRaw, hasTC := msgMap["tool_calls"]
@@ -1135,13 +2903,10 @@ func normalizeVisionImage(img visionImage) (visionImage, bool) {
 		// 解码失败（可能 GIF 有特殊帧/格式），交给上游判断
 		return img, false
 	}
-	// 提取第一帧（gif.Decode 返回 image.Image 即首帧）并转为 RGBA 保证 PNG 编码完整
+	// 提取第一帧（gif.Decode 返回 image.Image 即首帧）并转为 RGBA 保证 PNG 编码完整。
+	// 用 draw.Draw 整体拷贝（比逐像素 At/Set 快一个数量级，带图高并发下差异明显）
 	rgba := image.NewRGBA(frame.Bounds())
-	for i := 0; i < rgba.Bounds().Dx(); i++ {
-		for j := 0; j < rgba.Bounds().Dy(); j++ {
-			rgba.Set(i, j, frame.At(i, j))
-		}
-	}
+	draw.Draw(rgba, rgba.Bounds(), frame, frame.Bounds().Min, draw.Src)
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, rgba); err != nil {
 		return img, false
@@ -1150,6 +2915,152 @@ func normalizeVisionImage(img visionImage) (visionImage, bool) {
 		Base64: base64.StdEncoding.EncodeToString(buf.Bytes()),
 		MIME:   "image/png",
 	}, true
+}
+
+// ==================== 主模型 GIF 转换（可选，默认关闭） ====================
+//
+// 背景：视觉代理路径（applyVisionProxy）本来就会把 GIF 转成 PNG 首帧，
+// 但「主模型直收图片」的路径——主模型声明支持 vision、或没有配置 VisionProxyModel 时——
+// 图片会被原样转发，GIF 也就裸奔到上游。部分中转网关/视觉模型不接受 GIF，
+// 直接返回 400 invalid image input。
+//
+// 是否转换由两层配置决定（默认都关闭，保持透明转发）：
+//   - Config.GifNormalize                        全局开关
+//   - ModelDetailedSettings[model].GifNormalize  模型级覆盖（nil=跟随全局）
+//
+// 只处理主模型直收图片的请求，视觉代理路径不受本开关影响（它始终转换）。
+
+// gifNormalizeEnabled 判断指定模型是否启用「主模型 GIF 转换」：
+// 模型级配置优先，未指定则跟随全局开关。
+func gifNormalizeEnabled(modelID string) bool {
+	if setting, ok := cfg.ModelDetailedSettings[modelID]; ok && setting.GifNormalize != nil {
+		return *setting.GifNormalize
+	}
+	return cfg.GifNormalize
+}
+
+// normalizeGifInBody 把请求体中的 GIF 动图统一转换为 PNG 首帧（主模型直收图片时生效）。
+// 支持四种图片载体：
+//  1. Ollama images 数组（裸 base64 字符串）
+//  2. Ollama image 块   {"type":"image","image_base64":"..."}
+//  3. Anthropic image 块 {"type":"image","source":{"media_type":"...","data":"..."}}
+//  4. OpenAI image_url 块 {"type":"image_url","image_url":{"url":"data:image/gif;base64,..."}}
+//
+// 返回 (处理后的请求体, 是否发生了转换)。
+// [高并发内存安全] 先用字节标记预检，请求体里没有 GIF 特征时直接返回，不做整体反序列化。
+func normalizeGifInBody(body []byte, modelID string) ([]byte, bool) {
+	if len(body) == 0 || modelID == "" || !gifNormalizeEnabled(modelID) {
+		return body, false
+	}
+	// base64 编码的 GIF 一定以 "R0lG" 开头（"GIF8" 的 base64 前缀）；
+	// data URI 里则带 image/gif。两者任一命中才需要进一步解析。
+	if !bytes.Contains(body, []byte("image/gif")) && !bytes.Contains(body, []byte(`"R0lG`)) {
+		return body, false
+	}
+
+	var req map[string]interface{}
+	if json.Unmarshal(body, &req) != nil {
+		return body, false
+	}
+	messages, ok := req["messages"].([]interface{})
+	if !ok {
+		return body, false
+	}
+
+	converted := 0
+	// convertOne 就地转换一张 base64 图片，返回新的 (base64, mime)；未转换时原样返回
+	convertOne := func(b64, mime string) (string, string) {
+		if b64 == "" {
+			return b64, mime
+		}
+		if mime == "" {
+			mime = detectImageMIME(b64)
+		}
+		if mime != "image/gif" && !strings.HasPrefix(b64, "R0lG") {
+			return b64, mime
+		}
+		out, done := normalizeVisionImage(visionImage{Base64: b64, MIME: "image/gif"})
+		if !done {
+			return b64, mime
+		}
+		converted++
+		return out.Base64, out.MIME
+	}
+
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// 载体 1：Ollama images 数组（裸 base64 字符串，无 MIME 字段）
+		if imgs, ok := msg["images"].([]interface{}); ok && len(imgs) > 0 {
+			for i, v := range imgs {
+				s, ok := v.(string)
+				if !ok || s == "" {
+					continue
+				}
+				if nb, _ := convertOne(s, detectImageMIME(s)); nb != s {
+					imgs[i] = nb
+				}
+			}
+		}
+
+		// 载体 2～4：content 数组中的图片块
+		blocks, ok := msg["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, b := range blocks {
+			bm, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch bm["type"] {
+			case "image":
+				// Ollama：{"type":"image","image_base64":"..."}
+				if b64, ok := bm["image_base64"].(string); ok && b64 != "" {
+					if nb, _ := convertOne(b64, detectImageMIME(b64)); nb != b64 {
+						bm["image_base64"] = nb
+					}
+					continue
+				}
+				// Anthropic：{"type":"image","source":{"type":"base64","media_type":"...","data":"..."}}
+				if src, ok := bm["source"].(map[string]interface{}); ok {
+					data, _ := src["data"].(string)
+					mt, _ := src["media_type"].(string)
+					if nb, nmt := convertOne(data, mt); nb != data {
+						src["data"] = nb
+						src["media_type"] = nmt
+					}
+				}
+			case "image_url":
+				// OpenAI：{"type":"image_url","image_url":{"url":"data:image/gif;base64,..."}}
+				if iu, ok := bm["image_url"].(map[string]interface{}); ok {
+					urlStr, _ := iu["url"].(string)
+					idx := strings.Index(urlStr, ";base64,")
+					if idx < 0 {
+						continue
+					}
+					mime := strings.TrimPrefix(urlStr[:idx], "data:")
+					b64 := urlStr[idx+len(";base64,"):]
+					if nb, nmt := convertOne(b64, mime); nb != b64 {
+						iu["url"] = "data:" + nmt + ";base64," + nb
+					}
+				}
+			}
+		}
+	}
+
+	if converted == 0 {
+		return body, false
+	}
+	newBody, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	fmt.Printf("🎞️ 主模型 GIF 转换 [%s]: 已把 %d 张 GIF 动图转换为 PNG 首帧\n", modelID, converted)
+	return newBody, true
 }
 
 // ==================== 视觉代理模型（Vision Proxy） ====================
@@ -1814,6 +3725,14 @@ func applyVisionProxy(ctx context.Context, body []byte, modelID string) ([]byte,
 				go func(idx int, img visionImage) {
 					defer wg.Done()
 					defer func() { <-sem }()
+					// [进程存活兜底] 这是本程序自己起的 goroutine，net/http 只会 recover
+					// handler 主 goroutine，兜不住这里：任一 panic（图片解码越界等）
+					// 都会直接终止整个进程，表现为服务「突然消失」。
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Printf("⚠️ 视觉代理: 第 %d 张图片识别发生 panic，已拦截: %v\n", idx+1, r)
+						}
+					}()
 					desc, err := recognizeImageWithProxy(ctx, img, proxyModel, prompt)
 					if err != nil {
 						fmt.Printf("⚠️ 视觉代理: 第 %d 张图片识别失败: %v\n", idx+1, err)
@@ -1914,7 +3833,9 @@ func getDefaultConfig() Config {
 		OpenAIPrefix:            "[VC反代] ",
 		OpenAISuffix:            "",
 		StreamMode:              streamModePreserve,
-		Capabilities:            []string{"tools", "vision"}, // vs2026 需要这个字段才能启用工具功能
+		Capabilities:            []string{"tools", "vision"},   // vs2026 需要这个字段才能启用工具功能
+		DefaultContextLength:    builtinDefaultContextLength,   // 全局默认上下文长度（模型级配置优先）
+		DefaultMaxOutputTokens:  builtinDefaultMaxOutputTokens, // 全局默认最大输出 token（模型级配置优先）
 		OpenAIBase:              "https://api.openai.com/v1",
 		OpenAIKey:               "",
 		ProxyAPIKey:             "",                                             // 代理请求密钥（空=未设置，配合开关使用）
@@ -1925,6 +3846,7 @@ func getDefaultConfig() Config {
 		VisionProxyPrompt:       defaultVisionProxyPrompt,                       // 全局默认视觉代理提示词
 		VisionImageQuality:      &VisionQuality{Quality: visionQualityBalanced}, // 全局图片质量配置（默认平衡）
 		VisionProxyMemCacheSize: 200,                                            // 视觉代理图片内存缓存大小（默认 200，0=禁用）
+		GifNormalize:            false,                                          // 直连路径 GIF→PNG 首帧转换（默认关闭，保持透明转发）
 		ModelContextPrompt: ModelContextPrompt{
 			Enable:   false,
 			Position: ctxPosPrepend,
@@ -1933,15 +3855,30 @@ func getDefaultConfig() Config {
 		DoomLoopProtection: DoomLoopProtection{
 			Enable:      false, // 默认全关：不改变任何转发行为，用户主动开启才生效
 			Dedup:       false,
-			RepeatCheck: false, // 跨请求复读检测默认关闭（需记录每轮回复全文，且可能误伤正常重复提问）
+			RepeatCheck: false, // 跨请求复读检测默认关闭（只存摘要、不存全文，但"相同请求+相同回复"仍可能误伤正常重复提问）
 			Warn:        false, // 跨请求警告注入默认关闭
 			MaxRepeat:   3,
 			WarnPrompt:  defaultDoomLoopWarnPrompt,
 			// 思考标签消毒默认开启（独立于 Enable 生效）：ollama cloud 死循环根因防护，
 			// 只替换异常泄漏的裸标签，正常对话零影响
-			ThinkTag: true,
+			ThinkTag:         true,
+			ThinkTagRequest:  true, // 请求侧兜底：防止上游截断历史
+			ThinkTagResponse: true, // 响应侧根治：防止脏标签污染客户端历史
+			// 请求侧默认只清 assistant 历史（真正的死循环污染源），
+			// tool/user/system 里的裸标签多属内容的一部分，默认不碰以免误触发
+			ThinkTagRoleAssistant: true,
+			ThinkTagRoleUser:      false,
+			ThinkTagRoleSystem:    false,
+			ThinkTagRoleTool:      false,
+			LimitRepeatEntries:    true,
+			RepeatMaxEntries:      defaultRepeatMaxEntries,
+			LimitRepeatTTL:        true,
+			RepeatTTLMin:          defaultRepeatTTLMin,
 		},
 		ConnPool:       defaultConnPool,
+		ProxyLimit:     defaultProxyLimit,    // 过载保护（并发闸门 + 请求体上限），默认关闭
+		ServerTimeout:  defaultServerTimeout, // 入站服务器超时（需重启生效）
+		ServerTLS:      defaultServerTLS,     // 入站 HTTPS 加密（默认关闭，需重启生效）
 		RealtimeLog:    defaultRealtimeLog,
 		ModelMetaProbe: defaultModelMetaProbe,
 	}
@@ -1960,6 +3897,9 @@ func printConfigHelp() {
 	fmt.Println(" ▼ OpenAI_Suffix   : 返回给客户端的模型名称后缀,仅影响模型名字显示")
 	fmt.Println(" ▼ StreamMode      : 流式策略 = 不覆写/强制流式/强制关闭 (preserve/force_stream/force_close)")
 	fmt.Println(" ▼ Capabilities    : 向客户端声明支持的能力列表 (tools, vision 等)")
+	fmt.Println(" ▼ DefaultContextLength / DefaultMaxOutputTokens : 全局默认上下文长度 / 最大输出 token")
+	fmt.Println("                     上游未返回模型元数据、且 ModelDetailedSettings 未单独配置该模型时使用(默认 1000000 / 384000)")
+	fmt.Println("                     影响 /v1/models、/api/tags、/api/show、/api/ps 展示值与模型上下文注入; 0=使用内置默认值")
 	fmt.Println(" ▼ OPENAI_BASE     : 上游 OpenAI 兼容 API 地址 (必填)")
 	fmt.Println(" ▼ OPENAI_KEY      : 上游 API 密钥 (必填，每次启动时自动加密存储,换设备需重新输入)")
 	fmt.Println(" ▼ ProxyAPIKeys    : 代理请求密钥列表 (多密钥入站鉴权,每个客户端可分配独立密钥,便于区分请求来源)")
@@ -1978,6 +3918,7 @@ func printConfigHelp() {
 	fmt.Println("                     VisionProxyPrompt: 视觉代理自定义提示词(留空=使用全局 VisionProxyPrompt)")
 	fmt.Println("                     VisionImageQuality: 本模型图片质量配置(留空=使用全局 VisionImageQuality)")
 	fmt.Println("                       格式: {Quality: 枚举, CustomPercent: 自定义质量百分比}")
+	fmt.Println("                     GifNormalize: 主模型 GIF 转换(本模型) true=转换/false=不转换/缺省跟随全局 GifNormalize")
 	fmt.Println("                     识别结果按图片内容+提示词哈希缓存到 vision_cache/ 目录,重复图片直接命中缓存,不浪费 token")
 	fmt.Println("                     示例: {\"gpt-4o\": {\"ContextLength\": 128000, \"MaxOutputTokens\": 16384}}")
 	fmt.Println("                     示例: {\"deepseek-chat\": {\"VisionProxyModel\": \"gpt-4o\", \"VisionProxyPrompt\": \"请描述图片内容\"}}")
@@ -1991,6 +3932,10 @@ func printConfigHelp() {
 	fmt.Println(" ▼ VisionProxyMemCacheSize : 视觉代理图片内存缓存大小(0=禁用,默认200)")
 	fmt.Println("                     识别成功保存本地后同时放入内存,再次遇到相同图片直接命中内存(毫秒级),")
 	fmt.Println("                     减少磁盘读取、延长固态寿命;启动时按修改时间预加载最近的 N 条到内存")
+	fmt.Println(" ▼ GifNormalize    : 主模型 GIF 转换开关(默认关闭):主模型原生支持视觉/未配置视觉代理时,")
+	fmt.Println("                     请求体里的 GIF 动图将被转换为 PNG 首帧再转发(仅保留首帧)")
+	fmt.Println("                     部分上游/中转网关不接受 GIF(返回 400 invalid image input),开启可规避")
+	fmt.Println("                     视觉代理路径不受此开关影响(它始终转换);模型级可用 ModelDetailedSettings 的 GifNormalize 覆盖(true/false,缺省跟随全局)")
 	fmt.Println(" ▼ RequestPromptReplace: 请求提示词替换规则,自动替换请求中的指定文本")
 	fmt.Println("                     格式: {规则名称: {enable, role, index, prompt, replace}}")
 	fmt.Println("                     优先级:")
@@ -2005,20 +3950,54 @@ func printConfigHelp() {
 	fmt.Println("                     视觉说明自动判断:Capabilities含vision=原生支持;否则若配置 VisionProxyModel=由该代理模型识别;否则=不支持")
 	fmt.Println("                     示例: {\"Enable\": true, \"Position\": \"prepend\", \"Template\": \"你运行在{model}上,上下文{context_length},最大输出{max_output_tokens},能力{capabilities},{vision}\"}")
 	fmt.Println(" ▼ DoomLoopProtection : 末日循环保护,检测上游内容重复并熔断,防止客户端陷入重试死循环")
-	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), Warn: 跨请求警告注入(熔断/复读后下一轮注入system警告), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词, ThinkTag: 思考标签消毒}")
+	fmt.Println("                     格式: {Enable: 总开关, Dedup: 内容去重(相邻块+全文尾部), RepeatCheck: 跨请求复读检测(请求+回复与上一轮相同), Warn: 跨请求警告注入(熔断/复读后下一轮注入system警告), MaxRepeat: 连续重复熔断阈值(>=2,默认3), WarnPrompt: 跨请求警告提示词, ThinkTag: 思考标签消毒,")
+	fmt.Println("                           LimitRepeatEntries: 是否限记录条数, RepeatMaxEntries: 会话数上限(默认256),")
+	fmt.Println("                           LimitRepeatTTL: 是否限记录有效期, RepeatTTLMin: 有效期分钟(默认30)}")
 	fmt.Println("                     检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),")
 	fmt.Println("                     Warn 开启时在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)")
 	fmt.Println("                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭")
-	fmt.Println("                     ThinkTag 思考标签消毒(独立于 Enable 生效,默认开启): ollama cloud 死循环根因防护——")
+	fmt.Println("                     ThinkTag 思考标签消毒总开关(独立于 Enable 生效,默认开启): ollama cloud 死循环根因防护——")
 	fmt.Println("                       deepseek 系思考模型长上下文退化时会把字面 </thinking> 泄漏进正文,客户端回放该历史后")
 	fmt.Println("                       上游渲染器会在裸 </thinking> 处截断消息历史导致死循环(ollama/ollama#17617)。")
-	fmt.Println("                       本开关在转发边界把裸标签替换为 [THINK-START]/[THINK-END]: 响应侧防脏历史进入客户端,")
-	fmt.Println("                       请求侧防上游截断历史; 只处理计数不配对的裸标签,教学示例等配对标签原样保留")
+	fmt.Println("                       本开关在转发边界把裸标签替换为 [THINK-START]/[THINK-END], 只处理裸闭标签(无配对开标签), 裸开标签与配对标签不影响上游渲染")
+	fmt.Println("                     ThinkTagRequest 请求侧消毒(默认开启): 客户端历史 → 上游, 防上游截断 assistant 历史")
+	fmt.Println("                     ThinkTagResponse 响应侧消毒(默认开启): 上游 → 客户端, 防脏标签污染客户端历史(根治)")
+	fmt.Println("                     ThinkTagRoleAssistant/User/System/Tool 请求侧生效角色: 默认只处理 assistant(真正的污染源),")
+	fmt.Println("                       其余默认关闭——工具输出(如阅读源码)里的字面标签多属内容的一部分,一并处理会反复误触发徽章")
 	fmt.Println("                     示例: {\"Enable\": true, \"Dedup\": true, \"RepeatCheck\": false, \"Warn\": true, \"MaxRepeat\": 3, \"WarnPrompt\": \"请勿重复输出\"}")
 	fmt.Println(" ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启")
 	fmt.Println("                     格式: {MaxIdleConns: 全局最大空闲连接数, MaxIdleConnsPerHost: 每上游主机最大空闲连接数, MaxConnsPerHost: 每上游主机最大并发连接数,")
 	fmt.Println("                           IdleConnTimeoutSec: 空闲连接回收秒数, TLSHandshakeTimeoutSec: TLS握手超时秒数, ForceHTTP2: 强制协商HTTP/2}")
 	fmt.Println("                     0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true")
+	fmt.Println(" ▼ ProxyLimit       : 过载保护(并发闸门 + 请求体上限),防高并发 OOM,保存后立即生效,无需重启")
+	fmt.Println("                     格式: {Enable: 总开关, LimitConcurrency: 是否限并发, MaxConcurrent: 最大并发数(默认32),")
+	fmt.Println("                           LimitQueueTimeout: 是否限排队时间, QueueTimeoutSec: 排队超时秒(默认60),")
+	fmt.Println("                           LimitRequestBody: 是否限请求体大小, MaxRequestBodyMB: 请求体上限MB(默认32)}")
+	fmt.Println("                     限制用布尔开关控制(关闭=完全不限制),数值只填具体数字(0=用默认值)")
+	fmt.Println("                     并发已满时请求排队,排队超时返回 503;请求体超过上限直接返回 413(不做任何解析)")
+	fmt.Println("                     建议: 高并发带图片场景开启,MaxConcurrent 按内存与上游限流能力设置(如 16~64)")
+	fmt.Println(" ▼ ServerTimeout    : 入站 HTTP 服务器超时(防慢速连接堆积),修改需重启程序生效")
+	fmt.Println("                     格式: {LimitReadHeader: 是否限读头时间, ReadHeaderTimeoutSec: 读头超时秒(默认30),")
+	fmt.Println("                           LimitIdle: 是否回收空闲连接, IdleTimeoutSec: 空闲回收秒(默认120),")
+	fmt.Println("                           LimitMaxHeader: 是否限请求头大小, MaxHeaderMB: 请求头上限MB(默认1)}")
+	fmt.Println("                     刻意不提供 WriteTimeout/ReadTimeout: 会切断 SSE 流式对话与大请求体上传")
+	fmt.Println(" ▼ ServerTLS        : 入站 HTTPS 加密(自签名证书 / 自定义 CA),修改需重启程序生效")
+	fmt.Println("                     三种端口各自独立,端口号必须互不相同:")
+	fmt.Println("                       HTTP 端口   : 就是上面的 PORT(主监听端口),永远明文 HTTP,不可禁用")
+	fmt.Println("                       HTTPS 端口  : HTTPSPortEnable + HTTPSPort,纯加密;用 http:// 访问会自动 308 跳转到 https://")
+	fmt.Println("                       混合端口    : MixedPortEnable  + MixedPort,同端口按首字节自动识别 HTTP / HTTPS")
+	fmt.Println("                     HTTPSRedirect: HTTPS 端口收到明文请求时是否自动跳转(true=308 跳转/false=返回 400)")
+	fmt.Println("                     其它字段: CertMode: 证书来源(auto=自动生成/file=自定义),")
+	fmt.Println("                           CertDir: 自动证书目录(默认 certs), CertFile: 证书文件, KeyFile: 私钥文件,")
+	fmt.Println("                           CAFile: CA 证书(并入证书链;开启 ClientAuth 时用于校验客户端), ClientAuth: 是否要求客户端证书(mTLS)}")
+	fmt.Println("                     auto 模式首次启动自动生成 certs/ca.crt + certs/server.crt(+key),服务器证书有效期 3 年、CA 10 年,")
+	fmt.Println("                     临近过期或主机名变化会自动续签;配置页「下载 CA 证书」可直接导出 CA 给客户端/系统信任")
+	fmt.Println("                     file 模式可使用 XCA / OpenSSL / mkcert 生成的证书;CAFile 留空则不附加证书链、也不支持 mTLS")
+	fmt.Println("                     ⚠️ XCA 手动签发的证书常常没有 SAN(使用者可选名称),Chrome/Edge 只认 SAN 不认 CN → 必然报证书错误;")
+	fmt.Println("                       此时配置 CAKeyFile(CA 私钥,需无密码)+ ReissueServerCert=true,程序会用你的 CA 重签一张 SAN 完整的证书")
+	fmt.Println("                       重签结果写入 CertDir/server.crt + server.key(有效期 3 年,由同一 CA 签发,客户端无需重新信任)")
+	fmt.Println("                     CAFile 可写多张证书(中间 CA + 根 CA),程序会把它们全部并入证书链,避免「证书链不完整」")
+	fmt.Println("                     旧版单端口字段 ListenMode(http/both/https)会在启动时自动迁移为上述三端口配置")
 	fmt.Println(" ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)")
 	fmt.Println("                     格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,0=不截断,默认8000,上限5000000)}")
 	fmt.Println("                     记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量")
@@ -2076,10 +4055,10 @@ func printModelAliases() {
 		ctxLen := meta.ContextLength
 		maxOut := meta.MaxOutputTokens
 		if ctxLen <= 0 {
-			ctxLen = DefaultContextLength
+			ctxLen = defaultContextLength()
 		}
 		if maxOut <= 0 {
-			maxOut = DefaultMaxOutputTokens
+			maxOut = defaultMaxOutputTokens()
 		}
 
 		fmt.Printf("   🧩 %s\n", displayName)
@@ -2187,6 +4166,15 @@ func loadConfig() {
 		stored.Capabilities = defaultCfg.Capabilities
 		needSave = true
 	}
+	// 全局默认上下文长度 / 最大输出 token：旧配置缺字段或 <=0 时补默认并回写
+	if _, ok := rawMap["DefaultContextLength"]; !ok || stored.DefaultContextLength <= 0 {
+		stored.DefaultContextLength = defaultCfg.DefaultContextLength
+		needSave = true
+	}
+	if _, ok := rawMap["DefaultMaxOutputTokens"]; !ok || stored.DefaultMaxOutputTokens <= 0 {
+		stored.DefaultMaxOutputTokens = defaultCfg.DefaultMaxOutputTokens
+		needSave = true
+	}
 	if _, ok := rawMap["OPENAI_BASE"]; !ok {
 		stored.OpenAIBase = defaultCfg.OpenAIBase
 		needSave = true
@@ -2223,6 +4211,10 @@ func loadConfig() {
 		stored.VisionProxyMemCacheSize = 0
 		needSave = true
 	}
+	// 直连路径 GIF 转换开关（默认关闭；字段缺失按默认 false，语义一致，无需强制回写）
+	if _, ok := rawMap["GifNormalize"]; !ok {
+		stored.GifNormalize = defaultCfg.GifNormalize
+	}
 	if _, ok := rawMap["ModelContextPrompt"]; !ok {
 		stored.ModelContextPrompt = defaultCfg.ModelContextPrompt
 		needSave = true
@@ -2243,6 +4235,54 @@ func loadConfig() {
 				stored.DoomLoopProtection.ThinkTag = defaultCfg.DoomLoopProtection.ThinkTag
 				needSave = true
 			}
+			// 旧配置升级：请求侧/响应侧是新增的拆分开关，旧配置只有总开关 ThinkTag。
+			// 缺失时两个方向都跟随总开关 → 升级后行为与旧版完全一致（不会突然放开或收紧防护）
+			if _, has := rawDlp["ThinkTagRequest"]; !has {
+				stored.DoomLoopProtection.ThinkTagRequest = stored.DoomLoopProtection.ThinkTag
+				needSave = true
+			}
+			if _, has := rawDlp["ThinkTagResponse"]; !has {
+				stored.DoomLoopProtection.ThinkTagResponse = stored.DoomLoopProtection.ThinkTag
+				needSave = true
+			}
+			// 旧配置升级：请求侧生效角色是新增字段，默认只处理 assistant（真正的死循环污染源），
+			// 其余角色默认关闭——避免工具输出里的字面标签造成误报
+			if _, has := rawDlp["ThinkTagRoleAssistant"]; !has {
+				stored.DoomLoopProtection.ThinkTagRoleAssistant = defaultCfg.DoomLoopProtection.ThinkTagRoleAssistant
+				needSave = true
+			}
+			if _, has := rawDlp["ThinkTagRoleUser"]; !has {
+				stored.DoomLoopProtection.ThinkTagRoleUser = defaultCfg.DoomLoopProtection.ThinkTagRoleUser
+				needSave = true
+			}
+			if _, has := rawDlp["ThinkTagRoleSystem"]; !has {
+				stored.DoomLoopProtection.ThinkTagRoleSystem = defaultCfg.DoomLoopProtection.ThinkTagRoleSystem
+				needSave = true
+			}
+			if _, has := rawDlp["ThinkTagRoleTool"]; !has {
+				stored.DoomLoopProtection.ThinkTagRoleTool = defaultCfg.DoomLoopProtection.ThinkTagRoleTool
+				needSave = true
+			}
+			// 旧配置升级：复读记录上限字段缺失时补默认
+			if _, has := rawDlp["RepeatMaxEntries"]; !has {
+				stored.DoomLoopProtection.RepeatMaxEntries = defaultCfg.DoomLoopProtection.RepeatMaxEntries
+				needSave = true
+			}
+			if _, has := rawDlp["RepeatTTLMin"]; !has {
+				stored.DoomLoopProtection.RepeatTTLMin = defaultCfg.DoomLoopProtection.RepeatTTLMin
+				needSave = true
+			}
+			// 旧配置升级：LimitRepeatEntries / LimitRepeatTTL 是新加的布尔开关，
+			// 旧配置里没有这两个字段 → 反序列化为 false（= 不限制），
+			// 必须显式补 true，否则升级后会意外变成「不限条数 / 永不过期」
+			if _, has := rawDlp["LimitRepeatEntries"]; !has {
+				stored.DoomLoopProtection.LimitRepeatEntries = defaultCfg.DoomLoopProtection.LimitRepeatEntries
+				needSave = true
+			}
+			if _, has := rawDlp["LimitRepeatTTL"]; !has {
+				stored.DoomLoopProtection.LimitRepeatTTL = defaultCfg.DoomLoopProtection.LimitRepeatTTL
+				needSave = true
+			}
 		}
 	}
 	if _, ok := rawMap["ConnPool"]; !ok {
@@ -2250,6 +4290,44 @@ func loadConfig() {
 		needSave = true
 	} else {
 		stored.ConnPool = normalizeConnPool(stored.ConnPool)
+	}
+	if _, ok := rawMap["ProxyLimit"]; !ok {
+		stored.ProxyLimit = defaultCfg.ProxyLimit
+		needSave = true
+	} else {
+		if migrateProxyLimitSwitches(&stored.ProxyLimit, rawMap["ProxyLimit"]) {
+			needSave = true
+		}
+		stored.ProxyLimit = normalizeProxyLimit(stored.ProxyLimit)
+	}
+	if _, ok := rawMap["ServerTimeout"]; !ok {
+		stored.ServerTimeout = defaultCfg.ServerTimeout
+		needSave = true
+	} else {
+		if migrateServerTimeoutSwitches(&stored.ServerTimeout, rawMap["ServerTimeout"]) {
+			needSave = true
+		}
+		stored.ServerTimeout = normalizeServerTimeout(stored.ServerTimeout)
+	}
+	// 入站 HTTPS 加密：缺字段时补默认（默认关闭 → 升级后保持原有 HTTP 行为）
+	if _, ok := rawMap["ServerTLS"]; !ok {
+		stored.ServerTLS = defaultCfg.ServerTLS
+		needSave = true
+	} else {
+		// 旧版单端口 ListenMode(http/both/https) → 三端口模型（HTTPPort / HTTPSPort / MixedPort）
+		if migrateServerTLSPorts(&stored.ServerTLS, rawMap["ServerTLS"], stored.PORT) {
+			needSave = true
+			fmt.Println("🔄 检测到旧版 ServerTLS.ListenMode，已迁移为三个独立端口配置")
+		}
+		// 旧配置没有 HTTPSRedirect 字段 → 反序列化为 false，
+		// 与默认「明文访问 HTTPS 端口自动跳转」不一致，缺失时补默认 true
+		if rawTLS, ok := rawMap["ServerTLS"].(map[string]interface{}); ok {
+			if _, has := rawTLS["HTTPSRedirect"]; !has {
+				stored.ServerTLS.HTTPSRedirect = defaultCfg.ServerTLS.HTTPSRedirect
+				needSave = true
+			}
+		}
+		stored.ServerTLS = normalizeServerTLS(stored.ServerTLS)
 	}
 	if _, ok := rawMap["RealtimeLog"]; !ok {
 		stored.RealtimeLog = defaultCfg.RealtimeLog
@@ -2411,6 +4489,8 @@ func loadConfig() {
 
 	// 应用连接池配置（构建共享 Transport）
 	applyConnPoolConfig(stored.ConnPool)
+	// 应用过载保护（并发信号量容量）
+	applyProxyLimitConfig(stored.ProxyLimit)
 
 	// 应用视觉代理图片内存缓存大小，并预加载最近的识别结果到内存
 	setVisionMemCacheCap(stored.VisionProxyMemCacheSize)
@@ -2742,6 +4822,7 @@ const (
 	rtProtWarnInject    = "warn-inject"     // 跨请求警告注入
 	rtProtAssistantLoop = "assistant-loop"  // assistant 消息重复（自问自答循环）
 	rtProtVisionProxy   = "vision-proxy"    // 视觉代理识别
+	rtProtGifNormalize  = "gif-normalize"   // 主模型 GIF 转换（GIF→PNG 首帧）
 	rtProtCtxInject     = "ctx-inject"      // 模型上下文注入
 	rtProtPromptReplace = "prompt-replace"  // 提示词替换
 	rtProtModelAlias    = "model-alias"     // 模型名还原
@@ -3038,7 +5119,7 @@ func newRealtimeRecorder(w http.ResponseWriter, r *http.Request, rawBody []byte)
 		Status:   0,
 	}
 	// 客户端原始请求体（截断）
-	e.ReqBody, e.ReqTrunc = truncateBytes(string(rawBody), rl.MaxBodyLen)
+	e.ReqBody, e.ReqTrunc = truncateBodyString(rawBody, rl.MaxBodyLen)
 
 	cap := &realtimeCaptureWriter{ResponseWriter: w, limit: rl.MaxBodyLen}
 	var wrapped http.ResponseWriter
@@ -3056,7 +5137,7 @@ func (rec *realtimeRecorder) setUpstreamBody(body []byte) {
 	if rec == nil {
 		return
 	}
-	up, trunc := truncateBytes(string(body), normalizeRealtimeLog(cfg.RealtimeLog).MaxBodyLen)
+	up, trunc := truncateBodyString(body, normalizeRealtimeLog(cfg.RealtimeLog).MaxBodyLen)
 	e := rec.entry
 	e.mu.Lock()
 	e.UpBody, e.UpTrunc = up, trunc
@@ -3134,17 +5215,50 @@ func lastMatchInt(re *regexp.Regexp, s string) int {
 	return v
 }
 
+// truncateBodyString 把请求体按字符（rune）截断到 n 个字符后返回字符串。
+//
+// [高并发内存安全] 不要写成 truncateBytes(string(body), n)：那样会先把整份请求体
+// 复制成 string（带图片时单份就可达数十 MB），再截断丢掉 99.9%，纯属浪费；
+// 高并发下这部分临时垃圾会直接把进程推到 OOM。本函数直接扫描 []byte，
+// 只在末尾做一次必要的 string() 转换。
+func truncateBodyString(body []byte, n int) (string, bool) {
+	if n <= 0 || len(body) <= n {
+		// 字节数 <= 字符上限时，字符数必然也 <= 上限，无需扫描
+		return string(body), false
+	}
+	count := 0
+	for i := 0; i < len(body); {
+		if count == n {
+			return string(body[:i]), true
+		}
+		_, size := utf8.DecodeRune(body[i:])
+		if size <= 0 {
+			size = 1
+		}
+		i += size
+		count++
+	}
+	return string(body), false
+}
+
 // truncateBytes 按字符截断字符串到 n 个字符（按 rune，避免切断中文多字节字符），
 // 返回 (截断后文本, 是否发生了截断)
 func truncateBytes(s string, n int) (string, bool) {
 	if n <= 0 || len(s) <= n {
 		return s, false
 	}
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s, false
+	// [高并发内存安全] 这里绝不能用 []rune(s) —— 每个 rune 占 4 字节，
+	// 一个几 MB 的请求体会瞬时分配 4 倍内存，而调用方只要前 n 个字符，
+	// 高并发下这部分临时垃圾足以把进程推到 OOM。
+	// 改为顺序扫描到第 n 个 rune 的起始字节位置，零额外分配。
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i], true
+		}
+		count++
 	}
-	return string(runes[:n]), true
+	return s, false
 }
 
 // handleRealtimeAPI GET /api/realtime?after=<id> 返回记录列表；DELETE 清空
@@ -3524,6 +5638,38 @@ func apiRevealProxyKeys(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "keys": keys})
 }
 
+// apiDownloadCA 下载用于客户端信任的 CA 证书（PEM）。
+// 自动模式返回 certs/ca.crt；自定义模式返回配置的 CAFile；无可用 CA 时返回 404。
+func apiDownloadCA(w http.ResponseWriter, r *http.Request) {
+	if !requireConfigAuth(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	st := normalizeServerTLS(cfg.ServerTLS)
+	caFile := st.CAFile
+	if st.CertMode == certModeAuto {
+		_, _, caFile = autoCertPaths(st.CertDir)
+	}
+	if caFile == "" {
+		http.Error(w, "未配置 CA 证书", http.StatusNotFound)
+		return
+	}
+	data, err := os.ReadFile(caFile)
+	if err != nil {
+		http.Error(w, "CA 证书不可读: "+err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.Header().Set("Content-Disposition", `attachment; filename="remote-convert-ollama-ca.crt"`)
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodHead {
+		w.Write(data)
+	}
+}
+
 // proxyKeyView 代理密钥的前端视图（脱敏：不含密钥内容，仅含引用 KeyRef）
 type proxyKeyView struct {
 	Name   string `json:"Name"`             // 密钥名称
@@ -3553,7 +5699,8 @@ func apiGetConfig(w http.ResponseWriter, r *http.Request) {
 		OpenAIKeySet         bool           `json:"OPENAI_KEY_SET"`
 		WebConfigPasswordSet bool           `json:"WEB_CONFIG_PASSWORD_SET"`
 		ProxyAPIKeys         []proxyKeyView `json:"ProxyAPIKeys"`
-	}{Config: cfgCopy, OpenAIKeySet: keySet, WebConfigPasswordSet: pwSet, ProxyAPIKeys: proxyKeys})
+		TLS_CA               tlsCAInfo      `json:"TLS_CA"`
+	}{Config: cfgCopy, OpenAIKeySet: keySet, WebConfigPasswordSet: pwSet, ProxyAPIKeys: proxyKeys, TLS_CA: buildTLSInfo(cfgCopy.ServerTLS, cfgCopy.IP)})
 }
 
 // apiSaveConfig 保存配置到 config.json 并同步更新运行内存
@@ -3606,6 +5753,8 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	newCfg.IP = strings.TrimSpace(newCfg.IP)
 	newCfg.PORT = strings.TrimSpace(newCfg.PORT)
 	newCfg.StreamMode = normalizeStreamMode(newCfg.StreamMode)
+	// 全局默认上下文/输出上限：<=0 回退内置默认值（上下文必须有值，不支持"不限制"）
+	normalizeDefaultModelLimits(&newCfg)
 
 	// 规范化替换规则模式：mode 枚举 + 兼容旧 force/replaceWhole 字段
 	var rawCfg map[string]interface{}
@@ -3613,9 +5762,28 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	migrateRequestPromptReplace(&newCfg, rawCfg)
 
 	// 思考标签消毒：旧版配置页未携带 ThinkTag 字段时保持当前运行值（防误关防护）
+	// 请求侧/响应侧/角色同理：缺失即沿用当前运行值，避免老页面保存后子开关被静默清零
 	if rawDlp, ok := rawCfg["DoomLoopProtection"].(map[string]interface{}); ok {
 		if _, hasThinkTag := rawDlp["ThinkTag"]; !hasThinkTag {
 			newCfg.DoomLoopProtection.ThinkTag = cfg.DoomLoopProtection.ThinkTag
+		}
+		if _, has := rawDlp["ThinkTagRequest"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRequest = cfg.DoomLoopProtection.ThinkTagRequest
+		}
+		if _, has := rawDlp["ThinkTagResponse"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagResponse = cfg.DoomLoopProtection.ThinkTagResponse
+		}
+		if _, has := rawDlp["ThinkTagRoleAssistant"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRoleAssistant = cfg.DoomLoopProtection.ThinkTagRoleAssistant
+		}
+		if _, has := rawDlp["ThinkTagRoleUser"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRoleUser = cfg.DoomLoopProtection.ThinkTagRoleUser
+		}
+		if _, has := rawDlp["ThinkTagRoleSystem"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRoleSystem = cfg.DoomLoopProtection.ThinkTagRoleSystem
+		}
+		if _, has := rawDlp["ThinkTagRoleTool"]; !has {
+			newCfg.DoomLoopProtection.ThinkTagRoleTool = cfg.DoomLoopProtection.ThinkTagRoleTool
 		}
 	}
 
@@ -3635,6 +5803,73 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	// 规范化实时请求查看配置（条数/截断长度上下界）
 	newCfg.RealtimeLog = normalizeRealtimeLog(newCfg.RealtimeLog)
+	// 规范化过载保护配置（并发数/排队超时/请求体上限）
+	newCfg.ProxyLimit = normalizeProxyLimit(newCfg.ProxyLimit)
+	// 规范化入站服务器超时（修改需重启生效）
+	newCfg.ServerTimeout = normalizeServerTimeout(newCfg.ServerTimeout)
+	// 入站加密：先校验「启用就必须填端口」，避免 normalize 静默把开关关掉让用户困惑
+	if newCfg.ServerTLS.Enable {
+		if newCfg.ServerTLS.HTTPSPortEnable && sanitizePort(newCfg.ServerTLS.HTTPSPort) == "" {
+			http.Error(w, "已启用 HTTPS 端口但未填写端口号（HTTPS 端口为必填，且不能与 PORT / 混合端口相同）", http.StatusBadRequest)
+			return
+		}
+		if newCfg.ServerTLS.MixedPortEnable && sanitizePort(newCfg.ServerTLS.MixedPort) == "" {
+			http.Error(w, "已启用混合端口但未填写端口号（混合端口为必填，且不能与 PORT / HTTPS 端口相同）", http.StatusBadRequest)
+			return
+		}
+	}
+	// 旧页面保存时可能仍带 ListenMode（新页面已不再提交）→ 先按旧模式迁移，再规范化
+	if newCfg.ServerTLS.LegacyListenMode != "" {
+		rawTLS := map[string]interface{}{"ListenMode": newCfg.ServerTLS.LegacyListenMode}
+		migrateServerTLSPorts(&newCfg.ServerTLS, rawTLS, newCfg.PORT)
+	}
+	// 规范化入站 HTTPS 加密配置；启用时立即校验/生成证书，避免保存后重启才发现问题
+	newCfg.ServerTLS = normalizeServerTLS(newCfg.ServerTLS)
+	if newCfg.ServerTLS.Enable {
+		// 三个端口必须互不相同（HTTP 端口 = PORT，HTTPS / 混合端口各自独立）
+		ports := map[string]string{}
+		addPort := func(role, port string) error {
+			n, perr := strconv.Atoi(port)
+			if perr != nil || n < 1 || n > 65535 {
+				return fmt.Errorf("%s 端口号无效：%q（应为 1-65535 的数字）", role, port)
+			}
+			if prev, dup := ports[port]; dup {
+				return fmt.Errorf("%s 端口与 %s 端口重复（都是 %s），三个端口必须互不相同", role, prev, port)
+			}
+			ports[port] = role
+			return nil
+		}
+		if err := addPort("HTTP", newCfg.PORT); err != nil {
+			http.Error(w, "监听端口配置有误: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if newCfg.ServerTLS.HTTPSPortEnable {
+			if err := addPort("HTTPS", newCfg.ServerTLS.HTTPSPort); err != nil {
+				http.Error(w, "HTTPS 端口配置有误: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if newCfg.ServerTLS.MixedPortEnable {
+			if err := addPort("混合", newCfg.ServerTLS.MixedPort); err != nil {
+				http.Error(w, "混合端口配置有误: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		// 只有存在加密端口时才需要校验证书
+		needTLS := false
+		for _, p := range effectiveInboundPorts(newCfg.ServerTLS, newCfg.PORT) {
+			if p.needsTLS() {
+				needTLS = true
+				break
+			}
+		}
+		if needTLS {
+			if _, err := buildInboundTLSConfig(newCfg.ServerTLS, newCfg.IP); err != nil {
+				http.Error(w, "HTTPS 加密配置有误: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+	}
 	// 规范化模型详细设置里的图片质量配置
 	for m, s := range newCfg.ModelDetailedSettings {
 		if s.VisionImageQuality != nil {
@@ -3737,6 +5972,9 @@ func apiSaveConfig(w http.ResponseWriter, r *http.Request) {
 
 	// 总开关已启用但无有效密钥时提示（否则入站鉴权不会生效）
 	msg := "✅ 配置已保存。IP/PORT 修改需重启程序生效，其余配置立即生效。"
+	if newCfg.ServerTLS.Enable {
+		msg += " 🔐 入站加密 ServerTLS 需重启程序生效。"
+	}
 	if newCfg.ProxyAPIKeyEnabled {
 		valid := 0
 		for _, e := range newPlainKeys {
@@ -3769,6 +6007,13 @@ func applyConfigToRuntime(newCfg Config) {
 	cfg.OpenAISuffix = newCfg.OpenAISuffix
 	cfg.StreamMode = newCfg.StreamMode
 	cfg.Capabilities = newCfg.Capabilities
+	// 全局默认上下文长度 / 最大输出 token（旧页面不提交这两个字段 → 保持当前值，避免被清零）
+	if newCfg.DefaultContextLength > 0 {
+		cfg.DefaultContextLength = newCfg.DefaultContextLength
+	}
+	if newCfg.DefaultMaxOutputTokens > 0 {
+		cfg.DefaultMaxOutputTokens = newCfg.DefaultMaxOutputTokens
+	}
 	cfg.OpenAIBase = newCfg.OpenAIBase
 	// ProxyAPIKeys 密钥列表由调用方单独处理为明文；这里只同步总开关（立即生效，无需重启）
 	cfg.ProxyAPIKeyEnabled = newCfg.ProxyAPIKeyEnabled
@@ -3785,6 +6030,8 @@ func applyConfigToRuntime(newCfg Config) {
 	}
 	cfg.VisionProxyMemCacheSize = newCfg.VisionProxyMemCacheSize
 	setVisionMemCacheCap(newCfg.VisionProxyMemCacheSize)
+	// 直连路径 GIF 转换开关（立即生效）
+	cfg.GifNormalize = newCfg.GifNormalize
 	// 规范化插入位置并应用
 	newCfg.ModelContextPrompt.Position = normalizeCtxPos(newCfg.ModelContextPrompt.Position)
 	cfg.ModelContextPrompt = newCfg.ModelContextPrompt
@@ -3793,6 +6040,13 @@ func applyConfigToRuntime(newCfg Config) {
 	// 应用连接池配置（重建共享 Transport，立即生效）
 	cfg.ConnPool = normalizeConnPool(newCfg.ConnPool)
 	applyConnPoolConfig(cfg.ConnPool)
+	// 应用过载保护（并发闸门 + 请求体上限，立即生效）
+	cfg.ProxyLimit = normalizeProxyLimit(newCfg.ProxyLimit)
+	applyProxyLimitConfig(cfg.ProxyLimit)
+	// 应用入站服务器超时（仅存配置，http.Server 字段不允许在 Serve 后修改，需重启生效）
+	cfg.ServerTimeout = normalizeServerTimeout(newCfg.ServerTimeout)
+	// 应用入站 HTTPS 加密配置（证书与监听器在启动时构建，修改需重启生效）
+	cfg.ServerTLS = normalizeServerTLS(newCfg.ServerTLS)
 	// 应用实时请求查看配置（记录条数/截断长度，立即生效）
 	cfg.RealtimeLog = normalizeRealtimeLog(newCfg.RealtimeLog)
 	// 应用模型元数据探测配置（缓存时长/开关立即生效；缓存由 invalidateModelMetaCache 清空）
@@ -3903,10 +6157,12 @@ const dedupMinLen = 20
 // 官方仅修复本地渲染路径（PR #18260），cloud 端至今未修，本网关在转发边界做消毒兜底：
 //   - 响应侧：上游泄漏的裸标签在发给客户端前替换，防止脏历史进入客户端会话
 //   - 请求侧：客户端历史里已污染的裸标签在转发上游前替换，防止上游渲染器截断历史
-// 只替换"裸"标签（计数不配对的多余标签），配对的 <thinking>...</thinking> 原样保留
-// （可能是教学示例，不误伤）。
+// 只替换"裸闭标签"（无配对开标签的 </thinking>）：这才是真正会让上游截断历史的形态。
+// 裸 <thinking> 与配对完整的 <thinking>...</thinking> 一律原样保留（不影响上游渲染，无需处理）。
 
 // 思考标签常量：原始标签与安全替代文本
+// 注意：thinkTagSafeOpen 仅用于历史兼容/潜在扩展，当前消毒流程只产出 thinkTagSafeClose
+// （裸开标签无害，见 sanitizeThinkTags 注释）
 const (
 	thinkTagOpen      = "<thinking>"
 	thinkTagClose     = "</thinking>"
@@ -3926,9 +6182,10 @@ type thinkTagState struct {
 // 从左到右扫描片段，维护跨片段配对状态 st，只替换"裸"标签（无配对的）：
 //
 //	裸 </thinking>    → [THINK-END]
-//	（裸 <thinking> 由非流式入口在收尾时统一处理）
 //
-// 配对完整的 <thinking>...</thinking> 原样保留（可能是教学示例，不误伤）。
+// 裸 <thinking> 一律原样保留（它不会导致上游截断历史，本身无害；
+// 无差别替换会让包含该字面文本的正常对话反复误报）。
+// 配对完整的 <thinking>...</thinking> 同样原样保留（配对标签不触发上游截断）。
 // 返回 (处理后的片段, 是否发生了替换)。
 func sanitizeThinkTagsInc(st *thinkTagState, s string) (string, bool) {
 	if strings.Index(s, thinkTagOpen) < 0 && strings.Index(s, thinkTagClose) < 0 {
@@ -3969,23 +6226,19 @@ func sanitizeThinkTagsInc(st *thinkTagState, s string) (string, bool) {
 }
 
 // sanitizeThinkTags 非流式思考标签消毒（一次性处理完整文本）：
-// 先按配对状态机处理，收尾时把仍未配对的 <thinking>（反向泄漏，如教学示例
-// "<thinking>xxx" 无闭标签）从右往左替换为 [THINK-START]。
+// 与流式路径 sanitizeThinkTagsInc 保持完全一致——**只替换裸闭标签**。
+//
+// 为什么不再处理裸开标签（早期版本会用 LastIndex 反向替换）：
+//   - 上游渲染器只在裸 </thinking> 处截断历史（deepseek3.go 的 SplitN(content,"</thinking>",2)），
+//     裸 <thinking> 只是普通文本，不会造成上下文丢失，本身无害
+//   - 但正常对话中出现单独 <thinking> 字面量的场景极为常见
+//     （如技术文档、功能说明、读取源码时工具返回的内容），无差别替换会让实时记录每轮都亮
+//     「请求侧思考标签消毒」徽章，掩盖真正的异常信号
+//   - 流式路径本来就不处理裸开标签，两侧保持一致才能避免"流式漏进去 → 请求侧反复命中"的循环
+//
 // 返回 (处理后的文本, 是否发生了替换)。
 func sanitizeThinkTags(s string) (string, bool) {
-	st := &thinkTagState{}
-	out, modified := sanitizeThinkTagsInc(st, s)
-	// 反向泄漏：结尾有未配对的 <thinking>，从右往左替换最后的 openBalance 个
-	for st.openBalance > 0 {
-		idx := strings.LastIndex(out, thinkTagOpen)
-		if idx < 0 {
-			break
-		}
-		out = out[:idx] + thinkTagSafeOpen + out[idx+len(thinkTagOpen):]
-		st.openBalance--
-		modified = true
-	}
-	return out, modified
+	return sanitizeThinkTagsInc(&thinkTagState{}, s)
 }
 
 // sanitizeContentField 对消息的 content/system 字段做思考标签消毒：
@@ -4019,10 +6272,20 @@ func sanitizeContentField(msg map[string]interface{}, field string) bool {
 }
 
 // sanitizeMessagesThinkTags 对请求体做思考标签消毒（请求侧防护）：
-// 遍历 messages 数组（OpenAI/Ollama/Anthropic 三种格式通用）与 Anthropic 顶层 system 字段，
-// 把客户端历史里已污染的裸 </thinking> 替换为安全文本，防止上游 prompt 渲染器截断
+// 按 roles 指定的角色遍历 messages 数组（OpenAI/Ollama/Anthropic 三种格式通用），
+// 以及（roles.System 开启时的）Anthropic 顶层 system 字段，
+// 把客户端历史里已污染的裸标签替换为安全文本，防止上游 prompt 渲染器截断
 // assistant 历史导致死循环。返回 (处理后的请求体, 是否发生了替换)。
-func sanitizeMessagesThinkTags(body []byte) ([]byte, bool) {
+//
+// 为什么要按角色过滤：死循环的真正污染源是 assistant 历史被回放后遭上游截断；
+// tool（工具输出）/user/system 里的裸标签多属内容的一部分（如读取源码时工具返回的文本），
+// 无差别处理会让实时记录每轮都亮「请求侧思考标签消毒」徽章，掩盖真正的异常信号。
+func sanitizeMessagesThinkTags(body []byte, roles thinkTagRoles) ([]byte, bool) {
+	// [高并发内存安全] 预检门禁：请求体里根本没有裸思考标签时直接返回，
+	// 不做整体反序列化。带图片的请求体极大，每省一次 map 物化就省一整份 base64 副本。
+	if !bytes.Contains(body, []byte(thinkTagOpen)) && !bytes.Contains(body, []byte(thinkTagClose)) {
+		return body, false
+	}
 	var req map[string]interface{}
 	if json.Unmarshal(body, &req) != nil {
 		return body, false
@@ -4034,13 +6297,17 @@ func sanitizeMessagesThinkTags(body []byte) ([]byte, bool) {
 			if !ok {
 				continue
 			}
+			role, _ := msg["role"].(string)
+			if !roles.allows(role) {
+				continue
+			}
 			if sanitizeContentField(msg, "content") {
 				modified = true
 			}
 		}
 	}
-	// Anthropic 顶层 system 字段（string 或数组块）
-	if sanitizeContentField(req, "system") {
+	// Anthropic 顶层 system 字段（string 或数组块）——属于 system 角色
+	if roles.System && sanitizeContentField(req, "system") {
 		modified = true
 	}
 	if !modified {
@@ -4050,8 +6317,29 @@ func sanitizeMessagesThinkTags(body []byte) ([]byte, bool) {
 	if err != nil {
 		return body, false
 	}
-	fmt.Println("🛡️ 思考标签消毒: 请求历史含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])")
+	fmt.Printf("🛡️ 思考标签消毒: 请求历史(角色 %s)含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n", roles.describe())
 	return newBody, true
+}
+
+// describe 生成角色列表文案，用于日志（如 "assistant,tool"）。
+func (t thinkTagRoles) describe() string {
+	parts := make([]string, 0, 4)
+	if t.Assistant {
+		parts = append(parts, "assistant")
+	}
+	if t.User {
+		parts = append(parts, "user")
+	}
+	if t.System {
+		parts = append(parts, "system")
+	}
+	if t.Tool {
+		parts = append(parts, "tool")
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
 }
 
 // dedupStreamContent 对单个流式内容块做去重处理。
@@ -4110,19 +6398,108 @@ func dedupStreamContent(content string, full *strings.Builder, last *string, dup
 //   ② 跨请求复读：请求签名（最后一条 user 消息）与回复都与上一轮相同（Agent 死循环特征）
 // 处理：纯检测模式原样透传 + 标记跨请求警告；去重模式额外截断为前半段
 
-// 非流式跨请求复读记录：key → 上一轮 (请求签名, 回复)
+// 跨请求复读记录：key → 上一轮 (请求签名摘要, 回复摘要)
+//
+// [内存安全 + 精确判断] 早期实现把「完整请求签名 + 完整回复全文」存进 map，
+// key 是 IP+UA指纹|模型 —— 每多一个客户端/模型就永久多占一份全文，
+// 长回复叠加高并发后会持续吃掉内存，是进程被 OOM 静默杀掉的元凶之一。
+//
+// 但单纯把全文「截断到 8192 字符」又会引入判定偏差：
+// 两次回复只要「前 8192 字符相同、后面不同」就会被误判为复读
+// （开启 Dedup 时甚至会真的把正常内容截断成一半，属于误伤）。
+//
+// 因此改为只存 SHA-256 摘要（各 32 字节）：
+//
+//	① 判断精度 100%：摘要比对等价于全文比对，不存在截断导致的误报
+//	② 内存量级：256 条 × 64 字节 ≈ 16KB，与回复长短完全无关
+//	③ 天然免疫超长回复，不需要任何长度上限
+//
+// 仍保留条数上限与有效期，保证 map 与内存总量有确定上界。
+// 两个上限均由配置项控制（DoomLoopProtection.RepeatMaxEntries / RepeatTTLMin），
+// 默认值与上下界见 defaultRepeatMaxEntries / maxRepeatMaxEntries 等常量。
 var lastReplies = struct {
 	sync.Mutex
 	m map[string]lastReplyEntry
 }{m: make(map[string]lastReplyEntry)}
 
 type lastReplyEntry struct {
-	reqSig string
-	reply  string
+	reqSigHash [32]byte // 上一轮请求签名（最后一条 user 消息）的 SHA-256
+	replyHash  [32]byte // 上一轮回复全文的 SHA-256
+	at         time.Time
+}
+
+// replyDigest 计算用于复读比对的摘要。
+// 用 SHA-256 代替全文：既与「全文精确比对」完全等价（不含任何截断偏差），
+// 又把每条记录的内存占用从「回复长度」压缩到固定 32 字节。
+func replyDigest(s string) [32]byte {
+	return sha256.Sum256([]byte(s))
+}
+
+// getLastReply 读取指定会话的上一轮记录。
+// 返回 ok=false 表示无记录或已超过有效期（调用方应按「无上一轮」处理）。
+func getLastReply(key string) (lastReplyEntry, bool) {
+	lastReplies.Lock()
+	defer lastReplies.Unlock()
+	e, found := lastReplies.m[key]
+	if !found {
+		return lastReplyEntry{}, false
+	}
+	// 启用有效期限制且已超时才视为陈旧
+	if ttl, ok := repeatTTL(); ok && time.Since(e.at) > ttl {
+		return lastReplyEntry{}, false
+	}
+	return e, true
+}
+
+// setLastReply 写入指定会话的上一轮记录（只存摘要，不存原文）。
+// 超限时先清理过期项，仍超限则淘汰最旧的一条，保证 map 大小有硬上限。
+func setLastReply(key, reqSig, reply string) {
+	if reply == "" {
+		return
+	}
+	now := time.Now()
+	entry := lastReplyEntry{
+		reqSigHash: replyDigest(reqSig),
+		replyHash:  replyDigest(reply),
+		at:         now,
+	}
+
+	lastReplies.Lock()
+	defer lastReplies.Unlock()
+	limit, limitOn := repeatEntryLimit()
+	ttl, ttlOn := repeatTTL()
+	// 启用条数限制时才裁剪；先清过期项，仍超限则淘汰最旧
+	if limitOn && len(lastReplies.m) >= limit {
+		for k, e := range lastReplies.m {
+			if ttlOn && now.Sub(e.at) > ttl {
+				delete(lastReplies.m, k)
+			}
+		}
+		if len(lastReplies.m) >= limit {
+			oldestKey := ""
+			var oldestAt time.Time
+			first := true
+			for k, e := range lastReplies.m {
+				if first || e.at.Before(oldestAt) {
+					oldestKey, oldestAt, first = k, e.at, false
+				}
+			}
+			if oldestKey != "" {
+				delete(lastReplies.m, oldestKey)
+			}
+		}
+	}
+	lastReplies.m[key] = entry
 }
 
 // reqSignature 生成请求签名：取最后一条 user 消息内容（用于跨请求复读对比）
 func reqSignature(body []byte) string {
+	// [高并发内存安全] 请求签名只服务于跨请求复读检测（RepeatCheck 子开关，默认关）。
+	// 未开启时直接返回空串，避免把整份大请求体（带图片时数十 MB）物化成 map，
+	// 白占一份 base64 副本。调用方均能在 reqSig=="" 时正常降级。
+	if !cfg.DoomLoopProtection.Enable || !cfg.DoomLoopProtection.RepeatCheck {
+		return ""
+	}
 	var req map[string]interface{}
 	if json.Unmarshal(body, &req) != nil {
 		return ""
@@ -4207,12 +6584,11 @@ func dedupNonStreamContent(content, reqSig, key string) (string, string) {
 		}
 	}
 
-	// ② 跨请求复读：请求签名 + 回复都与上一轮相同（独立子开关 RepeatCheck 控制）
+	// ② 跨请求复读：请求签名 + 回复都与上一轮相同（独立子开关 RepeatCheck 控制）。
+	// 摘要比对等价于全文精确比对，不会因为超长回复被截断而误判
 	if cfg.DoomLoopProtection.RepeatCheck {
-		lastReplies.Lock()
-		prev := lastReplies.m[key]
-		lastReplies.Unlock()
-		if reqSig != "" && prev.reqSig == reqSig && prev.reply != "" && prev.reply == content {
+		prev, found := getLastReply(key)
+		if found && reqSig != "" && prev.reqSigHash == replyDigest(reqSig) && prev.replyHash == replyDigest(content) {
 			fmt.Printf("🚨 末日循环保护: 检测到跨请求复读 (请求与回复均与上一轮相同)\n")
 			markRepeatWarning(key)
 			reasons = append(reasons, "cross")
@@ -4223,10 +6599,10 @@ func dedupNonStreamContent(content, reqSig, key string) (string, string) {
 		}
 	}
 
-	// 更新记录（记录处理后的内容，客户端实际收到的）
-	lastReplies.Lock()
-	lastReplies.m[key] = lastReplyEntry{reqSig: reqSig, reply: content}
-	lastReplies.Unlock()
+	// 更新记录（仅跨请求复读检测需要；只存摘要，不存原文，内存与回复长短无关）
+	if cfg.DoomLoopProtection.RepeatCheck {
+		setLastReply(key, reqSig, content)
+	}
 
 	return content, strings.Join(reasons, ",")
 }
@@ -4239,18 +6615,14 @@ func checkStreamRepeat(fullText, reqSig, key string) bool {
 	if !cfg.DoomLoopProtection.Enable || !cfg.DoomLoopProtection.RepeatCheck || fullText == "" {
 		return false
 	}
-	lastReplies.Lock()
-	prev := lastReplies.m[key]
-	lastReplies.Unlock()
-	repeated := reqSig != "" && prev.reqSig == reqSig && prev.reply != "" && prev.reply == fullText
+	prev, found := getLastReply(key)
+	repeated := found && reqSig != "" && prev.reqSigHash == replyDigest(reqSig) && prev.replyHash == replyDigest(fullText)
 	if repeated {
 		fmt.Printf("🚨 末日循环保护: 检测到跨请求复读 (流式, 请求与回复均与上一轮相同)\n")
 		markRepeatWarning(key)
 	}
-	// 更新记录（记录本轮全文，供下一轮对比）
-	lastReplies.Lock()
-	lastReplies.m[key] = lastReplyEntry{reqSig: reqSig, reply: fullText}
-	lastReplies.Unlock()
+	// 更新记录（记录本轮全文的摘要，供下一轮对比；只存摘要，不存原文）
+	setLastReply(key, reqSig, fullText)
 	return repeated
 }
 
@@ -4357,8 +6729,8 @@ func fetchUpstreamModelMeta() map[string]upstreamModelMeta {
 		}
 
 		info := upstreamModelMeta{
-			ContextLength:   DefaultContextLength,
-			MaxOutputTokens: DefaultMaxOutputTokens,
+			ContextLength:   defaultContextLength(),
+			MaxOutputTokens: defaultMaxOutputTokens(),
 		}
 		ctxLen, maxOut := extractModelLimits(modelData)
 		if ctxLen > 0 {
@@ -5030,8 +7402,8 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 
 	var messages []interface{}
 	if rawMessages, ok := req["messages"].([]interface{}); ok {
-		// 将 Ollama 格式的消息转为 OpenAI 格式
-		messages = convertMessagesToOpenAI(rawMessages)
+		// 将 Ollama 格式的消息转为 OpenAI 格式（同时按会话+模型补齐 reasoning_content）
+		messages = convertMessagesToOpenAI(rawMessages, r, model)
 	} else if prompt, ok := req["prompt"].(string); ok {
 		messages = []interface{}{
 			map[string]interface{}{"role": "user", "content": prompt},
@@ -5125,7 +7497,7 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 	// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 	// 上游泄漏的裸 <thinking>/</thinking> 标签在发给客户端前替换为安全文本，
 	// 防止脏标签进入客户端历史后回放给上游导致渲染器截断历史
-	if cfg.DoomLoopProtection.ThinkTag && content != "" {
+	if thinkTagResponseEnabled() && content != "" {
 		if s, ok := sanitizeThinkTags(content); ok {
 			fmt.Printf("🛡️ 思考标签消毒: 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
 			content = s
@@ -5142,9 +7514,9 @@ func ollamaChat(w http.ResponseWriter, r *http.Request) {
 		markDlpReason(r, reason)
 	}
 
-	// 保存 reasoning_content，供后续请求自动注入
+	// 保存本轮 reasoning_content（按会话+模型隔离），供该模型下一轮请求兜底注入
 	if reasoningContent != "" {
-		setLastReasoningContent(reasoningContent)
+		setLastReasoning(r, model, reasoningContent)
 	}
 
 	// 提取上游 usage（真实 token 计数）
@@ -5444,7 +7816,7 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 			// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
 			// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
-			if cfg.DoomLoopProtection.ThinkTag {
+			if thinkTagResponseEnabled() {
 				if s, ok := sanitizeThinkTagsInc(ttState, content); ok {
 					content = s
 					ttCleaned = true
@@ -5549,9 +7921,9 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 		sendOllamaChunk("", true, outputTokens, nil, reasoningContent.String())
 	}
 
-	// 保存 reasoning_content，供后续请求自动注入
+	// 保存本轮 reasoning_content（按会话+模型隔离），供该模型下一轮请求兜底注入
 	if rc := reasoningContent.String(); rc != "" {
-		setLastReasoningContent(rc)
+		setLastReasoning(r, model, rc)
 	}
 
 	// 末日循环保护：思考标签消毒汇总（每轮一条日志，避免逐块刷屏）
@@ -5571,11 +7943,16 @@ func ollamaChatStream(w http.ResponseWriter, r *http.Request, payload map[string
 func openaiChat(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 
-	// 判断是否为流式请求
+	// 判断是否为流式请求（同时取出模型 ID，供 reasoning 按模型隔离使用）
 	var reqMeta struct {
-		Stream bool `json:"stream"`
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
 	}
 	json.Unmarshal(body, &reqMeta)
+
+	// DeepSeek 思考模式：OpenAI 协议是透传路径（不走 convertMessagesToOpenAI），
+	// 在此统一补齐 reasoning_content —— 放在流式分派之前，流式/非流式都能覆盖。
+	body = injectReasoningIntoOpenAIBody(body, r, reqMeta.Model)
 
 	if reqMeta.Stream {
 		openaiChatStream(w, r, body)
@@ -5604,7 +7981,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 	// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 	// 上游泄漏的裸 <thinking>/</thinking> 标签在发给客户端前替换为安全文本，
 	// 防止脏标签进入客户端历史后回放给上游导致渲染器截断历史
-	if cfg.DoomLoopProtection.ThinkTag {
+	if thinkTagResponseEnabled() {
 		var ttResp map[string]interface{}
 		if err := json.Unmarshal(raw, &ttResp); err == nil {
 			if choices, ok := ttResp["choices"].([]interface{}); ok && len(choices) > 0 {
@@ -5657,7 +8034,7 @@ func openaiChat(w http.ResponseWriter, r *http.Request) {
 			if choice, ok := choices[0].(map[string]interface{}); ok {
 				if msg, ok := choice["message"].(map[string]interface{}); ok {
 					if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
-						setLastReasoningContent(rc)
+						setLastReasoning(r, reqMeta.Model, rc)
 						// VS Code 兼容：将 reasoning_content 映射为 reasoning_text
 						if _, exists := msg["reasoning_text"]; !exists {
 							msg["reasoning_text"] = rc
@@ -5794,16 +8171,30 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 	// usage 追踪：上游流式可能只在末尾发 usage-only chunk，也可能完全不发，
 	// 需要记录并转发/兜底，保证 VS Code 上下文窗口占用显示不为 0
 	hasUpstreamUsage := false
-	// 预解析请求消息列表，用于上游未返回 usage 时的本地估算兜底
+	// 预解析请求消息列表（用于 usage 兜底估算）与模型 ID（用于 reasoning 按模型隔离）
 	var requestMessages []interface{}
+	requestModel := ""
 	{
 		var reqMeta struct {
+			Model    string        `json:"model"`
 			Messages []interface{} `json:"messages"`
 		}
 		if json.Unmarshal(body, &reqMeta) == nil {
 			requestMessages = reqMeta.Messages
+			requestModel = reqMeta.Model
 		}
 	}
+
+	// 累积本轮 reasoning_content，供【同会话同模型】的下一轮请求兜底注入。
+	// 用 defer 保证无论从哪个分支 return（含熔断提前返回）都能保存。
+	// 无条件累积（不因 thinkingDone 后删字段而丢失）：与 ollamaChatStream 保持一致，
+	// 正文开始后上游仍可能交错输出思考碎片，这些也属于本轮推理内容。
+	var reasoningAccum strings.Builder
+	defer func() {
+		if rc := reasoningAccum.String(); rc != "" {
+			setLastReasoning(r, requestModel, rc)
+		}
+	}()
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -5901,12 +8292,16 @@ func openaiChatStream(w http.ResponseWriter, r *http.Request, body []byte) {
 				var deltaMap map[string]interface{}
 				if err := json.Unmarshal(choice.Delta, &deltaMap); err == nil {
 					delta = deltaMap
+					// 累积本轮推理内容（在 thinkingDone 删除字段前取，避免漏记）
+					if rc, ok := deltaMap["reasoning_content"].(string); ok && rc != "" {
+						reasoningAccum.WriteString(rc)
+					}
 					// 检查是否已有 content → 标记 thinking 结束
 					if c, ok := deltaMap["content"].(string); ok && c != "" {
 						// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 						// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
 						// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
-						if cfg.DoomLoopProtection.ThinkTag {
+						if thinkTagResponseEnabled() {
 							if s, ok2 := sanitizeThinkTagsInc(ttState, c); ok2 {
 								c = s
 								ttCleaned = true
@@ -6489,7 +8884,7 @@ func anthropicMessagesStream(w http.ResponseWriter, r *http.Request, areq *Anthr
 			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 			// 在去重前处理：上游泄漏的裸思考标签替换为安全文本，防止脏历史进入客户端；
 			// 跨块配对状态机保证配对的 <thinking>...</thinking> 被拆块时不误伤
-			if cfg.DoomLoopProtection.ThinkTag {
+			if thinkTagResponseEnabled() {
 				if s, ok := sanitizeThinkTagsInc(ttState, deltaContent); ok {
 					deltaContent = s
 					ttCleaned = true
@@ -7055,7 +9450,7 @@ func convertOpenAIToAnthropic(r *http.Request, raw []byte, model string, reqBody
 
 			// 末日循环保护：思考标签消毒（ollama cloud 死循环根因防护）
 			// 上游泄漏的裸思考标签在 Anthropic 转换前替换为安全文本
-			if cfg.DoomLoopProtection.ThinkTag && textContent != "" {
+			if thinkTagResponseEnabled() && textContent != "" {
 				if s, ok := sanitizeThinkTags(textContent); ok {
 					fmt.Printf("🛡️ 思考标签消毒: Anthropic 响应含裸思考标签，已替换为安全文本 ([THINK-START]/[THINK-END])\n")
 					textContent = s
@@ -7204,7 +9599,7 @@ func toAnthropicStopReason(fr string) string {
 
 // -------------------- OpenAI API: /v1/models --------------------
 func openaiModels(w http.ResponseWriter, r *http.Request) {
-	req, _ := http.NewRequest("GET", cfg.OpenAIBase+"/models", nil)
+	req, _ := http.NewRequestWithContext(r.Context(), "GET", cfg.OpenAIBase+"/models", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
 	client := &http.Client{Transport: getSharedTransport()}
@@ -7218,8 +9613,230 @@ func openaiModels(w http.ResponseWriter, r *http.Request) {
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Printf("UPSTREAM MODELS [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
 
+	// 补 Anthropic 兼容字段（type / display_name / created_at / has_more 等）
+	raw = enhanceModelsListCompat(raw)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
+}
+
+// modelCreatedAt 本地模型对象的 created / created_at 时间基准。
+//
+// 为什么固定在进程内：OpenAI 规范里 created 表示模型「最后修改时间」，
+// 若每次请求都返回 time.Now()，客户端可能误判模型发生变化而反复刷新模型列表。
+// 进程内固定一个值既稳定又无需额外请求上游。
+var modelCreatedAt = time.Now()
+
+// enhanceModelsListCompat 给上游模型列表补充 Anthropic 兼容字段。
+//
+// 为什么需要：/v1/models 这个路径同时被 OpenAI 与 Anthropic 两套客户端使用，
+// 但两者期望的响应字段不同：
+//   - OpenAI   ：{object:"list", data:[{id, object:"model", created, owned_by}]}
+//   - Anthropic：{data:[{type:"model", id, display_name, created_at}], has_more, first_id, last_id}
+//
+// 上游一般只返回 OpenAI 格式，Anthropic 客户端（Claude Code / anthropic-sdk）
+// 拿不到 type / display_name / created_at / has_more 时会解析失败。
+//
+// 这里只「补字段」不「删字段」：OpenAI 客户端会忽略未知字段，
+// 因此一份超集响应可以同时满足两套客户端。解析失败时原样返回（绝不破坏透传）。
+func enhanceModelsListCompat(raw []byte) []byte {
+	if len(raw) == 0 {
+		return raw
+	}
+	var top map[string]interface{}
+	if json.Unmarshal(raw, &top) != nil {
+		return raw
+	}
+	data, ok := top["data"].([]interface{})
+	if !ok {
+		return raw
+	}
+
+	nowRFC := modelCreatedAt.UTC().Format(time.RFC3339)
+	firstID, lastID := "", ""
+	touched := false
+	for _, item := range data {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		id, _ := m["id"].(string)
+		if _, has := m["object"]; !has {
+			m["object"] = "model"
+			touched = true
+		}
+		if _, has := m["type"]; !has {
+			m["type"] = "model"
+			touched = true
+		}
+		if _, has := m["display_name"]; !has {
+			m["display_name"] = id
+			touched = true
+		}
+		if _, has := m["created_at"]; !has {
+			m["created_at"] = nowRFC
+			touched = true
+		}
+		if firstID == "" {
+			firstID = id
+		}
+		lastID = id
+	}
+	if _, has := top["has_more"]; !has {
+		top["has_more"] = false
+		touched = true
+	}
+	if _, has := top["first_id"]; !has {
+		if firstID == "" {
+			top["first_id"] = nil
+		} else {
+			top["first_id"] = firstID
+		}
+		touched = true
+	}
+	if _, has := top["last_id"]; !has {
+		if lastID == "" {
+			top["last_id"] = nil
+		} else {
+			top["last_id"] = lastID
+		}
+		touched = true
+	}
+	if !touched {
+		return raw
+	}
+
+	// 用 Encoder + SetEscapeHTML(false)，避免中文/特殊字符被转义得面目全非
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(top); err != nil {
+		return raw
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n")
+}
+
+// -------------------- OpenAI API: /v1/models/{model} --------------------
+// OpenAI 规范的「查询单个模型」接口（GET /v1/models/{model}）。
+//
+// 为什么必须本地实现：部分客户端（Visual Studio 2026 的 BYOM 等）除了 GET /v1/models
+// 拉列表之外，还会单独查询某个模型的详情。早期版本没有这条路由 → 落到 default 分支
+// 原样转发上游，而 OPENAI_BASE 通常已经以 /v1 结尾，拼出来变成 /v1/v1/models/xxx，
+// 上游直接报 Invalid URL (GET /v1/v1/models/xxx)。
+//
+// 这里不依赖上游是否支持该端点：本地按模型元数据构建标准 OpenAI Model 对象，
+// 并附带上下文长度 / 最大输出 / 能力列表等扩展字段（对不认识它们的客户端无害）。
+func openaiModelGet(w http.ResponseWriter, r *http.Request, modelParam string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	modelID := strings.TrimSpace(modelParam)
+	if modelID == "" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "缺少模型 ID：GET /v1/models/{model}",
+				"type":    "invalid_request_error",
+				"param":   "model",
+				"code":    "invalid_model",
+			},
+		})
+		return
+	}
+
+	// 元数据查询用上游真实模型 ID（剥离显示前缀/后缀 + 反查别名），
+	// 响应里的 id 仍回客户端请求时用的名字，与 /v1/models 列表保持一致。
+	upstreamID := displayNameToUpstreamID(modelID)
+	ctxLen, maxOut := getModelMetaFor(upstreamID)
+	caps := getModelCapabilities(upstreamID)
+	hasVision := hasCapability(caps, "vision")
+	hasTools := hasCapability(caps, "tools")
+
+	out := map[string]interface{}{
+		"id": modelID,
+		// OpenAI 规范字段
+		"object":   "model",
+		"created":  modelCreatedAt.Unix(),
+		"owned_by": "library", // 与 Ollama 官方口径一致（Ollama 默认返回 library）
+		// Anthropic 规范字段：同一路径 /v1/models/{model} 也被 Anthropic 客户端使用
+		// （Claude Code / anthropic-sdk 读取 type / display_name / created_at）
+		"type":         "model",
+		"display_name": modelID,
+		"created_at":   modelCreatedAt.UTC().Format(time.RFC3339),
+		// 扩展字段：上下文长度与输出上限（VS2026 / 部分客户端会读取）
+		"context_length":        ctxLen,
+		"context_window":        ctxLen,
+		"prompt_tokens":         ctxLen,
+		"completion_tokens":     ctxLen,
+		"total_tokens":          ctxLen,
+		"max_input_tokens":      ctxLen,
+		"max_output_tokens":     maxOut,
+		"max_completion_tokens": maxOut,
+		"num_ctx":               ctxLen,
+		"capabilities":          caps,
+		// 扁平键：部分客户端按字面 key 取值
+		"capabilities.supports.vision":    hasVision,
+		"capabilities.supports.tools":     hasTools,
+		"capabilities.supports.reasoning": true,
+		"supports_vision":                 hasVision,
+		"supports_tools":                  hasTools,
+		"supports_reasoning":              true,
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		return
+	}
+	json.NewEncoder(w).Encode(out)
+}
+
+// displayNameToUpstreamID 把客户端使用的显示名还原为上游真实模型 ID：
+// 先剥离 OpenAI_Prefix / OpenAI_Suffix，再按 ModelAlias 反查（别名 → 上游 ID）。
+// 用于本地查询模型元数据（ModelDetailedSettings / 上游 /v1/models 都以上游 ID 为键）。
+func displayNameToUpstreamID(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	clean := name
+	if cfg.OpenAIPrefix != "" {
+		clean = strings.TrimPrefix(clean, cfg.OpenAIPrefix)
+	}
+	if cfg.OpenAISuffix != "" {
+		clean = strings.TrimSuffix(clean, cfg.OpenAISuffix)
+	}
+	clean = strings.TrimSpace(clean)
+	// 别名反查：ModelAlias 的 key 是上游模型 ID，value 是显示名称
+	for upstreamID, alias := range cfg.ModelAlias {
+		if a := strings.TrimSpace(alias); a != "" && a == clean {
+			return upstreamID
+		}
+	}
+	if clean != "" {
+		return clean
+	}
+	return name
+}
+
+// joinUpstreamURL 拼接上游地址，避免版本前缀重复。
+// 典型场景：OPENAI_BASE = "https://api.xxx.com/v1" 时，客户端请求 /v1/models/xxx 若直接
+// 拼成 base+path，会得到 /v1/v1/models/xxx 而被上游判为 Invalid URL。
+func joinUpstreamURL(base, path string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if path == "" {
+		return base
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	// base 已以 /v1 结尾 → 去掉 path 的 /v1 前缀（大小写不敏感）
+	if strings.HasSuffix(strings.ToLower(base), "/v1") && strings.HasPrefix(strings.ToLower(path), "/v1/") {
+		path = path[len("/v1"):]
+	}
+	return base + path
 }
 
 func ollamaVersion(w http.ResponseWriter, r *http.Request) {
@@ -7234,7 +9851,7 @@ func ollamaVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func openaiModelsLegacy(w http.ResponseWriter, r *http.Request) {
-	req, _ := http.NewRequest("GET", cfg.OpenAIBase+"/models", nil)
+	req, _ := http.NewRequestWithContext(r.Context(), "GET", cfg.OpenAIBase+"/models", nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 
 	client := &http.Client{Transport: getSharedTransport()}
@@ -7247,6 +9864,9 @@ func openaiModelsLegacy(w http.ResponseWriter, r *http.Request) {
 
 	raw, _ := io.ReadAll(resp.Body)
 	fmt.Printf("UPSTREAM LEGACY MODELS [%s]: %s\n", time.Now().Format("15:04:05"), string(raw))
+
+	// 同样补 Anthropic 兼容字段，旧路径也可能被 Anthropic 客户端使用
+	raw = enhanceModelsListCompat(raw)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(raw)
@@ -7284,8 +9904,8 @@ func ollamaTags(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, exists := modelMeta[id]; !exists {
 			info := upstreamModelMeta{
-				ContextLength:   DefaultContextLength,
-				MaxOutputTokens: DefaultMaxOutputTokens,
+				ContextLength:   defaultContextLength(),
+				MaxOutputTokens: defaultMaxOutputTokens(),
 			}
 			// 与 fetchUpstreamModelMeta 共用同一套字段提取逻辑
 			if v, o := extractModelLimits(modelData); v > 0 || o > 0 {
@@ -7392,16 +10012,33 @@ func ollamaShow(w http.ResponseWriter, r *http.Request) {
 	}
 	json.Unmarshal(body, &req)
 
+	// Ollama 官方是 POST /api/show（body 带 model），
+	// 这里额外兼容 REST 风格的 GET /api/show?model=xxx / ?name=xxx，
+	// 方便只会发 GET 的客户端也能查到单模型详情。
+	if req.Model == "" {
+		req.Model = r.URL.Query().Get("model")
+	}
+	if req.Model == "" {
+		req.Model = r.URL.Query().Get("name")
+	}
+
 	modelID := req.Model
 	if modelID == "" {
 		modelID = "deepseek-v4-pro"
 	}
 
-	// 从上游获取该模型的元数据
+	// 从上游获取该模型的元数据（上游不可达 / 未返回元数据时用默认值兜底，
+	// 与 ollamaTags 保持一致，避免客户端拿到 context_length=0 而误判模型不可用）
 	meta := fetchUpstreamModelMeta()
 	modelMeta := meta[modelID]
 	ctxLen := modelMeta.ContextLength
 	maxOut := modelMeta.MaxOutputTokens
+	if ctxLen <= 0 {
+		ctxLen = defaultContextLength()
+	}
+	if maxOut <= 0 {
+		maxOut = defaultMaxOutputTokens()
+	}
 
 	// 获取该模型的能力列表：优先使用 ModelDetailedSettings 中的 Capabilities，否则使用全局 Capabilities
 	modelCaps := cfg.Capabilities
@@ -7490,10 +10127,10 @@ func ollamaPS(w http.ResponseWriter, r *http.Request) {
 		ctxLen := meta.ContextLength
 		maxOut := meta.MaxOutputTokens
 		if ctxLen <= 0 {
-			ctxLen = DefaultContextLength
+			ctxLen = defaultContextLength()
 		}
 		if maxOut <= 0 {
-			maxOut = DefaultMaxOutputTokens
+			maxOut = defaultMaxOutputTokens()
 		}
 
 		// 显示名称：优先使用 ModelAlias 中的别名，否则用上游 ID，再套上前后缀
@@ -7550,37 +10187,20 @@ func hasImageInBody(body []byte) bool {
 	if len(body) == 0 {
 		return false
 	}
-	var req map[string]interface{}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return false
-	}
-	// 检查 messages 数组
-	messages, _ := req["messages"].([]interface{})
-	for _, msg := range messages {
-		msgMap, _ := msg.(map[string]interface{})
-		if msgMap == nil {
-			continue
-		}
-		// Ollama images 数组
-		if images, _ := msgMap["images"].([]interface{}); len(images) > 0 {
+	// [高并发内存安全] 不要用 json.Unmarshal 到 map[string]interface{} 来判断有没有图片：
+	// 带图片的请求体里 base64 动辄数十 MB，物化成 interface{} 会额外复制一整套字符串，
+	// 而本函数只需要回答「是不是带图请求」（仅用于日志图标）。改为字节级标记扫描，零分配。
+	// 四种载体：OpenAI image_url data URI / OpenAI 图片块 / Ollama 图片块 / Ollama images 数组。
+	for _, marker := range [][]byte{
+		[]byte("data:image/"),
+		[]byte(`"image_url"`),
+		[]byte(`"image_base64"`),
+		[]byte(`"images"`),
+	} {
+		if bytes.Contains(body, marker) {
 			return true
 		}
-		// content 数组中的图片块
-		if contentArr, _ := msgMap["content"].([]interface{}); len(contentArr) > 0 {
-			for _, block := range contentArr {
-				blockMap, _ := block.(map[string]interface{})
-				if blockMap == nil {
-					continue
-				}
-				switch blockMap["type"] {
-				case "image", "image_url":
-					return true
-				}
-			}
-		}
 	}
-	// Anthropic /v1/messages 格式（顶层 content 数组已在 messages 中处理）
-	// Anthropic system 字段也可能含图片（较少见，不做额外处理）
 	return false
 }
 
@@ -7591,6 +10211,13 @@ func hasImageInBody(body []byte) bool {
 // 返回 (处理后的请求体, 是否发生了还原)
 func stripModelPrefixSuffix(body []byte) ([]byte, bool) {
 	if len(body) == 0 || (cfg.OpenAIPrefix == "" && cfg.OpenAISuffix == "") {
+		return body, false
+	}
+	// [高并发内存安全] 预检门禁：请求体里连前缀/后缀字符串都未出现，必然无需剥离，
+	// 直接跳过整体反序列化（超大带图片请求体因此完全不会被 map 物化）。
+	needPrefix := cfg.OpenAIPrefix != "" && bytes.Contains(body, []byte(cfg.OpenAIPrefix))
+	needSuffix := cfg.OpenAISuffix != "" && bytes.Contains(body, []byte(cfg.OpenAISuffix))
+	if !needPrefix && !needSuffix {
 		return body, false
 	}
 
@@ -7670,6 +10297,11 @@ func assistantMsgSignature(m map[string]interface{}) string {
 // 签名 = content + tool_calls(name+arguments)；空 content 且无 tool_calls 的消息跳过。
 // 连续（中间只有 tool 消息）出现 2 条相同签名的 assistant 消息 → 判定循环。
 func detectAssistantLoop(body []byte) bool {
+	// [高并发内存安全] 预检门禁：触发条件要求至少两条 assistant 消息签名相同，
+	// 因此 assistant 出现次数 < 2 时不可能命中，直接返回（零分配）。
+	if bytes.Count(body, []byte(`"assistant"`)) < 2 {
+		return false
+	}
 	var req map[string]interface{}
 	if json.Unmarshal(body, &req) != nil {
 		return false
@@ -8017,6 +10649,19 @@ func ruleLogDesc(rule PromptReplaceRule) string {
 }
 
 func logAllRequests(w http.ResponseWriter, r *http.Request) {
+	// 过载保护①：并发闸门。超出上限的请求在此排队（不占内存、不读请求体），
+	// 排队超过 QueueTimeoutSec 或客户端断开则返回 503，避免 goroutine 与内存无限堆积。
+	// 注意：流式请求会长时间持有槽位，这正是并发控制的目的（防止上游/内存被压垮）。
+	if cfg.ProxyLimit.Enable {
+		slot, ok := acquireProxySlot(r.Context())
+		if !ok {
+			fmt.Printf("🛡️ 过载保护: 并发已满，拒绝请求 %s %s (客户端: %s)\n", r.Method, r.URL.Path, clientIP(r))
+			writeOverloadError(w, r, http.StatusServiceUnavailable, "服务繁忙：并发请求已满，请稍后重试（可调大「过载保护」的最大并发数）")
+			return
+		}
+		defer releaseProxySlot(slot)
+	}
+
 	count := atomic.AddInt64(&requestCount, 1)
 	if count >= cfg.Log_Limit {
 		CallClear()
@@ -8024,7 +10669,19 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("🧹 日志已清理")
 	}
 
-	body, _ := io.ReadAll(r.Body)
+	// 过载保护②：请求体大小上限（带图片的请求体可能非常大）。
+	// 超限直接返回 413，不进入任何解析/注入链，避免内存被单个巨大请求吃掉。
+	body, readErr := readRequestBodyLimited(r)
+	if readErr != nil {
+		if errors.Is(readErr, errRequestBodyTooLarge) {
+			fmt.Printf("🛡️ 过载保护: 请求体超过 %d MB，已拒绝 %s %s (客户端: %s)\n", cfg.ProxyLimit.MaxRequestBodyMB, r.Method, r.URL.Path, clientIP(r))
+			// 先把剩余请求体丢掉，否则连接被 RST，客户端看不到 413 错误信息
+			drainRequestBody(r)
+			writeOverloadError(w, r, http.StatusRequestEntityTooLarge, fmt.Sprintf("请求体过大：超过上限 %d MB（可在「过载保护」中调整上限或关闭「限制请求体大小」）", cfg.ProxyLimit.MaxRequestBodyMB))
+			return
+		}
+		body = nil // 读取失败（客户端断开等）：交给后续流程按空请求体处理
+	}
 
 	// 实时请求查看：包装响应写入器（捕获状态码/响应体）并登记「进行中」记录，
 	// 请求结束时由 finish() 更新为最终状态（响应体/耗时/token 用量）
@@ -8105,8 +10762,10 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 	// 末日循环保护：思考标签消毒（请求侧，ollama cloud 死循环根因防护）
 	// 客户端历史里已污染的裸 <thinking>/</thinking> 标签在转发上游前替换为安全文本，
 	// 防止上游 prompt 渲染器在裸 </thinking> 处截断 assistant 历史导致死循环
-	if cfg.DoomLoopProtection.ThinkTag {
-		if newBody, changed := sanitizeMessagesThinkTags(body); changed {
+	// 按配置的生效角色过滤（默认只处理 assistant），避免工具输出/用户消息里的
+	// 字面标签被反复处理造成误报。
+	if thinkTagRequestEnabled() {
+		if newBody, changed := sanitizeMessagesThinkTags(body, currentThinkTagRoles()); changed {
 			body = newBody
 			if rec != nil {
 				rec.addProtection(rtProtThinkTagReq)
@@ -8178,6 +10837,18 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 主模型 GIF 转换（可选）：视觉代理路径已在 applyVisionProxy 内部完成 GIF→PNG 转换，
+	// 这里只处理仍然带图片的请求（主模型原生支持视觉 / 未配置视觉代理）。
+	// 部分上游不接受 GIF（400 invalid image input），按配置在转发前统一转为 PNG 首帧。
+	if curModel.Model != "" {
+		if newBody, changed := normalizeGifInBody(body, curModel.Model); changed {
+			body = newBody
+			if rec != nil {
+				rec.addProtection(rtProtGifNormalize)
+			}
+		}
+	}
+
 	// 把 body 放回去，否则后面 handler 读不到
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
@@ -8210,8 +10881,12 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		anthropicMessages(w, r)
 	case r.URL.Path == "/v1/models":
 		openaiModels(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/models/"): // OpenAI / Anthropic 单模型查询：GET /v1/models/{model}
+		openaiModelGet(w, r, strings.TrimPrefix(r.URL.Path, "/v1/models/"))
 	case r.URL.Path == "/models": // VSCode 旧版 API
 		openaiModelsLegacy(w, r)
+	case strings.HasPrefix(r.URL.Path, "/models/"): // 旧版单模型查询：GET /models/{model}
+		openaiModelGet(w, r, strings.TrimPrefix(r.URL.Path, "/models/"))
 	// case r.URL.Path == "/api/show": // VSCode 旧版 API
 	// 	ollamaShow(w, r)
 	default:
@@ -8221,9 +10896,10 @@ func logAllRequests(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("方法:", r.Method)
 		fmt.Println("================================")
 
-		// 尝试转发到上游
+		// 尝试转发到上游（joinUpstreamURL 会剔除重复的 /v1 前缀，
+		// 避免 OPENAI_BASE 已含 /v1 时拼出 /v1/v1/xxx 被上游判为 Invalid URL）
 		if r.URL.Path != "/" {
-			req, _ := http.NewRequest(r.Method, cfg.OpenAIBase+r.URL.Path, bytes.NewBuffer(body))
+			req, _ := http.NewRequest(r.Method, joinUpstreamURL(cfg.OpenAIBase, r.URL.Path), bytes.NewBuffer(body))
 			req.Header.Set("Authorization", "Bearer "+cfg.OpenAIKey)
 			req.Header.Set("Content-Type", "application/json")
 
@@ -8308,6 +10984,7 @@ func main() {
 	http.HandleFunc("/api/config/logout", apiConfigLogout)
 	http.HandleFunc("/api/config/test", apiTestConfig)
 	http.HandleFunc("/api/config/reveal", apiRevealProxyKeys)
+	http.HandleFunc("/api/config/ca", apiDownloadCA)
 	http.HandleFunc("/api/realtime", handleRealtimeAPI)
 	http.HandleFunc("/api/realtime/events", handleRealtimeEvents)
 
@@ -8319,7 +10996,6 @@ func main() {
 	if cfg.WebConfigPassword != "" {
 		pwHint = "（已启用访问密码 🔒）"
 	}
-	fmt.Println("⚙️ 配置管理页面: http://" + webHost + ":" + cfg.PORT + "/config " + pwHint)
 
 	if cfg.ProxyAPIKeyEnabled {
 		valid := 0
@@ -8336,5 +11012,150 @@ func main() {
 	}
 
 	http.HandleFunc("/", logAllRequests)
-	http.ListenAndServe(cfg.IP+":"+cfg.PORT, nil)
+
+	// [高并发稳定性] 不要直接用 http.ListenAndServe —— 它没有任何超时，
+	// 慢客户端 / 异常连接会无限堆积 goroutine 与文件句柄，高并发下把进程拖死。
+	// 注意：绝对不能设 WriteTimeout，否则 SSE 流式对话与实时记录推送会被中途掐断；
+	// 同理不设 ReadTimeout，避免大上下文请求体上传被中途截断。
+	// 以上参数来自配置页「服务器超时 ServerTimeout」，修改需重启程序生效
+	// （Go 的 http.Server 字段不允许在 Serve 之后修改，无法热更新）。
+	st := normalizeServerTimeout(cfg.ServerTimeout)
+
+	// ==================== 入站端口（HTTP / HTTPS / 混合，可任意组合） ====================
+	// 证书与监听器只能在启动时构建（http.Server / tls.Config 无法在 Serve 之后替换），
+	// 因此「入站加密」相关配置修改需重启程序生效。
+	tlsSt := normalizeServerTLS(cfg.ServerTLS)
+	ports := []inboundPortSpec{{Role: portRoleHTTP, Port: cfg.PORT}}
+	if tlsSt.Enable {
+		ports = effectiveInboundPorts(tlsSt, cfg.PORT)
+	}
+
+	needTLS := false
+	for _, p := range ports {
+		if p.needsTLS() {
+			needTLS = true
+			break
+		}
+	}
+
+	var inboundTLS *tls.Config
+	if needTLS {
+		cfgTLS, err := buildInboundTLSConfig(tlsSt, cfg.IP)
+		if err != nil {
+			fmt.Printf("❌ HTTPS 加密启动失败: %v\n   加密端口已降级为明文 HTTP 服务，请在配置页修正证书设置后重启\n", err)
+			for i := range ports {
+				ports[i].Role = portRoleHTTP
+			}
+		} else {
+			inboundTLS = cfgTLS
+			if info := buildTLSInfo(tlsSt, cfg.IP); info.Fingerprint != "" {
+				fmt.Println("🔐 CA 证书指纹: " + info.Fingerprint + "（有效期至 " + info.NotAfter + "）")
+				fmt.Println("   客户端信任该 CA 后即可用 https:// 访问；配置页「下载 CA 证书」可直接导出")
+				if info.Reissued {
+					fmt.Println("🔐 服务器证书: 已用自定义 CA 重签（" + info.CertFile + "）")
+				}
+				for _, w := range info.Warnings {
+					fmt.Println("⚠️ HTTPS 证书提示: " + w)
+				}
+			}
+		}
+	}
+
+	// 打印端口清单，并挑一个「最适合浏览器打开配置页」的地址做提示
+	webURL := ""
+	for _, p := range ports {
+		addr := cfg.IP + ":" + p.Port
+		switch p.Role {
+		case portRoleMixed:
+			fmt.Printf("🌐 混合端口: %s（同一端口同时支持 HTTP 与 HTTPS，按首字节自动识别）\n", addr)
+			webURL = "https://" + webHost + ":" + p.Port + "/config"
+		case portRoleHTTPS:
+			if tlsSt.HTTPSRedirect {
+				fmt.Printf("🔒 HTTPS 端口: %s（仅加密；用 http:// 访问会自动跳转到 https://）\n", addr)
+			} else {
+				fmt.Printf("🔒 HTTPS 端口: %s（仅加密；明文请求返回 400）\n", addr)
+			}
+			webURL = "https://" + webHost + ":" + p.Port + "/config"
+		default:
+			if inboundTLS == nil {
+				fmt.Printf("🔓 HTTP 端口: %s（明文）\n", addr)
+			} else {
+				fmt.Printf("🔓 HTTP 端口: %s（明文；加密端口在其它端口）\n", addr)
+			}
+			if webURL == "" {
+				webURL = "http://" + webHost + ":" + p.Port + "/config"
+			}
+		}
+	}
+	if webURL == "" {
+		webURL = "http://" + webHost + ":" + cfg.PORT + "/config"
+	}
+	fmt.Println("⚙️ 配置管理页面: " + webURL + " " + pwHint)
+
+	// 逐个端口启动监听：第一个在主 goroutine 阻塞，其余在后台 goroutine
+	for i, p := range ports {
+		serve := func() error { return serveInboundPort(p, st, inboundTLS, tlsSt.HTTPSRedirect) }
+		if i == len(ports)-1 {
+			if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Printf("服务异常退出: %v\n", err)
+			}
+			return
+		}
+		go func(role, port string) {
+			if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Printf("❌ %s 端口 %s 异常退出: %v\n", role, port, err)
+			}
+		}(p.Role, p.Port)
+	}
+}
+
+// serveInboundPort 按端口角色启动监听：
+//
+//	http  → 纯明文 HTTP
+//	https → 纯 TLS；明文请求按 redirect 决定「308 跳转」还是「400 拒绝」
+//	mixed → 同端口协议自适应（HTTP 与 HTTPS 共存）
+func serveInboundPort(p inboundPortSpec, st ServerTimeout, tlsCfg *tls.Config, redirect bool) error {
+	addr := cfg.IP + ":" + p.Port
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("❌ 端口 %s 监听失败（%s）: %v\n", p.Port, p.Role, err)
+		return err
+	}
+
+	// 超时参数沿用「服务器超时 ServerTimeout」
+	var readHeaderTimeout, idleTimeout time.Duration
+	if st.LimitReadHeader {
+		readHeaderTimeout = time.Duration(st.ReadHeaderTimeoutSec) * time.Second
+	}
+	if st.LimitIdle {
+		idleTimeout = time.Duration(st.IdleTimeoutSec) * time.Second
+	}
+	// ⚠ MaxHeaderBytes 特殊：Go 把 0 当作「使用 DefaultMaxHeaderBytes(1MB)」而不是不限制，
+	// 因此不限制时必须显式给一个极大值（约 2GB）。
+	maxHeaderBytes := int(^uint32(0) >> 1)
+	if st.LimitMaxHeader {
+		maxHeaderBytes = st.MaxHeaderMB << 20
+	}
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           nil,               // nil = 使用 http.DefaultServeMux（共享同一套路由）
+		ReadHeaderTimeout: readHeaderTimeout, // 0 = 不限制；只限制请求头读取（慢速攻击防护，不影响流式）
+		IdleTimeout:       idleTimeout,       // 0 = 不限制；空闲 keep-alive 连接超时回收
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+
+	switch p.Role {
+	case portRoleMixed:
+		if tlsCfg == nil {
+			return srv.Serve(ln)
+		}
+		return srv.Serve(newMixedListener(ln, tlsCfg, p.Port))
+	case portRoleHTTPS:
+		if tlsCfg == nil {
+			return srv.Serve(ln)
+		}
+		return srv.Serve(newHTTPSPortListener(ln, tlsCfg, redirect, p.Port))
+	default:
+		return srv.Serve(ln)
+	}
 }

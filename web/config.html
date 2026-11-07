@@ -6,8 +6,29 @@
 <title>Remote Convert Ollama · 配置管理</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Ctext%20x='32'%20y='46'%20font-size='40'%20text-anchor='middle'%3E%F0%9F%90%AD%3C/text%3E%3C/svg%3E">
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--accent2:#1f6feb;--green:#3fb950;--yellow:#d29922;--red:#f85149;--radius:12px}
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--accent2:#1f6feb;--green:#3fb950;--yellow:#d29922;--red:#f85149;--radius:12px;
+  /* 让浏览器原生控件（select 下拉面板、datalist 候选框、数字框上下箭头、复选框、
+     自动填充背景、滚动条）跟随深色主题——不加这一行，原生弹出层会是刺眼的浅色 */
+  color-scheme:dark}
 *{box-sizing:border-box;margin:0;padding:0}
+/* 始终为滚动条预留槽位：切换 tab 时页面高度变化（有的 tab 需要滚动、有的不需要）
+   不会再让整页宽度抖动（sticky header / footerbar / 内容左右位置保持一致）。
+   旧浏览器不支持 scrollbar-gutter，用 overflow-y:scroll 兜底（代价是常驻滚动条轨道）。 */
+html{overflow-y:scroll;scrollbar-gutter:stable}
+/* 滚动条风格统一（默认滚动条是系统浅灰样式，和深色 UI 割裂）。
+   实现要点：thumb 用 border + background-clip:content-box 做内缩，
+   这样轨道不用画底色就能得到「细圆角滑块」的效果，比直接设背景更贴合主题。 */
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#30363d;border:3px solid transparent;background-clip:content-box;border-radius:10px}
+::-webkit-scrollbar-thumb:hover{background:#484f58;background-clip:content-box}
+::-webkit-scrollbar-thumb:active{background:#58a6ff;background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent}
+/* Firefox 走标准属性；但 Chromium 只要看到 scrollbar-width/color 就会忽略上面的
+   ::-webkit-scrollbar 规则，所以必须用 @supports 隔离，不能无条件写 *{} */
+@supports not selector(::-webkit-scrollbar){
+  *{scrollbar-width:thin;scrollbar-color:#484f58 transparent}
+}
 body{background:linear-gradient(180deg,#0d1117 0%,#0a0e14 100%);color:var(--text);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;min-height:100vh;padding-bottom:120px}
 header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:12px;padding:14px 24px;background:rgba(13,17,23,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
 header .logo{font-size:22px}
@@ -22,6 +43,28 @@ header .spacer{flex:1}
 .panels{flex:1;min-width:0;display:flex;flex-direction:column}
 .panel{display:none;flex-direction:column;gap:18px}
 .panel.active{display:flex}
+/* ================= 子页面（二级 Tab） ================= */
+.subtabs{display:flex;gap:6px;flex-wrap:wrap;position:sticky;top:68px;z-index:6;padding:8px 0;background:linear-gradient(180deg,rgba(13,17,23,.97) 60%,rgba(13,17,23,.86));backdrop-filter:blur(8px);border-bottom:1px solid rgba(48,54,61,.55);margin-bottom:-6px}
+.subtab{padding:7px 14px;border-radius:20px;border:1px solid var(--border);background:var(--panel2);color:var(--muted);font-size:12.5px;cursor:pointer;user-select:none;transition:.15s;white-space:nowrap}
+.subtab:hover{color:var(--text);border-color:var(--accent)}
+.subtab.active{color:var(--accent);border-color:var(--accent);background:rgba(88,166,255,.12);font-weight:600}
+.subpanel{display:none;flex-direction:column;gap:18px}
+.subpanel.active{display:flex}
+/* 卡片头部：右侧工具区（快速跳转等） */
+.head-tools{display:flex;align-items:center;gap:8px;margin-left:12px;flex-shrink:0}
+.head-tools input[type=text]{width:130px;padding:5px 10px;font-size:12px}
+.head-tools select{width:auto;min-width:150px;padding:5px 26px 5px 10px;font-size:12px}
+.card>.head:has(.head-tools){flex-wrap:wrap;row-gap:8px}
+/* 子页 Tab 条右侧的粘滞工具栏（快速跳转）：跟着吸顶条一起，永远可见 */
+.subtab-tools{display:none;align-items:center;gap:8px;margin-left:auto;flex-shrink:0;flex-wrap:wrap}
+.subtab-tools.show{display:flex}
+.subtab-tools select{width:auto;min-width:170px;max-width:240px;padding:5px 26px 5px 10px;font-size:12px;border-radius:20px}
+.subtab-tools .badge{white-space:nowrap}
+@keyframes detailFlash{0%{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.3)}100%{border-color:var(--border);box-shadow:0 0 0 0 rgba(88,166,255,0)}}
+.card-item.flash{animation:detailFlash 1.5s ease-out}
+/* 跳转定位时预留吸顶条高度，避免卡片顶部被遮住 */
+#detailList .card-item{scroll-margin-top:140px}
+@media(max-width:900px){.subtabs{position:static}.subtab-tools{width:100%;justify-content:flex-end}.subtab-tools select{flex:1;max-width:none}}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
 .card>.head{display:flex;align-items:center;gap:8px;padding:12px 18px;background:var(--panel2);border-bottom:1px solid var(--border);font-weight:600;font-size:14px}
 .card>.head .hint{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted);text-align:right}
@@ -32,6 +75,12 @@ header .spacer{flex:1}
 input[type=text],input[type=number],input[type=password],select,textarea{width:100%;padding:9px 12px;background:#0d1117;color:var(--text);border:1px solid var(--border);border-radius:8px;font-size:13.5px;font-family:inherit;outline:none;transition:border-color .15s}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
 select{appearance:none;-webkit-appearance:none;background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6"><path d="M0 0l5 6 5-6z" fill="%238b949e"/></svg>');background-repeat:no-repeat;background-position:right 10px center;background-size:10px 6px;padding-right:34px;cursor:pointer}
+/* 下拉面板本身由系统渲染（无法完全自定义），但配色可以跟上主题 */
+select option{background:var(--panel2);color:var(--text)}
+/* 输入框/下拉悬停反馈，与按钮、卡片的边框反馈保持一致 */
+input[type=text]:hover:not(:focus),input[type=number]:hover:not(:focus),input[type=password]:hover:not(:focus),select:hover:not(:focus),textarea:hover:not(:focus){border-color:#484f58}
+/* 数字框的上下箭头跟随主题（Chromium 默认会画成浅色） */
+input[type=number]{accent-color:var(--accent2)}
 textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-size:12.5px;line-height:1.5}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
@@ -92,10 +141,23 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .row.disabled-row{opacity:.45;pointer-events:none;filter:grayscale(.4)}
 /* 末日循环保护：子选项缩进，与总开关形成层级 */
 .row.sub-row{margin-left:26px}
+/* 思考标签消毒：角色勾选为二级子项，整体左对齐（不要 align-items:center，否则会整行居中） */
+.row.sub2-row{margin-left:52px;gap:8px}
+.tt-role-hd{font-size:12px;color:var(--muted);line-height:1.4}
+.tt-roles{display:flex;flex-wrap:wrap;align-items:center;gap:8px 22px}
+.tt-role{gap:8px}
+.tt-role .lbl{font-size:12.5px}
+.tt-role-hint{font-size:11.5px;color:var(--muted);line-height:1.6;margin:0}
+/* 开关文案里的灰色补充说明 */
+.switch .lbl .hint{font-size:11.5px;font-weight:400;opacity:.8;line-height:1.55}
 /* 末日循环保护：组框（框住“启用+子选项”，ThinkTag 独立开关在组框外） */
 .dlp-group{border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-top:4px;background:rgba(13,17,23,.35);display:flex;flex-direction:column;gap:10px}
 .dlp-group .row:first-child{margin-top:0}
 .badge{font-size:11px;padding:2px 8px;border-radius:20px;background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}
+.tls-info{font-size:11.5px;line-height:1.75;color:var(--muted);word-break:break-all;background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.tls-info .tls-err{color:var(--yellow)}
+.tls-info .tls-key{color:var(--muted)}
+.tls-info .tls-val{color:var(--text)}
 .empty{color:var(--muted);font-size:13px;text-align:center;padding:10px}
 .pkrow{display:grid;grid-template-columns:1fr 1.5fr auto auto auto auto;gap:8px;align-items:center}
 .pk-enable{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer;white-space:nowrap}
@@ -120,7 +182,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .rt-badge.connecting .dot{background:var(--yellow);animation:rtpulse .8s infinite}
 @keyframes rtpulse{0%,100%{opacity:1}50%{opacity:.3}}
 .rt-count{margin-left:auto;font-family:Consolas,monospace;font-size:12px;color:var(--muted)}
-.rt-list{display:flex;flex-direction:column;gap:8px;max-height:66vh;overflow:auto}
+.rt-list{display:flex;flex-direction:column;gap:8px;max-height:66vh;overflow:auto;scrollbar-gutter:stable}
 .rt-item{border:1px solid var(--border);border-radius:10px;background:var(--panel2);overflow:hidden;flex-shrink:0}
 .rt-head{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;font-size:12.5px;flex-wrap:wrap;user-select:none}
 .rt-head:hover{background:rgba(88,166,255,.06)}
@@ -145,8 +207,20 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 .rt-body{flex-direction:column;gap:6px;padding:4px 12px 12px;border-top:1px solid var(--border);background:rgba(13,17,23,.45)}
 .rt-sec-label{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:8px;margin-top:8px}
 .rt-trunc{font-size:10.5px;color:var(--yellow);border:1px solid rgba(210,153,34,.35);background:rgba(210,153,34,.1);padding:1px 7px;border-radius:10px}
-.rt-pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:Consolas,"Courier New",monospace;font-size:11.5px;line-height:1.55;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;color:#c9d1d9;margin:0}
+.rt-pre{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:Consolas,"Courier New",monospace;font-size:11.5px;line-height:1.55;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;color:#c9d1d9;margin:0;scrollbar-gutter:stable}
 .rt-empty{color:var(--muted);font-size:13px;text-align:center;padding:22px}
+/* ===== 模型选择器：自定义可搜索下拉（替代 datalist，完全跟随主题） =====
+   为什么不用原生 <select> / <datalist>：
+   - datalist 候选框的间距/圆角/hover 高亮无法自定义，永远带着系统味
+   - select 无法同时支持「下拉选」与「自由手填」（模型可能尚未部署到上游）
+   实现：input 保持 text 可手填，聚焦时弹出浮层（position:fixed），输入即过滤。 */
+.mp-panel{position:fixed;z-index:300;background:var(--panel2);border:1px solid var(--border);border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.55);padding:4px;max-height:280px;overflow:auto;scrollbar-gutter:stable;font-size:12.5px;min-width:220px}
+.mp-item{padding:7px 10px;border-radius:7px;cursor:pointer;color:var(--text);font-family:Consolas,"Courier New",monospace;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .1s,color .1s}
+.mp-item:hover,.mp-item.active{background:rgba(88,166,255,.16);color:var(--accent)}
+.mp-item.mp-cur{color:var(--green)}
+.mp-empty{padding:12px 10px;color:var(--muted);text-align:center;font-size:12px;line-height:1.6}
+.mp-foot{position:sticky;bottom:-4px;margin:4px -4px -4px;padding:6px 12px;border-top:1px solid var(--border);background:var(--panel2);color:var(--muted);font-size:11px;display:flex;justify-content:space-between;gap:10px;border-radius:0 0 10px 10px}
+.mp-kbd{font-family:Consolas,monospace;opacity:.85;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -177,10 +251,53 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
   <div class="panels">
     <div class="panel active" id="tab-conn">
       <div class="card">
-        <div class="head" data-i18n="connListen">🖥️ 监听设置 <span class="hint" data-i18n="connListenHint">修改 IP / PORT 需重启程序生效</span></div>
-        <div class="body grid2">
-          <div class="row"><label data-i18n="lblIP">监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
-          <div class="row"><label data-i18n="lblPort">监听端口 PORT</label><input type="text" id="PORT" placeholder="11434"></div>
+        <div class="head" data-i18n="connListen">🖥️ 监听设置 <span class="hint" data-i18n="connListenHint">修改 IP / PORT / 端口组合需重启程序生效</span></div>
+        <div class="body">
+          <div class="grid2">
+            <div class="row"><label data-i18n="lblIP">监听地址 IP</label><input type="text" id="IP" placeholder="0.0.0.0"></div>
+            <div class="row"><label data-i18n="lblPort">HTTP 端口 PORT（明文，始终启用）</label><input type="text" id="PORT" placeholder="11434"></div>
+          </div>
+
+          <div class="row"><label class="switch"><input type="checkbox" id="TLSEnable" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsEnable">启用入站加密：额外开放 HTTPS / 混合端口（证书在下方 ServerTLS 卡片配置）</span></label></div>
+          <div class="row"><span class="tt-role-hd" data-i18n="tlsPortsHint">三个端口必须互不相同：HTTP 端口就是上面的 PORT；HTTPS / 混合端口各自独立启用，端口号必填</span></div>
+
+          <div class="dlp-group" id="rowTLSPorts">
+            <div class="row" id="rowTLSHttpsPortEnable"><label class="switch"><input type="checkbox" id="TLSHttpsPortEnable" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsHttpsPortEnable">启用 HTTPS 端口（纯加密）</span></label></div>
+            <div class="row sub-row" id="rowTLSHttpsPort"><label data-i18n="tlsHttpsPort">HTTPS 端口 HTTPSPort</label><input type="text" id="TLSHttpsPort" placeholder="如 11443"></div>
+            <div class="row sub2-row" id="rowTLSHttpsRedirect"><label class="switch"><input type="checkbox" id="TLSHttpsRedirect"><span class="track"></span><span class="lbl" data-i18n="tlsHttpsRedirect">用 http:// 访问该端口时自动跳转到 https://（308 永久重定向）</span></label></div>
+
+            <div class="row" id="rowTLSMixedPortEnable" style="margin-top:6px"><label class="switch"><input type="checkbox" id="TLSMixedPortEnable" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsMixedPortEnable">启用混合端口（同一端口同时支持 HTTP 与 HTTPS）</span></label></div>
+            <div class="row sub-row" id="rowTLSMixedPort"><label data-i18n="tlsMixedPort">混合端口 MixedPort</label><input type="text" id="TLSMixedPort" placeholder="如 11435"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="tlsTitle">🔐 入站加密 ServerTLS <span class="hint" data-i18n="tlsHint">证书与加密参数；修改需重启程序生效</span></div>
+        <div class="body">
+
+          <div class="row sub-row" id="rowTLSCertMode"><label data-i18n="tlsCertMode">证书来源 CertMode</label>
+            <select id="TLSCertMode" onchange="toggleTLSInputs()">
+              <option value="auto" data-i18n="tlsCertAuto">自动生成自签名证书（内置 CA，可下载信任）</option>
+              <option value="file" data-i18n="tlsCertFileMode">使用自定义证书文件（XCA / OpenSSL / mkcert）</option>
+            </select>
+          </div>
+
+          <div class="row sub-row" id="rowTLSCertDir"><label data-i18n="tlsCertDir">自动证书目录 CertDir（留空 = certs）</label><input type="text" id="TLSCertDir" placeholder="certs"></div>
+          <div class="row sub-row" id="rowTLSCertFile"><label data-i18n="tlsCertFileLbl">服务器证书 CertFile（PEM）</label><input type="text" id="TLSCertFile" placeholder="xca/127.0.0.1公钥.pem"></div>
+          <div class="row sub-row" id="rowTLSKeyFile"><label data-i18n="tlsKeyFileLbl">服务器私钥 KeyFile（PEM）</label><input type="text" id="TLSKeyFile" placeholder="xca/127.0.0.1私钥.pem"></div>
+          <div class="row sub-row" id="rowTLSCAFile"><label data-i18n="tlsCAFileLbl">CA 证书 CAFile（PEM，可选：补全证书链 / mTLS 校验）</label><input type="text" id="TLSCAFile" placeholder="xca/vancat组织.crt"></div>
+          <div class="row sub-row" id="rowTLSCAKeyFile"><label data-i18n="tlsCAKeyFileLbl">CA 私钥 CAKeyFile（PEM，需无密码；仅重签时使用）</label><input type="text" id="TLSCAKeyFile" placeholder="xca/中间CA私钥.pem"></div>
+
+          <div class="row sub-row" id="rowTLSReissue"><label class="switch"><input type="checkbox" id="TLSReissue" onchange="toggleTLSInputs()"><span class="track"></span><span class="lbl" data-i18n="tlsReissue">用 CA 重签服务器证书（修复缺少 SAN / 过期 / 主机名不匹配；XCA 的证书常常必须开）</span></label></div>
+
+          <div class="row sub-row" id="rowTLSClientAuth"><label class="switch"><input type="checkbox" id="TLSClientAuth"><span class="track"></span><span class="lbl" data-i18n="tlsClientAuth">要求客户端证书（mTLS，需要配置 CA 证书）</span></label></div>
+
+          <div class="row sub-row" id="rowTLSCAInfo">
+            <label data-i18n="tlsCAInfoLabel">CA 证书状态</label>
+            <div class="mono tls-info" id="tlsCAInfo">-</div>
+            <div><button class="btn small" id="btnDownloadCA" onclick="downloadCA()" data-i18n="btnDownloadCA">⬇️ 下载 CA 证书</button></div>
+          </div>
         </div>
       </div>
 
@@ -208,6 +325,34 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
             <div class="row"><label data-i18n="poolTlsTimeout">TLS 握手超时秒数 TLSHandshakeTimeoutSec</label><input type="number" id="poolTlsTimeout" min="0" placeholder="10"></div>
             <div class="row" style="align-items:flex-end"><label class="switch"><input type="checkbox" id="poolForceH2"><span class="track"></span><span class="lbl" data-i18n="poolForceH2">强制 HTTP/2（HTTPS 上游）</span></label></div>
           </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="limitTitle">🛡️ 过载保护 ProxyLimit <span class="hint" data-i18n="limitHint">防高并发 OOM：「限制」开关关闭即完全不限制；保存后立即生效，无需重启</span></div>
+        <div class="body">
+          <div class="row"><label class="switch"><input type="checkbox" id="LimitEnable" onchange="toggleLimitInputs()"><span class="track"></span><span class="lbl" data-i18n="limitEnable">启用：限制并发与请求体大小，防止高并发把服务撑爆（默认关闭）</span></label></div>
+
+          <div class="row sub-row" id="rowLimitConcurrency"><label class="switch"><input type="checkbox" id="LimitConcurrency" onchange="toggleLimitInputs()"><span class="track"></span><span class="lbl" data-i18n="limitConcurrency">限制并发数（关闭 = 不限并发，所有请求直接放行）</span></label></div>
+          <div class="row sub-row" id="rowLimitMaxConcurrent"><label data-i18n="limitMaxConcurrent">最大并发请求数 MaxConcurrent（超出排队，默认 32）</label><input type="number" id="LimitMaxConcurrent" min="1" max="4096" placeholder="32"></div>
+
+          <div class="row sub-row" id="rowLimitQueueTimeout"><label class="switch"><input type="checkbox" id="LimitQueueTimeout" onchange="toggleLimitInputs()"><span class="track"></span><span class="lbl" data-i18n="limitQueueTimeout">限制排队时间（关闭 = 排队不限时，只等客户端断开）</span></label></div>
+          <div class="row sub-row" id="rowLimitQueueTimeoutVal"><label data-i18n="limitQueueTimeoutVal">排队超时秒数 QueueTimeoutSec（超时返回 503，默认 60）</label><input type="number" id="LimitQueueTimeoutVal" min="1" max="3600" placeholder="60"></div>
+
+          <div class="row sub-row" id="rowLimitRequestBody"><label class="switch"><input type="checkbox" id="LimitRequestBody" onchange="toggleLimitInputs()"><span class="track"></span><span class="lbl" data-i18n="limitRequestBody">限制请求体大小（关闭 = 不限大小；带图片请求建议关闭）</span></label></div>
+          <div class="row sub-row" id="rowLimitMaxBody"><label data-i18n="limitMaxBody">单请求体上限 MaxRequestBodyMB（MB，超限返回 413，默认 32）</label><input type="number" id="LimitMaxBody" min="1" max="4096" placeholder="32"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="head" data-i18n="stTitle">⏱️ 服务器超时 ServerTimeout <span class="hint" data-i18n="stHint">防慢速连接堆积；修改 IP / PORT / 本组设置需重启程序生效</span></div>
+        <div class="body">
+          <div class="row"><label class="switch"><input type="checkbox" id="StLimitReadHeader" onchange="toggleServerTimeoutInputs()"><span class="track"></span><span class="lbl" data-i18n="stLimitReadHeader">限制读请求头时间（关闭 = 不限时）</span></label></div>
+          <div class="row sub-row" id="rowStReadHeader"><label data-i18n="stReadHeader">读请求头超时秒 ReadHeaderTimeoutSec（默认 30）</label><input type="number" id="StReadHeader" min="1" max="3600" placeholder="30"></div>
+          <div class="row"><label class="switch"><input type="checkbox" id="StLimitIdle" onchange="toggleServerTimeoutInputs()"><span class="track"></span><span class="lbl" data-i18n="stLimitIdle">回收空闲连接（关闭 = 不回收）</span></label></div>
+          <div class="row sub-row" id="rowStIdle"><label data-i18n="stIdle">空闲回收秒 IdleTimeoutSec（默认 120）</label><input type="number" id="StIdle" min="1" max="86400" placeholder="120"></div>
+          <div class="row"><label class="switch"><input type="checkbox" id="StLimitMaxHeader" onchange="toggleServerTimeoutInputs()"><span class="track"></span><span class="lbl" data-i18n="stLimitMaxHeader">限制请求头大小（关闭 = 不限大小）</span></label></div>
+          <div class="row sub-row" id="rowStMaxHeader"><label data-i18n="stMaxHeader">请求头上限 MB MaxHeaderMB（默认 1）</label><input type="number" id="StMaxHeader" min="1" max="64" placeholder="1"></div>
         </div>
       </div>
     </div>
@@ -253,91 +398,146 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
     </div>
 
     <div class="panel" id="tab-model">
-      <div class="card">
-        <div class="head" data-i18n="modelDisplay">🧩 模型显示 <span class="hint" data-i18n="modelDisplayHint">仅影响客户端看到的模型名称</span></div>
-        <div class="body">
-          <div class="grid2">
-            <div class="row"><label data-i18n="lblPrefix">模型名前缀 OpenAI_Prefix</label><input type="text" id="OpenAI_Prefix" placeholder="[VC反代] "></div>
-            <div class="row"><label data-i18n="lblSuffix">模型名后缀 OpenAI_Suffix</label><input type="text" id="OpenAI_Suffix"></div>
-          </div>
-          <div class="grid2">
-            <div class="row">
-              <label data-i18n="lblStreamMode">流式策略 StreamMode</label>
-              <select id="StreamMode">
-                <option value="preserve" data-i18n="smPreserve">preserve · 不覆写（默认）</option>
-                <option value="force_stream" data-i18n="smForceStream">force_stream · 强制流式</option>
-                <option value="force_close" data-i18n="smForceClose">force_close · 强制关闭</option>
-              </select>
+      <div class="subtabs" role="tablist">
+        <div class="subtab active" data-subtab="display" onclick="switchSubTab('model','display')" data-i18n="subModelDisplay">🧩 显示</div>
+        <div class="subtab" data-subtab="vision" onclick="switchSubTab('model','vision')" data-i18n="subModelVision">🖼 视觉</div>
+        <div class="subtab" data-subtab="ctx" onclick="switchSubTab('model','ctx')" data-i18n="subModelCtx">🧭 上下文</div>
+        <div class="subtab" data-subtab="dlp" onclick="switchSubTab('model','dlp')" data-i18n="subModelDlp">🚨 防护</div>
+        <div class="subtab" data-subtab="alias" onclick="switchSubTab('model','alias')" data-i18n="subModelAlias">🔖 别名</div>
+        <div class="subtab" data-subtab="detail" onclick="switchSubTab('model','detail')" data-i18n="subModelDetail">📐 详细设置</div>
+        <div class="subtab-tools" id="detailTools">
+          <button class="btn small" id="btnFetchModels" onclick="fetchModelList(this)" data-i18n="btnFetchModels">🔄 获取模型列表</button>
+          <select id="detailJump" onchange="jumpToDetail(this.value)"></select>
+          <span class="badge" id="detailCount">0</span>
+        </div>
+      </div>
+
+      <div class="subpanel active" id="sub-model-display">
+        <div class="card">
+          <div class="head" data-i18n="modelDisplay">🧩 模型显示 <span class="hint" data-i18n="modelDisplayHint">仅影响客户端看到的模型名称</span></div>
+          <div class="body">
+            <div class="grid2">
+              <div class="row"><label data-i18n="lblPrefix">模型名前缀 OpenAI_Prefix</label><input type="text" id="OpenAI_Prefix" placeholder="[VC反代] "></div>
+              <div class="row"><label data-i18n="lblSuffix">模型名后缀 OpenAI_Suffix</label><input type="text" id="OpenAI_Suffix"></div>
             </div>
-            <div class="row"><label data-i18n="lblCaps">能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
-          </div>
-          <div class="row"><label data-i18n="lblVisionPrompt">全局视觉代理提示词 VisionProxyPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionPromptHint">模型未自定义提示词时使用；留空=内置默认提示词</span></label><textarea rows="3" id="VisionProxyPrompt" data-i18n-ph="visionPromptPh" placeholder="请仔细查看这张图片，用简体中文详细描述图片中的全部内容..."></textarea></div>
-          <div class="grid2">
-            <div class="row">
-              <label data-i18n="lblVisionQuality">全局图片质量 VisionImageQuality <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionQualityHint">模型单独的图片质量优先</span></label>
-              <select id="VisionImageQuality" onchange="toggleVisionQualityInputs()">
-                <option value="original" data-i18n="vqOriginal">原图 · 不压缩</option>
-                <option value="high" data-i18n="vqHigh">高质量 · JPEG 90%</option>
-                <option value="balanced" data-i18n="vqBalanced">平衡 · JPEG 70%（默认）</option>
-                <option value="eco" data-i18n="vqEco">节省流量 · JPEG 40% + 最长边 1024</option>
-                <option value="custom" data-i18n="vqCustom">自定义 · 压缩质量百分比</option>
-              </select>
+            <div class="grid2">
+              <div class="row">
+                <label data-i18n="lblStreamMode">流式策略 StreamMode</label>
+                <select id="StreamMode">
+                  <option value="preserve" data-i18n="smPreserve">preserve · 不覆写（默认）</option>
+                  <option value="force_stream" data-i18n="smForceStream">force_stream · 强制流式</option>
+                  <option value="force_close" data-i18n="smForceClose">force_close · 强制关闭</option>
+                </select>
+              </div>
+              <div class="row"><label data-i18n="lblCaps">能力声明 Capabilities（逗号分隔）</label><input type="text" id="Capabilities" placeholder="tools, vision"></div>
             </div>
-            <div class="row" id="rowVisionCustomPercent">
-              <label data-i18n="lblVisionCustomPercent">自定义压缩质量百分比 CustomPercent（1-100）</label>
-              <div class="vq-slider-row">
-                <input type="range" id="VisionCustomRange" min="1" max="100" value="70" oninput="syncVqPercent('VisionCustomRange','VisionCustomPercent','vqValGlobal')">
-                <input type="number" id="VisionCustomPercent" min="1" max="100" value="70" placeholder="70" oninput="syncVqPercent('VisionCustomPercent','VisionCustomRange','vqValGlobal')">
-                <span class="vq-percent-val" id="vqValGlobal">70%</span>
+            <div class="grid2">
+              <div class="row"><label data-i18n="lblDefaultCtx">默认上下文长度 DefaultContextLength <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="defaultCtxHint">上游未返回元数据且模型未单独配置时使用；0=内置 1000000</span></label><input type="number" id="DefaultContextLength" min="0" max="100000000" value="1000000" placeholder="1000000"></div>
+              <div class="row"><label data-i18n="lblDefaultMaxOut">默认最大输出 DefaultMaxOutputTokens <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="defaultMaxOutHint">上游未返回元数据且模型未单独配置时使用；0=内置 384000</span></label><input type="number" id="DefaultMaxOutputTokens" min="0" max="10000000" value="384000" placeholder="384000"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="subpanel" id="sub-model-vision">
+        <div class="card">
+          <div class="head" data-i18n="visionTitle">🖼️ 视觉代理 Vision <span class="hint" data-i18n="visionHint">主模型不支持图片时用代理模型识别；识别结果按「图片+提示词」缓存到本地，重复图片零消耗</span></div>
+          <div class="body">
+            <div class="row"><label data-i18n="lblVisionPrompt">全局视觉代理提示词 VisionProxyPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionPromptHint">模型未自定义提示词时使用；留空=内置默认提示词</span></label><textarea rows="3" id="VisionProxyPrompt" data-i18n-ph="visionPromptPh" placeholder="请仔细查看这张图片，用简体中文详细描述图片中的全部内容..."></textarea></div>
+            <div class="grid2">
+              <div class="row">
+                <label data-i18n="lblVisionQuality">全局图片质量 VisionImageQuality <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionQualityHint">模型单独的图片质量优先</span></label>
+                <select id="VisionImageQuality" onchange="toggleVisionQualityInputs()">
+                  <option value="original" data-i18n="vqOriginal">原图 · 不压缩</option>
+                  <option value="high" data-i18n="vqHigh">高质量 · JPEG 90%</option>
+                  <option value="balanced" data-i18n="vqBalanced">平衡 · JPEG 70%（默认）</option>
+                  <option value="eco" data-i18n="vqEco">节省流量 · JPEG 40% + 最长边 1024</option>
+                  <option value="custom" data-i18n="vqCustom">自定义 · 压缩质量百分比</option>
+                </select>
+              </div>
+              <div class="row" id="rowVisionCustomPercent">
+                <label data-i18n="lblVisionCustomPercent">自定义压缩质量百分比 CustomPercent（1-100）</label>
+                <div class="vq-slider-row">
+                  <input type="range" id="VisionCustomRange" min="1" max="100" value="70" oninput="syncVqPercent('VisionCustomRange','VisionCustomPercent','vqValGlobal')">
+                  <input type="number" id="VisionCustomPercent" min="1" max="100" value="70" placeholder="70" oninput="syncVqPercent('VisionCustomPercent','VisionCustomRange','vqValGlobal')">
+                  <span class="vq-percent-val" id="vqValGlobal">70%</span>
+                </div>
               </div>
             </div>
-          </div>
-          <div class="row"><label data-i18n="lblVisionProxyMemCacheSize">视觉代理图片内存缓存大小 VisionProxyMemCacheSize <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionProxyMemCacheSizeHint">视觉代理识别成功保存本地后同时放入内存，再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命；0=禁用；启动时预加载最近的 N 条</span></label><input type="number" id="VisionProxyMemCacheSize" min="0" max="10000" value="200" placeholder="200"></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="head" data-i18n="ctxTitle">🧭 模型上下文信息注入 ModelContextPrompt <span class="hint" data-i18n="ctxHint">在提示词中附加当前模型信息（模型ID/上下文长度/最大输出），帮助模型自我认知</span></div>
-        <div class="body">
-          <div class="row"><label class="switch"><input type="checkbox" id="CtxEnable"><span class="track"></span><span class="lbl" data-i18n="ctxEnable">启用：对话时自动注入当前位置模型信息</span></label></div>
-          <div class="row"><label data-i18n="ctxPos">插入位置 Position</label>
-            <select id="CtxPos">
-              <option value="prepend" data-i18n="ctxPosPrepend">prepend · 插入到首条 system 消息开头（无 system 则新建）</option>
-              <option value="append" data-i18n="ctxPosAppend">append · 追加到消息末尾</option>
-            </select>
-          </div>
-          <div class="row"><label data-i18n="ctxTemplate">模板 Template <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="ctxTemplateHint">占位符：{model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉说明（原生/代理/不支持）</span></label><textarea rows="3" id="CtxTemplate" data-i18n-ph="ctxTemplatePh" placeholder="当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。"></textarea></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="head" data-i18n="dlpTitle">🚨 末日循环保护 DoomLoopProtection <span class="hint" data-i18n="dlpHint">检测上游内容重复并熔断，防止客户端陷入重试死循环</span></div>
-        <div class="body">
-          <div class="row"><label class="switch"><input type="checkbox" id="DlpThinkTag"><span class="track"></span><span class="lbl" data-i18n="dlpThinkTag">思考标签消毒：裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]（ollama cloud 死循环根因防护，独立于总开关生效）</span></label></div>
-          <div class="dlp-group">
-          <div class="row"><label class="switch"><input type="checkbox" id="DlpEnable" onchange="toggleDlpInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpEnable">启用：检测上游重复内容并熔断</span></label></div>
-          <div class="row sub-row" id="rowDlpDedup"><label class="switch"><input type="checkbox" id="DlpDedup"><span class="track"></span><span class="lbl" data-i18n="dlpDedup">内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段</span></label></div>
-          <div class="row sub-row" id="rowDlpRepeatCheck"><label class="switch"><input type="checkbox" id="DlpRepeatCheck"><span class="track"></span><span class="lbl" data-i18n="dlpRepeatCheck">跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）</span></label></div>
-          <div class="row sub-row" id="rowDlpWarn"><label class="switch"><input type="checkbox" id="DlpWarn"><span class="track"></span><span class="lbl" data-i18n="dlpWarn">跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label></div>
-          <div class="row sub-row" id="rowDlpMaxRepeat"><label data-i18n="dlpMaxRepeat">连续重复熔断阈值 MaxRepeat（≥2，默认 3）</label><input type="number" id="DlpMaxRepeat" min="2" max="20" value="3" placeholder="3"></div>
-          <div class="row sub-row" id="rowDlpWarnPrompt"><label data-i18n="dlpWarnPrompt">跨请求警告提示词 WarnPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="dlpWarnHint">熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label><textarea rows="3" id="DlpWarnPrompt" data-i18n-ph="dlpWarnPh" placeholder="【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"></textarea></div>
+            <div class="row"><label data-i18n="lblVisionProxyMemCacheSize">视觉代理图片内存缓存大小 VisionProxyMemCacheSize <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="visionProxyMemCacheSizeHint">视觉代理识别成功保存本地后同时放入内存，再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命；0=禁用；启动时预加载最近的 N 条</span></label><input type="number" id="VisionProxyMemCacheSize" min="0" max="10000" value="200" placeholder="200"></div>
+            <div class="row"><label class="switch"><input type="checkbox" id="GifNormalize"><span class="track"></span><span class="lbl" data-i18n="gifNormalize">直连路径 GIF 转换：把 GIF 动图转换为 PNG 首帧再转发（部分上游不接受 GIF 会报 400 invalid image input；默认关闭；视觉代理路径始终转换）</span></label></div>
           </div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="head" data-i18n="modelAlias">🔖 模型别名 ModelAlias <span class="hint" data-i18n="modelAliasHint">将上游模型 ID 显示为友好名称</span></div>
-        <div class="body">
-          <div id="aliasList" class="dtable"></div>
-          <div><button class="btn small" onclick="addAlias()" data-i18n="btnAddAlias">＋ 添加别名</button></div>
+      <div class="subpanel" id="sub-model-ctx">
+        <div class="card">
+          <div class="head" data-i18n="ctxTitle">🧭 模型上下文信息注入 ModelContextPrompt <span class="hint" data-i18n="ctxHint">在提示词中附加当前模型信息（模型ID/上下文长度/最大输出），帮助模型自我认知</span></div>
+          <div class="body">
+            <div class="row"><label class="switch"><input type="checkbox" id="CtxEnable"><span class="track"></span><span class="lbl" data-i18n="ctxEnable">启用：对话时自动注入当前位置模型信息</span></label></div>
+            <div class="row"><label data-i18n="ctxPos">插入位置 Position</label>
+              <select id="CtxPos">
+                <option value="prepend" data-i18n="ctxPosPrepend">prepend · 插入到首条 system 消息开头（无 system 则新建）</option>
+                <option value="append" data-i18n="ctxPosAppend">append · 追加到消息末尾</option>
+              </select>
+            </div>
+            <div class="row"><label data-i18n="ctxTemplate">模板 Template <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="ctxTemplateHint">占位符：{model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉说明（原生/代理/不支持）</span></label><textarea rows="3" id="CtxTemplate" data-i18n-ph="ctxTemplatePh" placeholder="当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。"></textarea></div>
+          </div>
         </div>
       </div>
 
-      <div class="card">
-        <div class="head" data-i18n="modelDetail">📐 模型详细设置 ModelDetailedSettings <span class="hint" data-i18n="modelDetailHint">覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理</span></div>
-        <div class="body">
-          <div id="detailList"></div>
-          <div><button class="btn small" onclick="addDetail()" data-i18n="btnAddDetail">＋ 添加模型设置</button></div>
+      <div class="subpanel" id="sub-model-dlp">
+        <div class="card">
+          <div class="head" data-i18n="dlpTitle">🚨 末日循环保护 DoomLoopProtection <span class="hint" data-i18n="dlpHint">检测上游内容重复并熔断，防止客户端陷入重试死循环</span></div>
+          <div class="body">
+            <div class="dlp-group">
+            <div class="row"><label class="switch"><input type="checkbox" id="DlpThinkTag" onchange="toggleThinkTagInputs()"><span class="track"></span><span class="lbl"><span data-i18n="dlpThinkTag">思考标签消毒</span> <span class="hint" data-i18n="dlpThinkTagHint">裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为安全文本，防 ollama cloud 死循环（独立于下方「启用」）</span></span></label></div>
+            <div class="row sub-row" id="rowDlpThinkTagRequest"><label class="switch"><input type="checkbox" id="DlpThinkTagRequest" onchange="toggleThinkTagInputs()"><span class="track"></span><span class="lbl"><span data-i18n="dlpThinkTagRequest">请求侧消毒</span> <span class="hint" data-i18n="dlpThinkTagRequestHint">客户端历史 → 上游，防上游渲染器截断 assistant 历史</span></span></label></div>
+            <div class="row sub2-row" id="rowDlpThinkTagRoles">
+              <div class="tt-role-hd" data-i18n="dlpThinkTagRoles">请求侧生效角色</div>
+              <div class="tt-roles">
+                <label class="switch tt-role"><input type="checkbox" id="DlpThinkTagRoleAssistant"><span class="track"></span><span class="lbl">assistant</span></label>
+                <label class="switch tt-role"><input type="checkbox" id="DlpThinkTagRoleUser"><span class="track"></span><span class="lbl">user</span></label>
+                <label class="switch tt-role"><input type="checkbox" id="DlpThinkTagRoleSystem"><span class="track"></span><span class="lbl">system</span></label>
+                <label class="switch tt-role"><input type="checkbox" id="DlpThinkTagRoleTool"><span class="track"></span><span class="lbl">tool</span></label>
+              </div>
+              <div class="tt-role-hint" data-i18n="dlpThinkTagRolesHint">默认只处理 assistant（死循环的真正污染源）；tool 工具输出里的字面标签多属内容的一部分，默认跳过以免误触发</div>
+            </div>
+            <div class="row sub-row" id="rowDlpThinkTagResponse"><label class="switch"><input type="checkbox" id="DlpThinkTagResponse"><span class="track"></span><span class="lbl"><span data-i18n="dlpThinkTagResponse">响应侧消毒</span> <span class="hint" data-i18n="dlpThinkTagResponseHint">上游 → 客户端，阻止脏标签污染会话历史（根治源头）</span></span></label></div>
+            </div>
+            <div class="dlp-group">
+            <div class="row"><label class="switch"><input type="checkbox" id="DlpEnable" onchange="toggleDlpInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpEnable">启用：检测上游重复内容并熔断</span></label></div>
+            <div class="row sub-row" id="rowDlpDedup"><label class="switch"><input type="checkbox" id="DlpDedup"><span class="track"></span><span class="lbl" data-i18n="dlpDedup">内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段</span></label></div>
+            <div class="row sub-row" id="rowDlpRepeatCheck"><label class="switch"><input type="checkbox" id="DlpRepeatCheck"><span class="track"></span><span class="lbl" data-i18n="dlpRepeatCheck">跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）</span></label></div>
+            <div class="row sub-row" id="rowDlpWarn"><label class="switch"><input type="checkbox" id="DlpWarn"><span class="track"></span><span class="lbl" data-i18n="dlpWarn">跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label></div>
+            <div class="row sub-row" id="rowDlpMaxRepeat"><label data-i18n="dlpMaxRepeat">连续重复熔断阈值 MaxRepeat（≥2，默认 3）</label><input type="number" id="DlpMaxRepeat" min="2" max="20" value="3" placeholder="3"></div>
+            <div class="row sub-row" id="rowDlpRepeatEntries"><label class="switch"><input type="checkbox" id="DlpLimitRepeatEntries" onchange="toggleRepeatInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpLimitRepeatEntries">限制复读记录条数（关闭 = 不限条数）</span></label></div>
+            <div class="row sub-row" id="rowDlpRepeatEntriesVal"><label data-i18n="dlpRepeatEntries">复读记录会话数上限 RepeatMaxEntries（默认 256，仅占内存，不影响判断精度）</label><input type="number" id="DlpRepeatEntries" min="1" max="10000" placeholder="256"></div>
+            <div class="row sub-row" id="rowDlpRepeatTTL"><label class="switch"><input type="checkbox" id="DlpLimitRepeatTTL" onchange="toggleRepeatInputs()"><span class="track"></span><span class="lbl" data-i18n="dlpLimitRepeatTTL">限制复读记录有效期（关闭 = 永不过期）</span></label></div>
+            <div class="row sub-row" id="rowDlpRepeatTTLVal"><label data-i18n="dlpRepeatTTL">复读记录保留分钟 RepeatTTLMin（默认 30）</label><input type="number" id="DlpRepeatTTL" min="1" max="1440" placeholder="30"></div>
+            <div class="row sub-row" id="rowDlpWarnPrompt"><label data-i18n="dlpWarnPrompt">跨请求警告提示词 WarnPrompt <span class="hint" style="color:var(--muted);font-weight:400" data-i18n="dlpWarnHint">熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）</span></label><textarea rows="3" id="DlpWarnPrompt" data-i18n-ph="dlpWarnPh" placeholder="【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"></textarea></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="subpanel" id="sub-model-alias">
+        <div class="card">
+          <div class="head" data-i18n="modelAlias">🔖 模型别名 ModelAlias <span class="hint" data-i18n="modelAliasHint">将上游模型 ID 显示为友好名称</span></div>
+          <div class="body">
+            <div id="aliasList" class="dtable"></div>
+            <div><button class="btn small" onclick="addAlias()" data-i18n="btnAddAlias">＋ 添加别名</button></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="subpanel" id="sub-model-detail">
+        <div class="card">
+          <div class="head" data-i18n="modelDetail">📐 模型详细设置 ModelDetailedSettings <span class="hint" data-i18n="modelDetailHint">覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理</span></div>
+          <div class="body">
+            <div id="detailList"></div>
+            <div><button class="btn small" onclick="addDetail()" data-i18n="btnAddDetail">＋ 添加模型设置</button></div>
+          </div>
         </div>
       </div>
     </div>
@@ -394,6 +594,9 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 
 <div id="toast"></div>
 
+<!-- 模型选择器浮层（自定义可搜索下拉，内容由 mpRender 动态填充） -->
+<div id="mpPanel" class="mp-panel hidden"></div>
+
 <div id="loginOverlay" class="hidden">
   <div class="login-box">
     <div class="login-icon">🔒</div>
@@ -406,7 +609,7 @@ textarea{min-height:56px;resize:vertical;font-family:Consolas,monospace;font-siz
 </div>
 
 <script>
-var state = { aliases: [], details: [], rules: [], proxyKeys: [] };
+var state = { aliases: [], details: [], rules: [], proxyKeys: [], modelOptions: [], modelsFetched: false, tlsCA: null };
 // 实时请求状态提前声明：applyI18n（DOMContentLoaded 时调用）会重渲染列表
 var rtState = { items: [], open: {}, paused: false, es: null, lastId: 0, enabled: true, timer: null };
 
@@ -441,14 +644,52 @@ var I18N = {
     rtProt_repeat_internal: '响应内部重复', rtProt_repeat_cross: '跨请求复读',
     rtProt_warn_inject: '注入复读警告', rtProt_assistant_loop: 'assistant 循环检测',
     rtProt_vision_proxy: '视觉代理识别', rtProt_ctx_inject: '模型上下文注入',
+    rtProt_gif_normalize: 'GIF 直连转换',
     rtProt_prompt_replace: '提示词替换', rtProt_model_alias: '模型名还原',
-    connListen: '🖥️ 监听设置', connListenHint: '修改 IP / PORT 需重启程序生效',
-    lblIP: '监听地址 IP', lblPort: '监听端口 PORT',
+    connListen: '🖥️ 监听设置', connListenHint: '修改 IP / PORT / 端口组合需重启程序生效',
+    lblIP: '监听地址 IP', lblPort: 'HTTP 端口 PORT（明文，始终启用）',
     connUpstream: '📡 上游 API', connUpstreamHint: 'OPENAI_KEY 留空表示保持当前密钥',
     lblBase: 'OPENAI_BASE', lblKey: 'OPENAI_KEY', keyEncrypted: '已加密保存', keyPlaceholder: '留空保持不变；输入明文新密钥将自动加密保存',
     poolTitle: '🔌 连接池设置 ConnPool', poolHint: 'HTTP/2 + keep-alive 连接复用；0 值回退默认；保存后立即生效，无需重启',
     poolMaxIdle: '全局最大空闲连接 MaxIdleConns', poolMaxIdlePerHost: '每主机空闲连接 MaxIdleConnsPerHost', poolMaxConnsPerHost: '每主机并发上限 MaxConnsPerHost',
     poolIdleTimeout: '空闲回收秒数 IdleConnTimeoutSec', poolTlsTimeout: 'TLS 握手超时秒数 TLSHandshakeTimeoutSec', poolForceH2: '强制 HTTP/2（HTTPS 上游）',
+    limitTitle: '🛡️ 过载保护 ProxyLimit', limitHint: '防高并发 OOM：「限制」开关关闭即完全不限制；保存后立即生效，无需重启',
+    limitEnable: '启用：限制并发与请求体大小，防止高并发把服务撑爆（默认关闭）',
+    limitConcurrency: '限制并发数（关闭 = 不限并发，所有请求直接放行）',
+    limitMaxConcurrent: '最大并发请求数 MaxConcurrent（超出排队，默认 32）',
+    limitQueueTimeout: '限制排队时间（关闭 = 排队不限时，只等客户端断开）',
+    limitQueueTimeoutVal: '排队超时秒数 QueueTimeoutSec（超时返回 503，默认 60）',
+    limitRequestBody: '限制请求体大小（关闭 = 不限大小；带图片请求建议关闭）',
+    limitMaxBody: '单请求体上限 MaxRequestBodyMB（MB，超限返回 413，默认 32）',
+    stTitle: '⏱️ 服务器超时 ServerTimeout', stHint: '防慢速连接堆积；修改 IP / PORT / 本组设置需重启程序生效',
+    stLimitReadHeader: '限制读请求头时间（关闭 = 不限时）', stReadHeader: '读请求头超时秒 ReadHeaderTimeoutSec（默认 30）',
+    stLimitIdle: '回收空闲连接（关闭 = 不回收）', stIdle: '空闲回收秒 IdleTimeoutSec（默认 120）',
+    stLimitMaxHeader: '限制请求头大小（关闭 = 不限大小）', stMaxHeader: '请求头上限 MB MaxHeaderMB（默认 1）',
+    tlsTitle: '🔐 入站加密 ServerTLS', tlsHint: '证书与加密参数；修改需重启程序生效',
+    tlsEnable: '启用入站加密：额外开放 HTTPS / 混合端口（证书在下方 ServerTLS 卡片配置）',
+    tlsPortsHint: '三个端口必须互不相同：HTTP 端口就是上面的 PORT；HTTPS / 混合端口各自独立启用，端口号必填',
+    tlsHttpsPortEnable: '启用 HTTPS 端口（纯加密）',
+    tlsHttpsPort: 'HTTPS 端口 HTTPSPort',
+    tlsHttpsRedirect: '用 http:// 访问该端口时自动跳转到 https://（308 永久重定向）',
+    tlsMixedPortEnable: '启用混合端口（同一端口同时支持 HTTP 与 HTTPS）',
+    tlsMixedPort: '混合端口 MixedPort',
+    tlsCertMode: '证书来源 CertMode',
+    tlsCertAuto: '自动生成自签名证书（内置 CA，可下载信任）',
+    tlsCertFileMode: '使用自定义证书文件（XCA / OpenSSL / mkcert）',
+    tlsCertDir: '自动证书目录 CertDir（留空 = certs）',
+    tlsCertFileLbl: '服务器证书 CertFile（PEM）',
+    tlsKeyFileLbl: '服务器私钥 KeyFile（PEM）',
+    tlsCAFileLbl: 'CA 证书 CAFile（PEM，可选：补全证书链 / mTLS 校验）',
+    tlsCAKeyFileLbl: 'CA 私钥 CAKeyFile（PEM，需无密码；仅重签时使用）',
+    tlsReissue: '用 CA 重签服务器证书（修复缺少 SAN / 过期 / 主机名不匹配；XCA 的证书常常必须开）',
+    tlsClientAuth: '要求客户端证书（mTLS，需要配置 CA 证书）',
+    tlsCAInfoLabel: 'CA 证书状态',
+    btnDownloadCA: '⬇️ 下载 CA 证书',
+    tlsNoCert: '证书尚未生成（启用后保存配置会自动生成；自定义模式请先填好证书路径）',
+    tlsFingerprint: 'CA 指纹 SHA-256', tlsNotAfter: 'CA 有效期至', tlsServerDomains: '服务器证书覆盖域名/IP', tlsSep: '：',
+    tlsCADownloaded: '⬇️ CA 证书已开始下载', tlsCADownloadFail: '下载 CA 证书失败: ',
+    tlsChain: '证书链张数', tlsReissued: '已用 CA 重签', tlsServerSubject: '服务器证书主题',
+    tlsWarnings: '证书诊断告警：',
     secPw: '🔒 访问密码', secPwHint: '防止局域网内被他人乱改，留空保持不变',
     lblWebPw: '配置页面访问密码 WebConfigPassword', pwEnabled: '已启用', webPwPlaceholder: '留空保持不变；设置新密码后需重新登录',
     secPwTip: '💡 设置后访问 /config 需输入密码，所有配置接口也会校验，防止局域网其他设备随意修改',
@@ -462,15 +703,28 @@ var I18N = {
     logTitle: '📜 日志设置', lblLogLimit: '终端日志清理阈值 Log_Limit',
     lblLogResp: '打印响应内容', lblLogHeaders: '打印请求头', lblLogBody: '打印请求体',
     modelDisplay: '🧩 模型显示', modelDisplayHint: '仅影响客户端看到的模型名称',
+    subModelDisplay: '🧩 显示', subModelVision: '🖼 视觉', subModelCtx: '🧭 上下文', subModelDlp: '🚨 防护', subModelAlias: '🔖 别名', subModelDetail: '📐 详细设置',
+    visionTitle: '🖼️ 视觉代理 Vision', visionHint: '主模型不支持图片时用代理模型识别；识别结果按「图片+提示词」缓存到本地，重复图片零消耗',
     lblPrefix: '模型名前缀 OpenAI_Prefix', lblSuffix: '模型名后缀 OpenAI_Suffix',
     lblStreamMode: '流式策略 StreamMode', smPreserve: 'preserve · 不覆写（默认）', smForceStream: 'force_stream · 强制流式', smForceClose: 'force_close · 强制关闭',
-    lblCaps: '能力声明 Capabilities（逗号分隔）',
+    lblCaps: '能力声明 Capabilities（逗号分隔）', lblDefaultCtx: '默认上下文长度 DefaultContextLength', defaultCtxHint: '上游未返回元数据且模型未单独配置时使用；0=内置 1000000', lblDefaultMaxOut: '默认最大输出 DefaultMaxOutputTokens', defaultMaxOutHint: '上游未返回元数据且模型未单独配置时使用；0=内置 384000',
     lblVisionPrompt: '全局视觉代理提示词 VisionProxyPrompt', visionPromptHint: '模型未自定义提示词时使用；留空=内置默认提示词', visionPromptPh: '请仔细查看这张图片，用简体中文详细描述图片中的全部内容...',
     lblVisionQuality: '全局图片质量 VisionImageQuality', visionQualityHint: '模型单独的图片质量优先；识别前统一压缩图片', vqOriginal: '原图 · 不压缩', vqHigh: '高质量 · JPEG 90%', vqBalanced: '平衡 · JPEG 70%（默认）', vqEco: '节省流量 · JPEG 40% + 最长边 1024', vqCustom: '自定义 · 压缩质量百分比',
     lblVisionCustomPercent: '自定义压缩质量百分比 CustomPercent（1-100）',
     lblVisionProxyMemCacheSize: '视觉代理图片内存缓存大小 VisionProxyMemCacheSize', visionProxyMemCacheSizeHint: '视觉代理识别成功保存本地后同时放入内存，再次遇到相同图片直接命中内存（毫秒级），减少磁盘读取、延长固态寿命；0=禁用；启动时预加载最近的 N 条',
+    gifNormalize: '主模型 GIF 转换：把 GIF 动图转换为 PNG 首帧再转发（部分上游不接受 GIF 会报 400 invalid image input；默认关闭；视觉代理路径始终转换）',
     modelAlias: '🔖 模型别名 ModelAlias', modelAliasHint: '将上游模型 ID 显示为友好名称', btnAddAlias: '＋ 添加别名',
     modelDetail: '📐 模型详细设置 ModelDetailedSettings', modelDetailHint: '覆盖上游自动获取的值；VisionProxyModel 可为主模型指定视觉代理', btnAddDetail: '＋ 添加模型设置',
+    detailJumpPh: '快速跳转模型…', detailJumpHint: '选择一个模型，自动滚动到它的设置卡片', detailCountHint: '已配置的模型数量',
+    btnFetchModels: '🔄 获取模型列表', modelsFetching: '获取中…', modelsCount: '✅ {n} 个模型',
+    modelsFetched: '✅ 已获取 {n} 个模型，点击模型输入框即可下拉选择',
+    modelsEmpty: '⚠️ 上游没有返回任何模型',
+    modelsFetchFail: '❌ 获取模型列表失败：',
+    modelPickHint: '点击可从上游模型列表中选择，也可手动输入',
+    mpNoModels: '尚未获取模型列表<br>点顶部「🔄 获取模型列表」后再试',
+    mpNoMatch: '没有匹配的模型',
+    mpCount: '{n} / {total} 个模型',
+    mpKeyHint: '↑↓ 选择 · Enter 确认 · Esc 关闭',
     ctxTitle: '🧭 模型上下文信息注入 ModelContextPrompt', ctxHint: '在提示词中附加当前模型信息（模型ID/上下文长度/最大输出），帮助模型自我认知', ctxEnable: '启用：对话时自动注入当前位置模型信息',
     ctxPos: '插入位置 Position', ctxPosPrepend: 'prepend · 插入到首条 system 消息开头（无 system 则新建）', ctxPosAppend: 'append · 追加到消息末尾',
     ctxTemplate: '模板 Template', ctxTemplateHint: '占位符：{model} 模型ID · {context_length} 上下文长度 · {max_output_tokens} 最大输出 · {capabilities} 能力列表 · {vision} 视觉说明（原生/代理/不支持）', ctxTemplatePh: '当前你运行在 {model} 模型上，上下文窗口长度 {context_length} tokens，单次最大输出 {max_output_tokens} tokens，支持的能力：{capabilities}。{vision}。请据此合理分配你的思考和输出长度。',
@@ -478,8 +732,19 @@ var I18N = {
     dlpDedup: '内容去重（单轮响应内）：跳过与上一块相同的内容，截断与已发送全文重复的片段',
     dlpRepeatCheck: '跨请求复读检测（跨轮次）：请求与回复均与上一轮相同时判定复读并提醒（需记录每轮回复全文）',
     dlpWarn: '跨请求警告注入：熔断/复读后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）',
-    dlpThinkTag: '思考标签消毒（独立于总开关生效）：裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]，防止 ollama cloud 死循环（长上下文退化时模型会把字面 &lt;/thinking&gt; 泄漏进正文，客户端回放历史后上游渲染器在裸标签处截断消息历史导致死循环）',
+    dlpThinkTag: '思考标签消毒',
+    dlpThinkTagHint: '裸 &lt;thinking&gt;/&lt;/thinking&gt; 泄漏替换为 [THINK-START]/[THINK-END]，防止 ollama cloud 死循环（独立于下方「启用」生效）',
+    dlpThinkTagRequest: '请求侧消毒',
+    dlpThinkTagRequestHint: '客户端历史 → 上游：防止上游渲染器在裸标签处截断 assistant 历史',
+    dlpThinkTagResponse: '响应侧消毒',
+    dlpThinkTagResponseHint: '上游 → 客户端：阻止脏标签污染客户端会话历史（根治源头）',
+    dlpThinkTagRoles: '请求侧生效角色',
+    dlpThinkTagRolesHint: '默认只处理 assistant（死循环的真正污染源）；tool 工具输出里的字面标签多属内容的一部分，默认跳过以免误触发',
     dlpMaxRepeat: '连续重复熔断阈值 MaxRepeat（≥2，默认 3）',
+    dlpRepeatEntries: '复读记录会话数上限 RepeatMaxEntries（默认 256，仅占内存，不影响判断精度）',
+    dlpLimitRepeatEntries: '限制复读记录条数（关闭 = 不限条数）',
+    dlpRepeatTTL: '复读记录保留分钟 RepeatTTLMin（默认 30）',
+    dlpLimitRepeatTTL: '限制复读记录有效期（关闭 = 永不过期）',
     dlpWarnPrompt: '跨请求警告提示词 WarnPrompt', dlpWarnHint: '熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）', dlpWarnPh: '【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。',
     rulesTitle: '✂️ 请求提示词替换 RequestPromptReplace', rulesHint: '自动替换请求中的指定文本', btnAddRule: '＋ 添加替换规则',
     btnReload: '🔄 重新加载', btnSave: '💾 保存配置', btnLogout: '🔒 退出登录',
@@ -489,6 +754,7 @@ var I18N = {
     lblModel: '模型', lblContextLength: '上下文长度 ContextLength', lblMaxOutput: '最大输出 MaxOutputTokens',
     lblCapsShort: '能力 Capabilities（逗号分隔）', lblVisionProxyModel: '视觉代理模型 VisionProxyModel（主模型不支持图片时，用此模型识别图片）',
     lblVisionProxyPrompt: '视觉代理提示词 VisionProxyPrompt（留空=默认提示词）', visionProxyPh: '请仔细查看这张图片，用简体中文详细描述图片中的全部内容...',
+    lblGifNormalizeShort: '主模型 GIF 转换（留空=全局）', gifFollowGlobal: '跟随全局（默认）', gifOn: '开启 · 转 PNG 首帧', gifOff: '关闭 · 原样转发',
     lblVqShort: '图片质量（留空=全局）', vqDefault: '跟随全局（默认）',
     lblEnable: '启用', lblRuleName: '规则名', ruleNamePh: '规则名称（唯一）',
     lblMode: '替换模式（互斥，只能选一种）', modeNormal: '📄 普通替换', modeWhole: '📝 匹配整段替换', modeForce: '⚡ 强制替换',
@@ -530,14 +796,52 @@ var I18N = {
     rtProt_repeat_internal: 'Internal repeat', rtProt_repeat_cross: 'Cross-request repeat',
     rtProt_warn_inject: 'Repeat warning injected', rtProt_assistant_loop: 'Assistant loop detected',
     rtProt_vision_proxy: 'Vision proxy', rtProt_ctx_inject: 'Model context injected',
+    rtProt_gif_normalize: 'GIF direct conversion',
     rtProt_prompt_replace: 'Prompt replaced', rtProt_model_alias: 'Model name restored',
-    connListen: '🖥️ Listen Settings', connListenHint: 'IP / PORT changes require restart',
-    lblIP: 'Listen IP', lblPort: 'Listen Port',
+    connListen: '🖥️ Listen Settings', connListenHint: 'IP / PORT / port combination changes require restart',
+    lblIP: 'Listen IP', lblPort: 'HTTP port PORT (plaintext, always on)',
     connUpstream: '📡 Upstream API', connUpstreamHint: 'Leave OPENAI_KEY empty to keep current key',
     lblBase: 'OPENAI_BASE', lblKey: 'OPENAI_KEY', keyEncrypted: 'Encrypted', keyPlaceholder: 'Leave empty to keep; enter plaintext to auto-encrypt',
     poolTitle: '🔌 Connection Pool ConnPool', poolHint: 'HTTP/2 + keep-alive reuse; 0 = default; takes effect immediately after save',
     poolMaxIdle: 'Global max idle MaxIdleConns', poolMaxIdlePerHost: 'Idle per host MaxIdleConnsPerHost', poolMaxConnsPerHost: 'Max conns per host MaxConnsPerHost',
     poolIdleTimeout: 'Idle timeout (s) IdleConnTimeoutSec', poolTlsTimeout: 'TLS handshake timeout (s) TLSHandshakeTimeoutSec', poolForceH2: 'Force HTTP/2 (HTTPS upstream)',
+    limitTitle: '🛡️ Overload Protection ProxyLimit', limitHint: 'Prevents high-concurrency OOM: turning a "limit" switch off means truly unlimited; takes effect immediately after save',
+    limitEnable: 'Enable: limit concurrency and request body size to keep the service alive (off by default)',
+    limitConcurrency: 'Limit concurrency (off = unlimited, all requests pass through)',
+    limitMaxConcurrent: 'Max concurrent requests MaxConcurrent (excess queues, default 32)',
+    limitQueueTimeout: 'Limit queue wait time (off = queue without timeout, wait for client to disconnect)',
+    limitQueueTimeoutVal: 'Queue timeout seconds QueueTimeoutSec (returns 503, default 60)',
+    limitRequestBody: 'Limit request body size (off = unlimited; recommended off for image requests)',
+    limitMaxBody: 'Max request body MaxRequestBodyMB (MB, returns 413, default 32)',
+    stTitle: '⏱️ Server Timeout ServerTimeout', stHint: 'Prevents slow-connection pile-up; IP / PORT / this group require a restart',
+    stLimitReadHeader: 'Limit read-header time (off = unlimited)', stReadHeader: 'Read header timeout (s) ReadHeaderTimeoutSec (default 30)',
+    stLimitIdle: 'Reclaim idle connections (off = never reclaim)', stIdle: 'Idle timeout (s) IdleTimeoutSec (default 120)',
+    stLimitMaxHeader: 'Limit request header size (off = unlimited)', stMaxHeader: 'Max header MB MaxHeaderMB (default 1)',
+    tlsTitle: '🔐 Inbound TLS ServerTLS', tlsHint: 'Certificates and encryption options; changes require a restart',
+    tlsEnable: 'Enable inbound encryption: expose extra HTTPS / mixed ports (certificates are configured in the ServerTLS card below)',
+    tlsPortsHint: 'The three ports must differ: the HTTP port is PORT above; HTTPS / mixed ports are toggled independently and require a port number',
+    tlsHttpsPortEnable: 'Enable HTTPS port (encrypted only)',
+    tlsHttpsPort: 'HTTPS port HTTPSPort',
+    tlsHttpsRedirect: 'Auto-redirect http:// accesses on this port to https:// (308 Permanent Redirect)',
+    tlsMixedPortEnable: 'Enable mixed port (HTTP and HTTPS on the same port)',
+    tlsMixedPort: 'Mixed port MixedPort',
+    tlsCertMode: 'Certificate source CertMode',
+    tlsCertAuto: 'Auto-generate self-signed certificate (built-in CA, downloadable)',
+    tlsCertFileMode: 'Use custom certificate files (XCA / OpenSSL / mkcert)',
+    tlsCertDir: 'Auto certificate directory CertDir (empty = certs)',
+    tlsCertFileLbl: 'Server certificate CertFile (PEM)',
+    tlsKeyFileLbl: 'Server private key KeyFile (PEM)',
+    tlsCAFileLbl: 'CA certificate CAFile (PEM, optional: chain completion / mTLS validation)',
+    tlsCAKeyFileLbl: 'CA private key CAKeyFile (PEM, must be unencrypted; used only when re-issuing)',
+    tlsReissue: 'Re-issue server certificate with the CA (fixes missing SAN / expiry / hostname mismatch; usually required for XCA certificates)',
+    tlsClientAuth: 'Require client certificate (mTLS; a CA certificate is required)',
+    tlsCAInfoLabel: 'CA certificate status',
+    btnDownloadCA: '⬇️ Download CA certificate',
+    tlsNoCert: 'Certificate not generated yet (saving with TLS enabled will generate it; for custom mode fill in the paths first)',
+    tlsFingerprint: 'CA SHA-256 fingerprint', tlsNotAfter: 'CA valid until', tlsServerDomains: 'Server certificate covers', tlsSep: ': ',
+    tlsCADownloaded: '⬇️ CA certificate download started', tlsCADownloadFail: 'Failed to download CA certificate: ',
+    tlsChain: 'Certificates in chain', tlsReissued: 'Re-issued by CA', tlsServerSubject: 'Server certificate subject',
+    tlsWarnings: 'Certificate diagnostics:',
     secPw: '🔒 Access Password', secPwHint: 'Prevent others on LAN from modifying; leave empty to keep',
     lblWebPw: 'Config page password WebConfigPassword', pwEnabled: 'Enabled', webPwPlaceholder: 'Leave empty to keep; new password requires re-login',
     secPwTip: '💡 After setting, /config requires password and all config APIs are protected',
@@ -551,15 +855,28 @@ var I18N = {
     logTitle: '📜 Logging', lblLogLimit: 'Terminal log limit Log_Limit',
     lblLogResp: 'Print response', lblLogHeaders: 'Print headers', lblLogBody: 'Print body',
     modelDisplay: '🧩 Model Display', modelDisplayHint: 'Only affects model names seen by client',
+    subModelDisplay: '🧩 Display', subModelVision: '🖼 Vision', subModelCtx: '🧭 Context', subModelDlp: '🚨 Protection', subModelAlias: '🔖 Alias', subModelDetail: '📐 Details',
+    visionTitle: '🖼️ Vision Proxy', visionHint: 'Recognizes images with a proxy model when the main model lacks vision; results are cached locally by image + prompt',
     lblPrefix: 'Model name prefix OpenAI_Prefix', lblSuffix: 'Model name suffix OpenAI_Suffix',
     lblStreamMode: 'Stream mode StreamMode', smPreserve: 'preserve · no override (default)', smForceStream: 'force_stream · force streaming', smForceClose: 'force_close · force close',
-    lblCaps: 'Capabilities (comma separated)',
+    lblCaps: 'Capabilities (comma separated)', lblDefaultCtx: 'Default context length DefaultContextLength', defaultCtxHint: 'Used when upstream returns no model metadata and the model has no per-model setting; 0 = built-in 1000000', lblDefaultMaxOut: 'Default max output DefaultMaxOutputTokens', defaultMaxOutHint: 'Used when upstream returns no model metadata and the model has no per-model setting; 0 = built-in 384000',
     lblVisionPrompt: 'Global vision proxy prompt VisionProxyPrompt', visionPromptHint: 'Used when model has no custom prompt; empty = built-in default', visionPromptPh: 'Please look at this image carefully and describe all its contents in detail...',
     lblVisionQuality: 'Global image quality VisionImageQuality', visionQualityHint: 'Per-model quality takes priority; images are compressed before recognition', vqOriginal: 'Original · no compression', vqHigh: 'High · JPEG 90%', vqBalanced: 'Balanced · JPEG 70% (default)', vqEco: 'Eco · JPEG 40% + max edge 1024', vqCustom: 'Custom · compression quality %',
     lblVisionCustomPercent: 'Custom compression quality CustomPercent (1-100)',
     lblVisionProxyMemCacheSize: 'Vision proxy image memory cache size VisionProxyMemCacheSize', visionProxyMemCacheSizeHint: 'After vision proxy recognition, results are also kept in memory; the same image hits memory instantly (ms), reducing disk reads and extending SSD life; 0 = disabled; preloads the latest N entries at startup',
+    gifNormalize: 'Main-model GIF conversion: convert animated GIFs to their first PNG frame before forwarding (some upstreams reject GIF with 400 invalid image input; off by default; the vision proxy path always converts)',
     modelAlias: '🔖 Model Alias ModelAlias', modelAliasHint: 'Show friendly names for upstream model IDs', btnAddAlias: '＋ Add Alias',
     modelDetail: '📐 Model Detailed Settings ModelDetailedSettings', modelDetailHint: 'Override upstream values; VisionProxyModel sets a vision proxy for the main model', btnAddDetail: '＋ Add Model Setting',
+    detailJumpPh: 'Jump to model…', detailJumpHint: 'Pick a model to scroll to its settings card', detailCountHint: 'Number of configured models',
+    btnFetchModels: '🔄 Fetch models', modelsFetching: 'Fetching…', modelsCount: '✅ {n} models',
+    modelsFetched: '✅ Fetched {n} models — click a model field to pick from the list',
+    modelsEmpty: '⚠️ Upstream returned no models',
+    modelsFetchFail: '❌ Failed to fetch model list: ',
+    modelPickHint: 'Click to pick from the upstream model list, or type manually',
+    mpNoModels: 'Model list not loaded yet<br>Click "🔄 Fetch models" at the top first',
+    mpNoMatch: 'No matching models',
+    mpCount: '{n} / {total} models',
+    mpKeyHint: '↑↓ select · Enter confirm · Esc close',
     ctxTitle: '🧭 Model Context Injection ModelContextPrompt', ctxHint: 'Appends current model info (ID/context length/max output) to the prompt, helping the model understand itself', ctxEnable: 'Enable: inject current model info into prompts on every request',
     ctxPos: 'Insert position Position', ctxPosPrepend: 'prepend · Insert at the start of the first system message (create one if none)', ctxPosAppend: 'append · Append to the end of messages',
     ctxTemplate: 'Template Template', ctxTemplateHint: 'Placeholders: {model} ID · {context_length} context length · {max_output_tokens} max output · {capabilities} capabilities · {vision} vision note (native/proxy/none)', ctxTemplatePh: 'You are running on the {model} model with a context window of {context_length} tokens, a max output of {max_output_tokens} tokens, and capabilities: {capabilities}. {vision}. Allocate your thinking and output length accordingly.',
@@ -567,8 +884,19 @@ var I18N = {
     dlpDedup: 'Content dedup (within a single response): skip blocks identical to the previous one, truncate fragments repeating the already-sent text',
     dlpRepeatCheck: 'Cross-request repeat check (across turns): flag as repetition when request and reply both match the previous round (stores each round reply)',
     dlpWarn: 'Cross-request warning injection: after tripping/repetition, inject a system warning into the next request so the AI stops repeating (once only)',
-    dlpThinkTag: 'Think-tag sanitization (independent of master switch): replace bare &lt;thinking&gt;/&lt;/thinking&gt; leaks with [THINK-START]/[THINK-END] to prevent ollama cloud loops (under long-context degeneration the model leaks a literal &lt;/thinking&gt; into text; when clients replay that history, the upstream renderer truncates the message at the bare tag, causing a loop)',
+    dlpThinkTag: 'Think-tag sanitization',
+    dlpThinkTagHint: 'Replace bare &lt;thinking&gt;/&lt;/thinking&gt; leaks with [THINK-START]/[THINK-END] to prevent ollama cloud loops (independent of the Enable switch below)',
+    dlpThinkTagRequest: 'Request-side sanitization',
+    dlpThinkTagRequestHint: 'Client history → upstream: prevents the upstream renderer from truncating assistant history at bare tags',
+    dlpThinkTagResponse: 'Response-side sanitization',
+    dlpThinkTagResponseHint: 'Upstream → client: stops dirty tags from polluting the client session history (root fix)',
+    dlpThinkTagRoles: 'Active roles (request side)',
+    dlpThinkTagRolesHint: 'Only assistant is handled by default (the real loop source); literal tags inside tool output are usually part of the content itself and are skipped to avoid false positives',
     dlpMaxRepeat: 'Consecutive repeat trip threshold MaxRepeat (≥2, default 3)',
+    dlpRepeatEntries: 'Repeat record session limit RepeatMaxEntries (default 256, memory only, no effect on accuracy)',
+    dlpLimitRepeatEntries: 'Limit repeat record count (off = unlimited)',
+    dlpRepeatTTL: 'Repeat record TTL minutes RepeatTTLMin (default 30)',
+    dlpLimitRepeatTTL: 'Limit repeat record TTL (off = never expires)',
     dlpWarnPrompt: 'Cross-request warning prompt WarnPrompt', dlpWarnHint: 'After tripping, inject a system warning into the next request so the AI stops repeating (once only)', dlpWarnPh: '[System warning] Your previous reply contained duplicated content (possible loop). Stop repeating immediately and give the final answer directly. Do not repeat any already-output text.',
     rulesTitle: '✂️ Request Prompt Replace RequestPromptReplace', rulesHint: 'Automatically replace specified text in requests', btnAddRule: '＋ Add Rule',
     btnReload: '🔄 Reload', btnSave: '💾 Save Config', btnLogout: '🔒 Logout',
@@ -577,6 +905,7 @@ var I18N = {
     lblModel: 'Model', lblContextLength: 'Context Length', lblMaxOutput: 'Max Output Tokens',
     lblCapsShort: 'Capabilities (comma separated)', lblVisionProxyModel: 'Vision proxy model VisionProxyModel (used to recognize images when main model lacks vision)',
     lblVisionProxyPrompt: 'Vision proxy prompt VisionProxyPrompt (empty = default)', visionProxyPh: 'Please look at this image carefully and describe all its contents in detail...',
+    lblGifNormalizeShort: 'Main-model GIF conversion (empty = global)', gifFollowGlobal: 'Follow global (default)', gifOn: 'On · convert to PNG first frame', gifOff: 'Off · forward as-is',
     lblVqShort: 'Image quality (empty = global)', vqDefault: 'Follow global (default)',
     lblEnable: 'Enable', lblRuleName: 'Rule name', ruleNamePh: 'Rule name (unique)',
     lblMode: 'Replace mode (mutually exclusive)', modeNormal: '📄 Normal replace', modeWhole: '📝 Whole-match replace', modeForce: '⚡ Force replace',
@@ -638,6 +967,11 @@ function applyI18n(){
   if(rb){ rb.textContent = t('rtRefresh'); }
   var cb = $('rtClearBtn');
   if(cb){ cb.textContent = t('rtClear'); }
+  // 模型选择器浮层：切语言时 renderDetails() 会重建卡片 DOM，
+  // 旧输入框节点被销毁 → 浮层失去锚点，直接关闭最稳妥（下次点开自然重定位）
+  if(typeof mpClose === 'function'){ mpClose(); }
+  // 入站加密的 CA 状态文本随语言切换刷新（内容含动态字段）
+  if(typeof renderTLSInfo === 'function' && state.tlsCA){ renderTLSInfo(state.tlsCA); }
   // 更新监听地址（含翻译）
   updateListenAddr();
 }
@@ -652,9 +986,15 @@ function toggleLang(){
 function updateListenAddr(){
   var ip = $('IP').value || '0.0.0.0';
   var port = $('PORT').value || '11434';
+  // 头部显示全部已启用的端口（HTTP 端口 = PORT，HTTPS / 混合端口各自独立）
+  var parts = ['http ' + ip + ':' + port];
+  var httpsOn = $('TLSHttpsPortEnable') && $('TLSHttpsPortEnable').checked;
+  var mixedOn = $('TLSMixedPortEnable') && $('TLSMixedPortEnable').checked;
+  if(httpsOn && $('TLSHttpsPort').value.trim()){ parts.push('https ' + ip + ':' + $('TLSHttpsPort').value.trim()); }
+  if(mixedOn && $('TLSMixedPort').value.trim()){ parts.push('mixed ' + ip + ':' + $('TLSMixedPort').value.trim()); }
   // 更新 sub 里的监听地址（subListen 含 {addr} 占位符）
   var sub = document.querySelector('[data-i18n="subListen"]');
-  if(sub){ sub.innerHTML = t('subListen', { addr: '<span id="listenAddr">' + ip + ':' + port + '</span>' }); }
+  if(sub){ sub.innerHTML = t('subListen', { addr: '<span id="listenAddr">' + parts.join(' · ') + '</span>' }); }
 }
 // ================= 中英文切换结束 =================
 
@@ -668,6 +1008,278 @@ function switchTab(name){
   });
   // 切到实时请求页时启动 SSE 实时推送，离开时断开（省资源）
   if(name === 'realtime'){ rtStart(); } else { rtStop(); }
+}
+
+// -------- 二级子页（模型设置内部）--------
+// 状态保存在 DOM class 上；同时写 localStorage，刷新后恢复到上次停留的子页
+function switchSubTab(panel, name){
+  document.querySelectorAll('.subpanel').forEach(function(p){
+    p.classList.toggle('active', p.id === 'sub-' + panel + '-' + name);
+  });
+  document.querySelectorAll('#tab-' + panel + ' .subtab').forEach(function(s){
+    s.classList.toggle('active', s.getAttribute('data-subtab') === name);
+  });
+  // 快速跳转工具栏：仅「详细设置」子页显示（位于吸顶的 Tab 条右侧，滚动时始终可见）
+  var tools = $('detailTools');
+  if(tools){ tools.classList.toggle('show', panel === 'model' && name === 'detail'); }
+  try{ localStorage.setItem('cfg_sub_' + panel, name); }catch(e){}
+}
+
+// -------- 模型详细设置：快速跳转 --------
+// 重建跳转下拉（模型名变化/增删时调用）；保留当前选中项
+function renderDetailJump(){
+  var sel = $('detailJump');
+  if(!sel){ return; }
+  var cur = sel.value;
+  var opts = ['<option value="">' + esc(t('detailJumpPh')) + '</option>'];
+  state.details.forEach(function(d, i){
+    var name = (d.model || '').trim() || ('#' + (i + 1));
+    opts.push('<option value="' + i + '">' + esc(name) + '</option>');
+  });
+  sel.innerHTML = opts.join('');
+  sel.title = t('detailJumpHint');
+  if(cur !== '' && state.details[Number(cur)]){ sel.value = cur; }
+  var cnt = $('detailCount');
+  if(cnt){ cnt.textContent = state.details.length; cnt.title = t('detailCountHint'); }
+}
+
+// 跳到指定模型卡片：先切到「详细设置」子页，再滚动定位并高亮
+function jumpToDetail(v){
+  if(v === '' || v == null){ return; }
+  var idx = Number(v);
+  switchSubTab('model', 'detail');
+  var el = document.getElementById('detailCard_' + idx);
+  if(!el){ return; }
+  // 子页刚切换完成，稍等一帧再滚动才能拿到正确坐标
+  setTimeout(function(){
+    // block:'start' + 卡片上的 scroll-margin-top，让卡片顶部正好落在吸顶条下方
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    el.classList.remove('flash');
+    void el.offsetWidth; // 强制回流，重新触发动画
+    el.classList.add('flash');
+    setTimeout(function(){ el.classList.remove('flash'); }, 1600);
+  }, 60);
+  var sel = $('detailJump');
+  if(sel){ sel.value = ''; } // 复位，方便下次重复选中同一项
+}
+
+// 模型名输入时只更新状态（不重建 DOM，避免光标跳动），单独刷新跳转列表
+function onDetailModelInput(i, v){
+  if(!state.details[i]){ return; }
+  state.details[i].model = v;
+  renderDetailJump();
+}
+
+// -------- 模型选择器：自定义可搜索下拉 --------
+// 从 /api/config/test 拉取上游 /models 的模型 ID 列表，供「详细设置」里的
+// 模型 / 视觉代理模型输入框下拉选择。
+// 为什么不用原生 <datalist>：候选框的间距、圆角、hover 高亮全部由系统渲染，无法自定义，
+// 在深色 UI 里始终显得突兀；这里用一个 position:fixed 浮层自己画，风格与页面完全一致。
+// 输入框仍是普通 text，随时可以手填（模型可能尚未部署到上游，或列表拉取失败）。
+
+var mpState = { input: null, items: [], active: -1, q: '' };
+
+function mpPanelEl(){ return $('mpPanel'); }
+
+// mpOpen 在指定输入框下方（空间不足则上方）展开候选面板
+// 打开时先展示【全部】候选：用户点开通常是想看有哪些可选，
+// 若按当前值预先过滤，反而只剩一条（当前值本身），失去浏览意义。
+// 当前值与候选相同的项会用绿色高亮（见 mpRender 的 mp-cur）。
+function mpOpen(input){
+  var p = mpPanelEl();
+  if(!p || !input){ return; }
+  mpState.input = input;
+  mpState.active = -1;
+  p.classList.remove('hidden');
+  mpRender('');
+  mpPosition(input);
+}
+
+function mpClose(){
+  var p = mpPanelEl();
+  if(p){ p.classList.add('hidden'); }
+  mpState.input = null;
+  mpState.active = -1;
+}
+
+// mpPosition 跟随输入框定位：下方空间够就往下弹，否则往上翻
+function mpPosition(input){
+  var p = mpPanelEl();
+  if(!p || !input || p.classList.contains('hidden')){ return; }
+  var r = input.getBoundingClientRect();
+  var ph = p.offsetHeight || 240;
+  var roomBelow = window.innerHeight - r.bottom;
+  var top = roomBelow > ph + 12 ? (r.bottom + 4) : Math.max(8, r.top - ph - 4);
+  p.style.left = Math.round(r.left) + 'px';
+  p.style.top = Math.round(top) + 'px';
+  p.style.width = Math.round(r.width) + 'px';
+}
+
+// mpRender 按关键词过滤后渲染候选列表（含底部提示，sticky 始终可见）
+// 过滤词记在 mpState.q 上：切语言等「非用户输入」的刷新场景要用同一个词重渲染，
+// 否则会被输入框当前值再过滤一次，列表莫名塌缩。
+function mpRender(q){
+  var p = mpPanelEl();
+  if(!p){ return; }
+  mpState.q = (q == null ? '' : String(q));
+  var all = state.modelOptions || [];
+  var kw = mpState.q.trim().toLowerCase();
+  var list = kw ? all.filter(function(x){ return x.toLowerCase().indexOf(kw) >= 0; }) : all.slice();
+  mpState.items = list;
+  if(mpState.active >= list.length){ mpState.active = -1; }
+  var cur = mpState.input ? String(mpState.input.value || '').trim() : '';
+  var html = '';
+  if(!all.length){
+    html = '<div class="mp-empty">' + t('mpNoModels') + '</div>';
+  } else if(!list.length){
+    html = '<div class="mp-empty">' + t('mpNoMatch') + '</div>';
+  } else {
+    for(var i = 0; i < list.length; i++){
+      // 与输入框当前值完全相同的项标绿，方便看出「已选中」
+      var cls = 'mp-item' + (i === mpState.active ? ' active' : '') + (list[i] === cur ? ' mp-cur' : '');
+      html += '<div class="' + cls + '" data-mp-idx="' + i + '" title="' + esc(list[i]) + '">' + esc(list[i]) + '</div>';
+    }
+  }
+  html += '<div class="mp-foot"><span>' + t('mpCount', { n: list.length, total: all.length }) +
+          '</span><span class="mp-kbd">' + t('mpKeyHint') + '</span></div>';
+  p.innerHTML = html;
+}
+
+// mpPick 选中第 idx 项：写回输入框并派发 input 事件（触发卡片上内联的 oninput → 同步 state）
+function mpPick(idx){
+  var input = mpState.input;
+  if(!input){ return; }
+  var val = mpState.items[idx];
+  if(val == null){ return; }
+  input.value = val;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+  mpClose();
+  input.blur();
+}
+
+// mpSetActive 只切换高亮项，不重建列表。
+// ⚠️ 键盘导航绝不能调 mpRender(el.value)：那会按输入框当前值重新过滤，
+// 用户一按 ↓ 列表就塌缩成「只有当前值那一项」。
+function mpSetActive(i){
+  var p = mpPanelEl();
+  if(!p){ return; }
+  mpState.active = i;
+  var items = p.querySelectorAll('.mp-item');
+  for(var k = 0; k < items.length; k++){
+    items[k].classList.toggle('active', k === i);
+  }
+  mpScrollActive();
+}
+
+// 键盘导航：↑↓ 移动、Enter 确认、Esc 关闭、Tab 关闭
+function mpKeydown(e){
+  var p = mpPanelEl();
+  if(!p || p.classList.contains('hidden')){ return; }
+  var n = mpState.items.length;
+  if(e.key === 'ArrowDown'){
+    e.preventDefault();
+    if(n){ mpSetActive((mpState.active + 1) % n); }
+  } else if(e.key === 'ArrowUp'){
+    e.preventDefault();
+    if(n){ mpSetActive((mpState.active - 1 + n) % n); }
+  } else if(e.key === 'Enter'){
+    if(mpState.active >= 0){ e.preventDefault(); mpPick(mpState.active); }
+    else if(n === 1){ e.preventDefault(); mpPick(0); }  // 唯一候选直接选中
+    else { mpClose(); }
+  } else if(e.key === 'Escape' || e.key === 'Tab'){
+    mpClose();
+  }
+}
+
+function mpScrollActive(){
+  var p = mpPanelEl();
+  if(!p){ return; }
+  var el = p.querySelector('.mp-item.active');
+  if(el && el.scrollIntoView){ el.scrollIntoView({ block: 'nearest' }); }
+}
+
+// 全局委托：聚焦打开、输入过滤、键盘导航、点击外部关闭、滚动时跟随
+document.addEventListener('focusin', function(e){
+  var el = e.target;
+  if(el && el.classList && el.classList.contains('model-pick')){ mpOpen(el); }
+});
+document.addEventListener('input', function(e){
+  var el = e.target;
+  if(el && el.classList && el.classList.contains('model-pick') && mpState.input === el){
+    mpState.active = -1;
+    mpRender(el.value);
+    mpPosition(el);
+  }
+});
+// 点击输入框重新打开面板：Esc / 点击外部关闭后输入框仍保有焦点，
+// 此时再点它不会触发 focusin（焦点没变），必须靠 click 兜底，否则「关了就再也打不开」。
+document.addEventListener('click', function(e){
+  var el = e.target;
+  if(!el || !el.classList || !el.classList.contains('model-pick')){ return; }
+  var p = mpPanelEl();
+  if(p && p.classList.contains('hidden')){ mpOpen(el); }
+});
+document.addEventListener('keydown', function(e){
+  var el = e.target;
+  if(el && el.classList && el.classList.contains('model-pick')){ mpKeydown(e); }
+});
+// 用 mousedown 而不是 click：先 preventDefault 可避免输入框失焦导致面板提前关闭
+document.addEventListener('mousedown', function(e){
+  var p = mpPanelEl();
+  if(!p || p.classList.contains('hidden')){ return; }
+  var it = e.target && e.target.closest ? e.target.closest('.mp-item') : null;
+  if(it){
+    e.preventDefault();
+    mpPick(Number(it.getAttribute('data-mp-idx')));
+    return;
+  }
+  // 点在面板自身（滚动条/空白）或另一个 .model-pick 上都不关；其余位置关闭
+  if(p.contains(e.target)){ return; }
+  if(e.target && e.target.classList && e.target.classList.contains('model-pick')){ return; }
+  mpClose();
+});
+window.addEventListener('scroll', function(){
+  if(mpState.input){ mpPosition(mpState.input); }
+}, true);
+window.addEventListener('resize', function(){
+  if(mpState.input){ mpPosition(mpState.input); }
+});
+
+// fetchModelList 拉取上游模型列表。
+// btn 为 null 时表示静默调用（不显示提示）；silent=true 时失败也不弹错误。
+async function fetchModelList(btn, silent){
+  var oldHTML = btn ? btn.innerHTML : '';
+  if(btn){ btn.disabled = true; btn.innerHTML = t('modelsFetching'); }
+  try{
+    var res = await api('/api/config/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // 传当前表单值：用户可能刚改了 BASE/KEY 但还没保存
+      body: JSON.stringify({
+        OPENAI_BASE: $('OPENAI_BASE').value.trim(),
+        OPENAI_KEY: $('OPENAI_KEY').value.trim()
+      })
+    });
+    var models = (res && res.models) || [];
+    state.modelOptions = models;
+    state.modelsFetched = true;
+    // 面板正开着时立即刷新内容（沿用当前过滤词）
+    if(mpState.input){ mpRender(mpState.q); mpPosition(mpState.input); }
+    if(btn){ btn.innerHTML = t('modelsCount', { n: models.length }); }
+    if(!silent){
+      if(models.length){ toast(t('modelsFetched', { n: models.length }), 'ok'); }
+      else { toast(t('modelsEmpty'), 'err'); }
+    }
+  }catch(e){
+    if(btn){ btn.innerHTML = oldHTML; }
+    if(!silent){ toast(t('modelsFetchFail') + e.message, 'err'); }
+  }finally{
+    if(btn){
+      btn.disabled = false;
+      // 短暂显示结果数量后恢复按钮原文案
+      setTimeout(function(){ btn.innerHTML = t('btnFetchModels'); }, 2200);
+    }
+  }
 }
 
 function esc(s){
@@ -809,6 +1421,8 @@ async function loadCfg(notify){
     $('OpenAI_Suffix').value = c.OpenAI_Suffix || '';
     $('StreamMode').value = c.StreamMode || 'preserve';
     $('Capabilities').value = (c.Capabilities || []).join(', ');
+    $('DefaultContextLength').value = c.DefaultContextLength != null ? c.DefaultContextLength : 1000000;
+    $('DefaultMaxOutputTokens').value = c.DefaultMaxOutputTokens != null ? c.DefaultMaxOutputTokens : 384000;
     $('VisionProxyPrompt').value = c.VisionProxyPrompt || '';
     // 全局图片质量（枚举 + 自定义百分比）
     var vq = c.VisionImageQuality || {};
@@ -820,6 +1434,8 @@ async function loadCfg(notify){
     toggleVisionQualityInputs();
     // 视觉代理图片内存缓存大小（0=禁用）
     $('VisionProxyMemCacheSize').value = c.VisionProxyMemCacheSize != null ? c.VisionProxyMemCacheSize : 200;
+    // 直连路径 GIF 转换（默认关闭）
+    $('GifNormalize').checked = !!c.GifNormalize;
 
     // 实时请求查看（RealtimeLog）
     var rl = c.RealtimeLog || {};
@@ -836,6 +1452,47 @@ async function loadCfg(notify){
     $('poolTlsTimeout').value = cp.TLSHandshakeTimeoutSec || '';
     $('poolForceH2').checked = cp.ForceHTTP2 !== false;
 
+    // 过载保护（限制项均为「布尔开关 + 具体数值」）
+    var pl = c.ProxyLimit || {};
+    $('LimitEnable').checked = !!pl.Enable;
+    $('LimitConcurrency').checked = pl.LimitConcurrency !== false;
+    $('LimitMaxConcurrent').value = pl.MaxConcurrent || 32;
+    $('LimitQueueTimeout').checked = pl.LimitQueueTimeout !== false;
+    $('LimitQueueTimeoutVal').value = pl.QueueTimeoutSec || 60;
+    $('LimitRequestBody').checked = !!pl.LimitRequestBody;
+    $('LimitMaxBody').value = pl.MaxRequestBodyMB || 32;
+    toggleLimitInputs();
+
+    // 服务器超时（修改需重启生效）
+    var st = c.ServerTimeout || {};
+    $('StLimitReadHeader').checked = st.LimitReadHeader !== false;
+    $('StReadHeader').value = st.ReadHeaderTimeoutSec || 30;
+    $('StLimitIdle').checked = st.LimitIdle !== false;
+    $('StIdle').value = st.IdleTimeoutSec || 120;
+    $('StLimitMaxHeader').checked = st.LimitMaxHeader !== false;
+    $('StMaxHeader').value = st.MaxHeaderMB || 1;
+    toggleServerTimeoutInputs();
+
+    // 入站加密（修改需重启生效）：HTTP 端口就是 PORT，HTTPS / 混合端口各自独立
+    var ts = c.ServerTLS || {};
+    $('TLSEnable').checked = !!ts.Enable;
+    $('TLSHttpsPortEnable').checked = !!ts.HTTPSPortEnable;
+    $('TLSHttpsPort').value = ts.HTTPSPort || '';
+    $('TLSHttpsRedirect').checked = ts.HTTPSRedirect !== false;
+    $('TLSMixedPortEnable').checked = !!ts.MixedPortEnable;
+    $('TLSMixedPort').value = ts.MixedPort || '';
+    $('TLSCertMode').value = (ts.CertMode === 'file') ? 'file' : 'auto';
+    $('TLSCertDir').value = ts.CertDir || 'certs';
+    $('TLSCertFile').value = ts.CertFile || '';
+    $('TLSKeyFile').value = ts.KeyFile || '';
+    $('TLSCAFile').value = ts.CAFile || '';
+    $('TLSCAKeyFile').value = ts.CAKeyFile || '';
+    $('TLSReissue').checked = !!ts.ReissueServerCert;
+    $('TLSClientAuth').checked = !!ts.ClientAuth;
+    state.tlsCA = c.TLS_CA || null;
+    renderTLSInfo(state.tlsCA);
+    toggleTLSInputs();
+
     // 模型上下文信息注入
     var ctx = c.ModelContextPrompt || {};
     $('CtxEnable').checked = !!ctx.Enable;
@@ -849,7 +1506,21 @@ async function loadCfg(notify){
     $('DlpRepeatCheck').checked = !!dlp.RepeatCheck;
     $('DlpWarn').checked = !!dlp.Warn;
     $('DlpThinkTag').checked = dlp.ThinkTag !== false;
+    // 请求侧/响应侧：字段缺失时跟随总开关（与后端旧配置迁移保持一致）
+    $('DlpThinkTagRequest').checked = (dlp.ThinkTagRequest != null) ? !!dlp.ThinkTagRequest : (dlp.ThinkTag !== false);
+    $('DlpThinkTagResponse').checked = (dlp.ThinkTagResponse != null) ? !!dlp.ThinkTagResponse : (dlp.ThinkTag !== false);
+    // 请求侧生效角色：字段缺失时默认只处理 assistant
+    $('DlpThinkTagRoleAssistant').checked = (dlp.ThinkTagRoleAssistant != null) ? !!dlp.ThinkTagRoleAssistant : true;
+    $('DlpThinkTagRoleUser').checked = !!dlp.ThinkTagRoleUser;
+    $('DlpThinkTagRoleSystem').checked = !!dlp.ThinkTagRoleSystem;
+    $('DlpThinkTagRoleTool').checked = !!dlp.ThinkTagRoleTool;
+    toggleThinkTagInputs();
     $('DlpMaxRepeat').value = dlp.MaxRepeat || 3;
+    $('DlpRepeatEntries').value = (dlp.RepeatMaxEntries != null) ? dlp.RepeatMaxEntries : 256;
+    $('DlpRepeatTTL').value = (dlp.RepeatTTLMin != null) ? dlp.RepeatTTLMin : 30;
+    $('DlpLimitRepeatEntries').checked = dlp.LimitRepeatEntries !== false;
+    $('DlpLimitRepeatTTL').checked = dlp.LimitRepeatTTL !== false;
+    toggleRepeatInputs();
     $('DlpWarnPrompt').value = dlp.WarnPrompt || '';
     toggleDlpInputs();
 
@@ -865,7 +1536,7 @@ async function loadCfg(notify){
     if(c.ModelDetailedSettings){
       Object.keys(c.ModelDetailedSettings).forEach(function(k){
         var s = c.ModelDetailedSettings[k] || {};
-        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', '), vpm: s.VisionProxyModel || '', vpp: s.VisionProxyPrompt || '', vq: (s.VisionImageQuality || {}).Quality || '', vqp: (s.VisionImageQuality || {}).CustomPercent || '' });
+        state.details.push({ model: k, cl: s.ContextLength || '', mot: s.MaxOutputTokens || '', caps: (s.Capabilities || []).join(', '), vpm: s.VisionProxyModel || '', vpp: s.VisionProxyPrompt || '', vq: (s.VisionImageQuality || {}).Quality || '', vqp: (s.VisionImageQuality || {}).CustomPercent || '', gif: s.GifNormalize === true ? 'on' : (s.GifNormalize === false ? 'off' : '') });
       });
     }
     renderDetails();
@@ -885,6 +1556,8 @@ async function loadCfg(notify){
     }
     renderRules();
     updateListenAddr();
+    // 首次加载时静默拉一次上游模型列表（失败不打扰用户；之后靠「获取模型列表」按钮手动刷新）
+    if(!state.modelsFetched){ fetchModelList(null, true); }
     if(notify){ toast(t('toastReloaded')); }
   }catch(e){
     toast(t('toastLoadFail') + e.message, 'err');
@@ -913,17 +1586,24 @@ function renderDetails(){
   state.details.forEach(function(d, i){
     var el = document.createElement('div');
     el.className = 'card-item';
+    el.id = 'detailCard_' + i; // 快速跳转定位用
     el.innerHTML =
       '<div class="item-head"><span class="name">' + t('lblModel') + '</span>' +
-      '<input type="text" class="mono" style="flex:1" value="' + esc(d.model) + '" placeholder="' + t('upModelIdPh2') + '" oninput="state.details[' + i + '].model=this.value">' +
+      '<input type="text" class="mono model-pick" style="flex:1" value="' + esc(d.model) + '" placeholder="' + t('upModelIdPh2') + '" oninput="onDetailModelInput(' + i + ',this.value)" title="' + t('modelPickHint') + '">' +
       '<button class="btn danger" onclick="removeAt(state.details,' + i + ',renderDetails)" title="' + t('btnDelete') + '">✕</button></div>' +
       '<div class="grid3">' +
       '<div class="row"><label>' + t('lblContextLength') + '</label><input type="number" min="0" value="' + esc(d.cl) + '" placeholder="1000000" oninput="state.details[' + i + '].cl=this.value"></div>' +
       '<div class="row"><label>' + t('lblMaxOutput') + '</label><input type="number" min="0" value="' + esc(d.mot) + '" placeholder="384000" oninput="state.details[' + i + '].mot=this.value"></div>' +
       '<div class="row"><label>' + t('lblCapsShort') + '</label><input type="text" value="' + esc(d.caps) + '" placeholder="tools, vision" oninput="state.details[' + i + '].caps=this.value"></div>' +
       '</div>' +
-      '<div class="row"><label>' + t('lblVisionProxyModel') + '</label><input type="text" class="mono" value="' + esc(d.vpm) + '" placeholder="gpt-4o" oninput="state.details[' + i + '].vpm=this.value"></div>' +
+      '<div class="row"><label>' + t('lblVisionProxyModel') + '</label><input type="text" class="mono model-pick" value="' + esc(d.vpm) + '" placeholder="gpt-4o" oninput="state.details[' + i + '].vpm=this.value" title="' + t('modelPickHint') + '"></div>' +
       '<div class="row"><label>' + t('lblVisionProxyPrompt') + '</label><textarea rows="2" placeholder="' + t('visionProxyPh') + '" oninput="state.details[' + i + '].vpp=this.value">' + esc(d.vpp) + '</textarea></div>' +
+      '<div class="row"><label>' + t('lblGifNormalizeShort') + '</label>' +
+      '<select onchange="state.details[' + i + '].gif=this.value">' +
+      '<option value=""' + (d.gif === '' ? ' selected' : '') + '>' + t('gifFollowGlobal') + '</option>' +
+      '<option value="on"' + (d.gif === 'on' ? ' selected' : '') + '>' + t('gifOn') + '</option>' +
+      '<option value="off"' + (d.gif === 'off' ? ' selected' : '') + '>' + t('gifOff') + '</option>' +
+      '</select></div>' +
       '<div class="grid2">' +
       '<div class="row"><label>' + t('lblVqShort') + '</label>' +
       '<select onchange="state.details[' + i + '].vq=this.value;syncVqInput(' + i + ')">' +
@@ -943,6 +1623,8 @@ function renderDetails(){
       '</div>';
     box.appendChild(el);
   });
+  // 同步快速跳转下拉（模型名/数量变化后立即生效）
+  renderDetailJump();
 }
 
 function renderRules(){
@@ -988,13 +1670,163 @@ function removeAt(arr, i, render){ arr.splice(i, 1); render(); }
 // 注意：ThinkTag 思考标签消毒独立于总开关生效，不参与置灰
 function toggleDlpInputs(){
   var on = $('DlpEnable').checked;
-  ['rowDlpDedup','rowDlpRepeatCheck','rowDlpWarn','rowDlpMaxRepeat','rowDlpWarnPrompt'].forEach(function(id){
+  ['rowDlpDedup','rowDlpRepeatCheck','rowDlpWarn','rowDlpMaxRepeat','rowDlpRepeatEntries','rowDlpRepeatTTL','rowDlpRepeatEntriesVal','rowDlpRepeatTTLVal','rowDlpWarnPrompt'].forEach(function(id){
+    var row = $(id);
+    if(row){ row.classList.toggle('disabled-row', !on); }
+  });
+  // 总开关开启时，再按各自的限制开关细化置灰
+  if (on) { toggleRepeatInputs(); }
+}
+
+// 过载保护：总开关关闭时子项置灰
+function toggleLimitInputs(){
+  var on = $('LimitEnable').checked;
+  ['rowLimitMaxConcurrent','rowLimitQueueTimeout','rowLimitMaxBody'].forEach(function(id){
     var row = $(id);
     if(row){ row.classList.toggle('disabled-row', !on); }
   });
 }
 
-// 全局图片质量：custom 档位时显示自定义百分比输入框
+// 过载保护：三级联动（总开关 → 各项限制开关 → 具体数值输入框）
+function toggleLimitInputs(){
+  var on = $('LimitEnable').checked;
+  ['rowLimitConcurrency','rowLimitQueueTimeout','rowLimitRequestBody'].forEach(function(id){
+    var row = $(id); if(row){ row.classList.toggle('disabled-row', !on); }
+  });
+  // 子项数值框：总开关关 或 该项限制开关关 → 置灰
+  var pairs = [['LimitConcurrency','rowLimitMaxConcurrent'],['LimitQueueTimeout','rowLimitQueueTimeoutVal'],['LimitRequestBody','rowLimitMaxBody']];
+  pairs.forEach(function(p){
+    var row = $(p[1]); if(!row){ return; }
+    var disabled = !on || !$(p[0]).checked;
+    row.classList.toggle('disabled-row', disabled);
+  });
+}
+
+// 入站加密：总开关 / 两个加密端口 / 证书来源 逐级联动
+function toggleTLSInputs(){
+  var on = $('TLSEnable').checked;
+  // 两个加密端口各自独立启停（HTTP 端口固定就是 PORT，不需要开关）
+  var httpsOn = on && $('TLSHttpsPortEnable').checked;
+  var mixedOn = on && $('TLSMixedPortEnable').checked;
+  // 任一加密端口启用 → 必须有证书配置
+  var needCert = httpsOn || mixedOn;
+  var fileMode = $('TLSCertMode').value === 'file';
+
+  // 端口输入框：跟随各自开关
+  var pairs = [['rowTLSHttpsPortEnable', on], ['rowTLSMixedPortEnable', on], ['rowTLSHttpsPort', httpsOn], ['rowTLSHttpsRedirect', httpsOn], ['rowTLSMixedPort', mixedOn]];
+  pairs.forEach(function(p){
+    var r = $(p[0]); if(r){ r.classList.toggle('disabled-row', !p[1]); }
+  });
+  // 证书相关：只有存在加密端口时才需要
+  ['rowTLSCertMode','rowTLSCAFile','rowTLSClientAuth','rowTLSCAInfo'].forEach(function(id){
+    var r = $(id); if(r){ r.classList.toggle('disabled-row', !needCert); }
+  });
+  // 证书来源二选一
+  var autoRow = $('rowTLSCertDir'), certRow = $('rowTLSCertFile'), keyRow = $('rowTLSKeyFile');
+  if(autoRow){ autoRow.classList.toggle('hidden', fileMode); autoRow.classList.toggle('disabled-row', !needCert); }
+  if(certRow){ certRow.classList.toggle('hidden', !fileMode); certRow.classList.toggle('disabled-row', !needCert); }
+  if(keyRow){ keyRow.classList.toggle('hidden', !fileMode); keyRow.classList.toggle('disabled-row', !needCert); }
+  // 重签开关与 CA 私钥（仅自定义证书模式有意义）
+  var reissueOn = $('TLSReissue').checked;
+  var rr = $('rowTLSReissue'), rk = $('rowTLSCAKeyFile');
+  if(rr){ rr.classList.toggle('hidden', !fileMode); rr.classList.toggle('disabled-row', !needCert); }
+  if(rk){
+    rk.classList.toggle('hidden', !fileMode || !reissueOn);
+    rk.classList.toggle('disabled-row', !needCert || !reissueOn);
+  }
+  // 头部监听地址提示同步刷新
+  if(typeof updateListenAddr === 'function'){ updateListenAddr(); }
+}
+
+// 渲染 CA 证书状态（指纹 / 有效期 / 覆盖域名）
+function renderTLSInfo(info){
+  var box = $('tlsCAInfo');
+  var btn = $('btnDownloadCA');
+  if(!box){ return; }
+  if(!info || !info.Available){
+    var msg = t('tlsNoCert');
+    if(info && info.Error){ msg += t('tlsSep') + info.Error; }
+    box.innerHTML = '<span class="tls-err">' + tlsEsc(msg) + '</span>';
+    if(btn){ btn.disabled = true; }
+    return;
+  }
+  var lines = [
+    [t('tlsFingerprint'), info.Fingerprint || '-'],
+    [t('tlsNotAfter'), info.NotAfter || '-'],
+    [t('tlsServerDomains'), (info.ServerDomains || []).join(', ') || '-']
+  ];
+  if(info.ServerSubject){ lines.push([t('tlsServerSubject'), info.ServerSubject]); }
+  if(info.ChainLength){ lines.push([t('tlsChain'), String(info.ChainLength)]); }
+  if(info.Reissued){ lines.push([t('tlsReissued'), info.CertFile || '-']); }
+  var body = lines.map(function(p){
+    return '<span class="tls-key">' + tlsEsc(p[0]) + tlsEsc(t('tlsSep')) + '</span><span class="tls-val mono">' + tlsEsc(p[1]) + '</span>';
+  }).join('<br>');
+  if(info.Warnings && info.Warnings.length){
+    body += '<br><span class="tls-err">' + tlsEsc(t('tlsWarnings')) + '</span><br>';
+    body += info.Warnings.map(function(w){ return '<span class="tls-err">⚠️ ' + tlsEsc(w) + '</span>'; }).join('<br>');
+  }
+  box.innerHTML = body;
+  if(btn){ btn.disabled = !info.Downloadable; }
+}
+
+function tlsEsc(s){
+  return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c];
+  });
+}
+
+// 下载 CA 证书（带配置页会话鉴权；浏览器直接打开链接无法带请求头，故用 fetch + Blob）
+async function downloadCA(){
+  try{
+    var token = sessionStorage.getItem('cfg_token') || '';
+    var headers = {};
+    if(token){ headers['X-Config-Token'] = token; }
+    var res = await fetch('/api/config/ca', { headers: headers });
+    if(res.status === 401){ clearSession(); showLogin(); throw new Error(t('authExpired')); }
+    if(!res.ok){ throw new Error('HTTP ' + res.status); }
+    var blob = await res.blob();
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'remote-convert-ollama-ca.crt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 5000);
+    toast(t('tlsCADownloaded'), 'ok');
+  }catch(e){
+    toast(t('tlsCADownloadFail') + e.message, 'err');
+  }
+}
+
+// 服务器超时：每项限制开关联动对应数值框
+function toggleServerTimeoutInputs(){
+  [['StLimitReadHeader','rowStReadHeader'],['StLimitIdle','rowStIdle'],['StLimitMaxHeader','rowStMaxHeader']].forEach(function(p){
+    var row = $(p[1]); if(!row){ return; }
+    row.classList.toggle('disabled-row', !$(p[0]).checked);
+  });
+}
+
+// 复读记录：限制开关联动数值框
+function toggleRepeatInputs(){
+  [['DlpLimitRepeatEntries','rowDlpRepeatEntriesVal'],['DlpLimitRepeatTTL','rowDlpRepeatTTLVal']].forEach(function(p){
+    var row = $(p[1]); if(!row){ return; }
+    row.classList.toggle('disabled-row', !$(p[0]).checked);
+  });
+}
+
+// 思考标签消毒：三级联动（总开关 → 请求侧/响应侧 → 请求侧生效角色）
+// 注意：整组独立于 DoomLoopProtection.Enable，不受总开关置灰影响
+function toggleThinkTagInputs(){
+  var on = $('DlpThinkTag').checked;
+  var reqOn = on && $('DlpThinkTagRequest').checked;
+  ['rowDlpThinkTagRequest','rowDlpThinkTagResponse'].forEach(function(id){
+    var row = $(id); if(row){ row.classList.toggle('disabled-row', !on); }
+  });
+  // 请求侧关闭时，角色勾选无意义 → 置灰
+  var roleRow = $('rowDlpThinkTagRoles');
+  if(roleRow){ roleRow.classList.toggle('disabled-row', !reqOn); }
+}
 function toggleVisionQualityInputs(){
   var row = $('rowVisionCustomPercent');
   if(row){ row.style.display = $('VisionImageQuality').value === 'custom' ? '' : 'none'; }
@@ -1030,6 +1862,9 @@ function collectCfg(){
     if(dc.length){ o.Capabilities = dc; }
     if(d.vpm && d.vpm.trim()){ o.VisionProxyModel = d.vpm.trim(); }
     if(d.vpp && d.vpp.trim()){ o.VisionProxyPrompt = d.vpp.trim(); }
+    // 模型级 GIF 转换：留空=跟随全局；on/off=显式覆盖
+    if(d.gif === 'on'){ o.GifNormalize = true; }
+    else if(d.gif === 'off'){ o.GifNormalize = false; }
     // 模型级图片质量：留空=跟随全局；custom 档位带上自定义百分比（夹取 1-100）
     if(d.vq && d.vq.trim()){
       var vqo = { Quality: d.vq.trim() };
@@ -1067,12 +1902,15 @@ function collectCfg(){
     OpenAI_Suffix: $('OpenAI_Suffix').value,
     StreamMode: $('StreamMode').value,
     Capabilities: splitList($('Capabilities').value),
+    DefaultContextLength: parseInt($('DefaultContextLength').value, 10) || 1000000,
+    DefaultMaxOutputTokens: parseInt($('DefaultMaxOutputTokens').value, 10) || 384000,
     VisionProxyPrompt: $('VisionProxyPrompt').value.trim(),
     VisionImageQuality: {
       Quality: $('VisionImageQuality').value,
       CustomPercent: $('VisionImageQuality').value === 'custom' ? (parseInt($('VisionCustomPercent').value, 10) || 0) : 0
     },
     VisionProxyMemCacheSize: parseInt($('VisionProxyMemCacheSize').value, 10) || 0,
+    GifNormalize: $('GifNormalize').checked,
     RealtimeLog: {
       Enable: $('RtEnable').checked,
       MaxEntries: parseInt($('RtMaxEntries').value, 10) || 100,
@@ -1089,9 +1927,19 @@ function collectCfg(){
       Dedup: $('DlpDedup').checked,
       Warn: $('DlpWarn').checked,
       ThinkTag: $('DlpThinkTag').checked,
+      ThinkTagRequest: $('DlpThinkTagRequest').checked,
+      ThinkTagResponse: $('DlpThinkTagResponse').checked,
+      ThinkTagRoleAssistant: $('DlpThinkTagRoleAssistant').checked,
+      ThinkTagRoleUser: $('DlpThinkTagRoleUser').checked,
+      ThinkTagRoleSystem: $('DlpThinkTagRoleSystem').checked,
+      ThinkTagRoleTool: $('DlpThinkTagRoleTool').checked,
       MaxRepeat: parseInt($('DlpMaxRepeat').value, 10) || 3,
+      RepeatMaxEntries: (function(){ var v = parseInt($('DlpRepeatEntries').value, 10); return isNaN(v) ? 256 : v; })(),
+      LimitRepeatEntries: $('DlpLimitRepeatEntries').checked,
+      RepeatTTLMin: (function(){ var v = parseInt($('DlpRepeatTTL').value, 10); return isNaN(v) ? 30 : v; })(),
+      LimitRepeatTTL: $('DlpLimitRepeatTTL').checked,
       WarnPrompt: $('DlpWarnPrompt').value.trim()
-    },
+      },
     ConnPool: {
       MaxIdleConns: parseInt($('poolMaxIdle').value, 10) || 0,
       MaxIdleConnsPerHost: parseInt($('poolMaxIdlePerHost').value, 10) || 0,
@@ -1099,6 +1947,39 @@ function collectCfg(){
       IdleConnTimeoutSec: parseInt($('poolIdleTimeout').value, 10) || 0,
       TLSHandshakeTimeoutSec: parseInt($('poolTlsTimeout').value, 10) || 0,
       ForceHTTP2: $('poolForceH2').checked
+    },
+    ProxyLimit: {
+      Enable: $('LimitEnable').checked,
+      LimitConcurrency: $('LimitConcurrency').checked,
+      MaxConcurrent: (function(){ var v = parseInt($('LimitMaxConcurrent').value, 10); return isNaN(v) ? 32 : v; })(),
+      LimitQueueTimeout: $('LimitQueueTimeout').checked,
+      QueueTimeoutSec: (function(){ var v = parseInt($('LimitQueueTimeoutVal').value, 10); return isNaN(v) ? 60 : v; })(),
+      LimitRequestBody: $('LimitRequestBody').checked,
+      MaxRequestBodyMB: (function(){ var v = parseInt($('LimitMaxBody').value, 10); return isNaN(v) ? 32 : v; })()
+    },
+    ServerTimeout: {
+      LimitReadHeader: $('StLimitReadHeader').checked,
+      ReadHeaderTimeoutSec: (function(){ var v = parseInt($('StReadHeader').value, 10); return isNaN(v) ? 30 : v; })(),
+      LimitIdle: $('StLimitIdle').checked,
+      IdleTimeoutSec: (function(){ var v = parseInt($('StIdle').value, 10); return isNaN(v) ? 120 : v; })(),
+      LimitMaxHeader: $('StLimitMaxHeader').checked,
+      MaxHeaderMB: (function(){ var v = parseInt($('StMaxHeader').value, 10); return isNaN(v) ? 1 : v; })()
+    },
+    ServerTLS: {
+      Enable: $('TLSEnable').checked,
+      HTTPSPortEnable: $('TLSHttpsPortEnable').checked,
+      HTTPSPort: $('TLSHttpsPort').value.trim(),
+      HTTPSRedirect: $('TLSHttpsRedirect').checked,
+      MixedPortEnable: $('TLSMixedPortEnable').checked,
+      MixedPort: $('TLSMixedPort').value.trim(),
+      CertMode: $('TLSCertMode').value,
+      CertDir: $('TLSCertDir').value.trim(),
+      CertFile: $('TLSCertFile').value.trim(),
+      KeyFile: $('TLSKeyFile').value.trim(),
+      CAFile: $('TLSCAFile').value.trim(),
+      CAKeyFile: $('TLSCAKeyFile').value.trim(),
+      ReissueServerCert: $('TLSReissue').checked,
+      ClientAuth: $('TLSClientAuth').checked
     },
     OPENAI_BASE: $('OPENAI_BASE').value.trim(),
     OPENAI_KEY: $('OPENAI_KEY').value.trim(),
@@ -1372,6 +2253,7 @@ var RT_PROT_META = {
   'warn-inject': { cls: 'trip', icon: '🚨' },
   'assistant-loop': { cls: 'trip', icon: '🚨' },
   'vision-proxy': { cls: 'proc', icon: '🖼' },
+  'gif-normalize': { cls: 'proc', icon: '🎞' },
   'ctx-inject': { cls: 'proc', icon: '🧭' },
   'prompt-replace': { cls: 'proc', icon: '✂' },
   'model-alias': { cls: 'proc', icon: '🔧' }
@@ -1619,6 +2501,11 @@ window.addEventListener('DOMContentLoaded', function(){
     if(localStorage.getItem('rt_fmt') === '0' && $('rtFormat')){ $('rtFormat').checked = false; }
   }catch(e){}
   applyI18n();
+  // 恢复模型设置上次停留的二级子页
+  try{
+    var lastSub = localStorage.getItem('cfg_sub_model');
+    if(lastSub){ switchSubTab('model', lastSub); }
+  }catch(e){}
   initAuth();
 });
 </script>

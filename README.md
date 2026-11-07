@@ -34,6 +34,7 @@
 - 🖼️ **无中生有视觉**：主模型不支持图片时，自动用视觉代理模型识别后合并文本返回
 - 🛠️ **打通工具调用**：Ollama / OpenAI / Anthropic 三种格式的工具调用互相转换，解决 Agent 死循环
 - 🔌 **连接池调优**：HTTP/2 + keep-alive 连接复用，可配置空闲连接数/超时/并发上限，保存后立即生效无需重启
+- 🛡️ **过载保护**：并发闸门 + 请求体上限，防止高并发（尤其带图片）把进程 OOM 掉；「限制」用布尔开关控制，一关就真的不限制
 - 📡 **实时请求查看**：配置页面内实时查看每一笔请求的原始请求体、转发上游请求体、响应体、耗时与 Token 用量，并自动标记本次触发的保护（思考标签消毒/去重/熔断/复读等）
 
 > 💡 **简单来说**：你只需在 VS Code / VS2026 中配置 Ollama 作为 API 提供商，然后指向本程序，就能使用任何 **OpenAI 兼容的 API 服务**（如 DeepSeek、GPT、Claude 等）——并且还能把任何一个模型"调教"成你想要的样子。
@@ -42,13 +43,14 @@
 
 ## 🎯 为什么需要这个工具？
 
-| 问题                                                   | 解决方案                                                     |
-| ------------------------------------------------------ | ------------------------------------------------------------ |
-| ❌ VS Code Copilot Chat 只支持 Ollama API 调用本地模型 | ✅ 本程序模拟 Ollama API，实际调用远程 OpenAI 兼容 API       |
-| ❌ VS2026 仅内置支持 OpenAI + Azure + Anthropic 官方   | ✅ 同时提供 Ollama API + Anthropic Messages API 两种接入方式 |
-| ❌ 官方限制多、地区不可用、价格高昂                    | ✅ 自由选择任意第三方 OpenAI 兼容服务商                      |
-| ❌ API Key 明文存储有泄露风险                          | ✅ AES-GCM 加密存储，绑定机器指纹 + UUID 双重校验            |
-| ❌ 模型被厂商"驯化"，不敢越界、不知道自己的能力     | ✅ 在请求中间层注入人格 + 自我认知，把任何模型"调教"成你想要的样子 |
+
+| 问题                                                   | 解决方案                                                           |
+| -------------------------------------------------------- | -------------------------------------------------------------------- |
+| ❌ VS Code Copilot Chat 只支持 Ollama API 调用本地模型 | ✅ 本程序模拟 Ollama API，实际调用远程 OpenAI 兼容 API             |
+| ❌ VS2026 仅内置支持 OpenAI + Azure + Anthropic 官方   | ✅ 同时提供 Ollama API + Anthropic Messages API 两种接入方式       |
+| ❌ 官方限制多、地区不可用、价格高昂                    | ✅ 自由选择任意第三方 OpenAI 兼容服务商                            |
+| ❌ API Key 明文存储有泄露风险                          | ✅ AES-GCM 加密存储，绑定机器指纹 + UUID 双重校验                  |
+| ❌ 模型被厂商"驯化"，不敢越界、不知道自己的能力        | ✅ 在请求中间层注入人格 + 自我认知，把任何模型"调教"成你想要的样子 |
 
 ---
 
@@ -56,28 +58,30 @@
 
 ### 🔄 多协议转换
 
-| 客户端请求                         | 转换目标                               | 说明                                        |
-| ---------------------------------- | -------------------------------------- | ------------------------------------------- |
-| `GET /api/version`               | → 返回版本信息                        | VS Code 探测 Ollama 服务                    |
-| `GET /api/tags`                  | →`GET /v1/models` (上游)            | 获取模型列表，支持别名、前后缀、上下文信息  |
-| `POST /api/show`                 | → 返回增强模型信息                    | 包含上下文窗口、能力声明、Token 限制等      |
-| `GET /api/ps`                   | → 返回全部模型信息（本地生成）        | 模拟"已加载到内存"状态，Ollama 客户端探活/显示运行模型 |
-| `POST /api/chat`                 | →`POST /v1/chat/completions` (上游) | Ollama 聊天补全 → OpenAI 格式              |
-| `POST /v1/chat/completions`      | →`POST /v1/chat/completions` (上游) | 标准 OpenAI 流式/非流式透传                 |
-| `POST /v1/messages`              | →`POST /v1/chat/completions` (上游) | **Anthropic 格式 → OpenAI 格式转换** |
-| `POST /v1/messages/count_tokens` | → Token 估算                          | Anthropic token 计数接口                    |
-| `GET /v1/models`                 | →`GET /v1/models` (上游)            | 获取上游模型列表                            |
-| `GET /models`                    | →`GET /v1/models` (上游)            | VS Code 旧版 API 兼容                       |
+
+| 客户端请求                       | 转换目标                             | 说明                                                   |
+| ---------------------------------- | -------------------------------------- | -------------------------------------------------------- |
+| `GET /api/version`               | → 返回版本信息                      | VS Code 探测 Ollama 服务                               |
+| `GET /api/tags`                  | →`GET /v1/models` (上游)            | 获取模型列表，支持别名、前后缀、上下文信息             |
+| `POST /api/show`                 | → 返回增强模型信息                  | 包含上下文窗口、能力声明、Token 限制等                 |
+| `GET /api/ps`                    | → 返回全部模型信息（本地生成）      | 模拟"已加载到内存"状态，Ollama 客户端探活/显示运行模型 |
+| `POST /api/chat`                 | →`POST /v1/chat/completions` (上游) | Ollama 聊天补全 → OpenAI 格式                         |
+| `POST /v1/chat/completions`      | →`POST /v1/chat/completions` (上游) | 标准 OpenAI 流式/非流式透传                            |
+| `POST /v1/messages`              | →`POST /v1/chat/completions` (上游) | **Anthropic 格式 → OpenAI 格式转换**                  |
+| `POST /v1/messages/count_tokens` | → Token 估算                        | Anthropic token 计数接口                               |
+| `GET /v1/models`                 | →`GET /v1/models` (上游)            | 获取上游模型列表                                       |
+| `GET /models`                    | →`GET /v1/models` (上游)            | VS Code 旧版 API 兼容                                  |
 
 ### 🧩 客户端接入方式
 
 本服务端对外提供 **三种 API 类型**，客户端按自己支持的协议**任选其一**连接即可——无论走哪种入口，程序都会统一转换为 **OpenAI 兼容 API** 转发给上游（`OPENAI_BASE`）：
 
-| 客户端接口类型                 | 连接地址（示例）                    | 典型客户端                                                                       | 说明                                             |
-| ------------------------------ | ----------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------ |
-| 🔵 **Ollama API**          | `http://127.0.0.1:11434`（`/api/chat`、`/api/tags`、`/api/version`、`/api/show`） | VS Code Copilot Chat、VS2026（Ollama 后端） | 最常用入口，Ollama 生态客户端开箱即用，零配置     |
-| 🟢 **OpenAI 兼容 API**    | `http://127.0.0.1:11434/v1`（`/v1/chat/completions`、`/v1/models`）               | 一切支持 OpenAI 格式的客户端（NextChat、Cherry Studio、LobeChat、自定义脚本等）   | 把 Base URL 指向本机 `/v1` 即可，无需任何转换     |
-| 🟣 **Anthropic Messages API** | `http://127.0.0.1:11434/v1`（`/v1/messages`、`/v1/messages/count_tokens`）       | 支持 Anthropic 格式的客户端（如 VS2026 Anthropic 后端）                          | 自动完成 Anthropic → OpenAI 转换后转发上游 |
+
+| 客户端接口类型                | 连接地址（示例）                                                                  | 典型客户端                                                                      | 说明                                          |
+| ------------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------- |
+| 🔵 **Ollama API**             | `http://127.0.0.1:11434`（`/api/chat`、`/api/tags`、`/api/version`、`/api/show`） | VS Code Copilot Chat、VS2026（Ollama 后端）                                     | 最常用入口，Ollama 生态客户端开箱即用，零配置 |
+| 🟢 **OpenAI 兼容 API**        | `http://127.0.0.1:11434/v1`（`/v1/chat/completions`、`/v1/models`）               | 一切支持 OpenAI 格式的客户端（NextChat、Cherry Studio、LobeChat、自定义脚本等） | 把 Base URL 指向本机 `/v1` 即可，无需任何转换 |
+| 🟣 **Anthropic Messages API** | `http://127.0.0.1:11434/v1`（`/v1/messages`、`/v1/messages/count_tokens`）        | 支持 Anthropic 格式的客户端（如 VS2026 Anthropic 后端）                         | 自动完成 Anthropic → OpenAI 转换后转发上游   |
 
 > 💡 **简单总结**：上游只需要是 **OpenAI 兼容 API**；而你的客户端无论是只认 **Ollama**、只认 **OpenAI**、还是只认 **Anthropic** 协议，都能直接连本服务端，协议差异由程序在中间自动转换。
 
@@ -88,6 +92,7 @@
 - ✅ **显示名前缀/后缀** — 在客户端看到类似 `[VC反代] 高级智商` 的模型名称
 - ✅ **思考功能** — 返回 `think: true` 启用推理能力
 - ✅ **Reasoning 内容追踪** — 自动追踪 DeepSeek 思考模式，后续请求自动注入 `reasoning_content`
+  （按「会话 + 模型 ID」隔离，只补最后一条 assistant 消息，Ollama / OpenAI 两条协议流式与非流式全覆盖）
 - ✅ **VS Code 兼容映射** — `reasoning_content` → `reasoning_text` 自动映射
 - ✅ **超大上下文** — 声明 1M tokens 上下文窗口，支持每模型独立设置
 - ✅ **流式传输 (SSE)** — 支持 `stream: true`，实时输出
@@ -115,12 +120,14 @@
 - **自动获取模型列表**：启动时显示上游所有可用模型及其别名映射、上下文长度、最大输出
 - **流式策略**：支持 `preserve` / `force_stream` / `force_close` 三种模式灵活切换
 - **日志分级**：可分别控制请求头(`Log_Headers`)、请求体(`Log_Body`)、响应内容(`Log_Responses`)的日志打印
-- **模型详细设置**：`ModelDetailedSettings` 支持为每个模型单独指定上下文长度、最大输出 Token 和能力列表
+- **模型详细设置**：`ModelDetailedSettings` 支持为每个模型单独指定上下文长度、最大输出 Token 和能力列表；模型名/视觉代理模型输入框支持从上游 `/v1/models` 拉取列表后**可搜索下拉选择**（自定义浮层，同时保留手动输入）
 - **视觉代理模型**：`VisionProxyModel` 为主模型指定视觉代理，图片请求自动识别后合并文本，识别结果本地缓存防重复消耗 token
 - **请求提示词替换**：`RequestPromptReplace` 支持自动替换请求消息中的指定文本，实现 Copilot 自有提示词篡改等高级玩法
 - **模型上下文注入**：`ModelContextPrompt` 在对话时自动把当前模型信息（模型ID/上下文长度/最大输出/能力/视觉说明）注入提示词，让 AI 自我认知，更合理地规划思考与输出长度
 - **末日循环保护**：`DoomLoopProtection` 检测上游内容重复（相邻块/全文尾部/跨请求复读）并熔断，防止客户端陷入重试死循环
 - **连接池设置**：`ConnPool` 可配置上游 HTTP/2 + keep-alive 连接池（空闲连接数/超时/并发上限），保存后立即生效，无需重启
+- **过载保护**：`ProxyLimit` 并发闸门 + 请求体上限，防止高并发 OOM（进程被系统静默杀掉）；每项「是否限制」都是独立布尔开关，关闭 = 完全不限制，保存后立即生效
+- **服务器超时**：`ServerTimeout` 配置入站 HTTP 服务器的读头超时/空闲回收/请求头上限，防慢速连接堆积（修改需重启生效）
 - **实时请求查看**：`RealtimeLog` 在内存中记录最近的请求与响应（原始请求体/转发上游请求体/响应体/耗时/Token 用量），配置页面「📡 实时请求」页实时查看（SSE 推送），自动标记触发的保护（思考标签消毒/去重/熔断/复读/视觉代理等），只存内存不写磁盘
 
 ---
@@ -213,12 +220,40 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
         "TLSHandshakeTimeoutSec": 10,
         "ForceHTTP2": true
     },
+    "ProxyLimit": {
+        "Enable": false,
+        "LimitConcurrency": true,
+        "MaxConcurrent": 32,
+        "LimitQueueTimeout": true,
+        "QueueTimeoutSec": 60,
+        "LimitRequestBody": false,
+        "MaxRequestBodyMB": 32
+    },
+    "ServerTimeout": {
+        "LimitReadHeader": true,
+        "ReadHeaderTimeoutSec": 30,
+        "LimitIdle": true,
+        "IdleTimeoutSec": 120,
+        "LimitMaxHeader": true,
+        "MaxHeaderMB": 1
+    },
     "DoomLoopProtection": {
         "Enable": false,
         "Dedup": false,
         "RepeatCheck": false,
         "MaxRepeat": 3,
-        "WarnPrompt": ""
+        "WarnPrompt": "",
+        "ThinkTag": true,
+        "ThinkTagRequest": true,
+        "ThinkTagResponse": true,
+        "ThinkTagRoleAssistant": true,
+        "ThinkTagRoleUser": false,
+        "ThinkTagRoleSystem": false,
+        "ThinkTagRoleTool": false,
+        "LimitRepeatEntries": true,
+        "RepeatMaxEntries": 256,
+        "LimitRepeatTTL": true,
+        "RepeatTTLMin": 30
     },
     "RealtimeLog": {
         "Enable": true,
@@ -228,33 +263,37 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 }
 ```
 
-| 配置项                    | 说明                                                                     | 默认值                                 |
-| ------------------------- | ------------------------------------------------------------------------ | -------------------------------------- |
-| `IP`                    | 监听地址                                                                 | `0.0.0.0`                            |
-| `PORT`                  | 监听端口                                                                 | `11434`                              |
-| `Log_Limit`             | 终端日志自动清理阈值(条)                                                 | `100`                                |
-| `Log_Responses`         | 是否打印响应内容                                                         | `true`                               |
-| `Log_Headers`           | 是否打印请求头                                                           | `true`                               |
-| `Log_Body`              | 是否打印请求体                                                           | `true`                               |
-| `OpenAI_Prefix`         | 模型显示名前缀                                                           | `[VC反代] `                          |
-| `OpenAI_Suffix`         | 模型显示名后缀                                                           | `""` (空)                            |
-| `StreamMode`            | 流式策略                                                                 | `preserve`                           |
-| `Capabilities`          | 能力声明列表                                                             | `["tools", "vision"]`                |
-| `OPENAI_BASE`           | 上游 OpenAI 兼容 API 地址                                                | **必填**                         |
-| `OPENAI_KEY`            | 上游 API 密钥                                                            | **必填**，首次输入明文后自动加密 |
-| `ModelAlias`            | 模型别名映射`{上游ID: 显示名称}`                                       | `{}`                                 |
-| `ModelDetailedSettings` | 模型详细设置`{上游ID: {ContextLength, MaxOutputTokens, Capabilities, VisionProxyModel, VisionProxyPrompt}}` | `{}`                                 |
-| `VisionProxyPrompt`    | 全局默认视觉代理提示词（模型未自定义时使用）                                       | 内置默认提示词                       |
-| `RequestPromptReplace`  | 请求提示词替换规则`{规则名: {enable, mode, role, index, prompt, replace}}`   | `{}`                                 |
-| `ModelContextPrompt`   | 模型上下文信息注入`{Enable, Position, Template}`                         | `{Enable:false, Position:"prepend", Template:内置默认}` |
-| `ConnPool`            | 上游连接池设置`{MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}` | 内置默认（见下表） |
-| `DoomLoopProtection`  | 末日循环保护`{Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt}`         | `{Enable:false, Dedup:false, RepeatCheck:false, MaxRepeat:3, WarnPrompt:""}` |
-| `RealtimeLog`  | 实时请求查看`{Enable, MaxEntries, MaxBodyLen}`（内存记录，不写磁盘）         | `{Enable:true, MaxEntries:100, MaxBodyLen:8000}` |
+
+| 配置项                  | 说明                                                                                                                                                  | 默认值                                                                                                                                                            |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IP`                    | 监听地址                                                                                                                                              | `0.0.0.0`                                                                                                                                                         |
+| `PORT`                  | 监听端口                                                                                                                                              | `11434`                                                                                                                                                           |
+| `Log_Limit`             | 终端日志自动清理阈值(条)                                                                                                                              | `100`                                                                                                                                                             |
+| `Log_Responses`         | 是否打印响应内容                                                                                                                                      | `true`                                                                                                                                                            |
+| `Log_Headers`           | 是否打印请求头                                                                                                                                        | `true`                                                                                                                                                            |
+| `Log_Body`              | 是否打印请求体                                                                                                                                        | `true`                                                                                                                                                            |
+| `OpenAI_Prefix`         | 模型显示名前缀                                                                                                                                        | `[VC反代] `                                                                                                                                                       |
+| `OpenAI_Suffix`         | 模型显示名后缀                                                                                                                                        | `""` (空)                                                                                                                                                         |
+| `StreamMode`            | 流式策略                                                                                                                                              | `preserve`                                                                                                                                                        |
+| `Capabilities`          | 能力声明列表                                                                                                                                          | `["tools", "vision"]`                                                                                                                                             |
+| `OPENAI_BASE`           | 上游 OpenAI 兼容 API 地址                                                                                                                             | **必填**                                                                                                                                                          |
+| `OPENAI_KEY`            | 上游 API 密钥                                                                                                                                         | **必填**，首次输入明文后自动加密                                                                                                                                  |
+| `ModelAlias`            | 模型别名映射`{上游ID: 显示名称}`                                                                                                                      | `{}`                                                                                                                                                              |
+| `ModelDetailedSettings` | 模型详细设置`{上游ID: {ContextLength, MaxOutputTokens, Capabilities, VisionProxyModel, VisionProxyPrompt}}`                                           | `{}`                                                                                                                                                              |
+| `VisionProxyPrompt`     | 全局默认视觉代理提示词（模型未自定义时使用）                                                                                                          | 内置默认提示词                                                                                                                                                    |
+| `RequestPromptReplace`  | 请求提示词替换规则`{规则名: {enable, mode, role, index, prompt, replace}}`                                                                            | `{}`                                                                                                                                                              |
+| `ModelContextPrompt`    | 模型上下文信息注入`{Enable, Position, Template}`                                                                                                      | `{Enable:false, Position:"prepend", Template:内置默认}`                                                                                                           |
+| `ConnPool`              | 上游连接池设置`{MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}`                          | 内置默认（见下表）                                                                                                                                                |
+| `ProxyLimit`            | 过载保护`{Enable, LimitConcurrency, MaxConcurrent, LimitQueueTimeout, QueueTimeoutSec, LimitRequestBody, MaxRequestBodyMB}`（防高并发 OOM，立即生效） | `{Enable:false, LimitConcurrency:true, MaxConcurrent:32, LimitQueueTimeout:true, QueueTimeoutSec:60, LimitRequestBody:false, MaxRequestBodyMB:32}`                |
+| `ServerTimeout`         | 入站服务器超时`{LimitReadHeader, ReadHeaderTimeoutSec, LimitIdle, IdleTimeoutSec, LimitMaxHeader, MaxHeaderMB}`（**需重启生效**）                     | `{LimitReadHeader:true, ReadHeaderTimeoutSec:30, LimitIdle:true, IdleTimeoutSec:120, LimitMaxHeader:true, MaxHeaderMB:1}`                                         |
+| `DoomLoopProtection`    | 末日循环保护`{Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt, ThinkTag, ThinkTagRequest, ThinkTagResponse, ThinkTagRoleAssistant, ThinkTagRoleUser, ThinkTagRoleSystem, ThinkTagRoleTool, LimitRepeatEntries, RepeatMaxEntries, LimitRepeatTTL, RepeatTTLMin}`       | `{Enable:false, Dedup:false, RepeatCheck:false, MaxRepeat:3, ThinkTag:true, ThinkTagRequest:true, ThinkTagResponse:true, ThinkTagRoleAssistant:true, ThinkTagRoleUser:false, ThinkTagRoleSystem:false, ThinkTagRoleTool:false, LimitRepeatEntries:true, RepeatMaxEntries:256, LimitRepeatTTL:true, RepeatTTLMin:30}` |
+| `RealtimeLog`           | 实时请求查看`{Enable, MaxEntries, MaxBodyLen}`（内存记录，不写磁盘）                                                                                  | `{Enable:true, MaxEntries:100, MaxBodyLen:8000}`                                                                                                                  |
 
 **`StreamMode` 说明**：
 
-| 值               | 行为                                 |
-| ---------------- | ------------------------------------ |
+
+| 值             | 行为                                 |
+| ---------------- | -------------------------------------- |
 | `preserve`     | 按客户端请求决定是否流式（默认）     |
 | `force_stream` | 无论客户端是否请求，都强制使用流式   |
 | `force_close`  | 无论客户端是否请求，都强制使用非流式 |
@@ -281,18 +320,65 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 
 **`ConnPool` 连接池说明**：
 
-| 字段 | 说明 | 默认值 |
-| --- | --- | --- |
-| `MaxIdleConns` | 全局最大空闲连接数 | `100` |
-| `MaxIdleConnsPerHost` | 每上游主机最大空闲连接数（Go 默认仅 2，代理场景建议调大） | `32` |
-| `MaxConnsPerHost` | 每上游主机最大并发连接数（防止极端并发打爆文件描述符） | `64` |
-| `IdleConnTimeoutSec` | 空闲连接回收时间（秒） | `90` |
-| `TLSHandshakeTimeoutSec` | TLS 握手超时（秒） | `10` |
-| `ForceHTTP2` | 强制协商 HTTP/2（仅对 `https://` 上游生效，上游不支持自动回退 HTTP/1.1） | `true` |
+
+| 字段                     | 说明                                                                     | 默认值 |
+| -------------------------- | -------------------------------------------------------------------------- | -------- |
+| `MaxIdleConns`           | 全局最大空闲连接数                                                       | `100`  |
+| `MaxIdleConnsPerHost`    | 每上游主机最大空闲连接数（Go 默认仅 2，代理场景建议调大）                | `32`   |
+| `MaxConnsPerHost`        | 每上游主机最大并发连接数（防止极端并发打爆文件描述符）                   | `64`   |
+| `IdleConnTimeoutSec`     | 空闲连接回收时间（秒）                                                   | `90`   |
+| `TLSHandshakeTimeoutSec` | TLS 握手超时（秒）                                                       | `10`   |
+| `ForceHTTP2`             | 强制协商 HTTP/2（仅对 `https://` 上游生效，上游不支持自动回退 HTTP/1.1） | `true` |
 
 - 所有 `http.Client` 共享同一个连接池，连接复用率高，高并发时不再频繁重建 TCP/TLS 连接
 - **保存后立即生效（热更新连接池，无需重启）**；字段填 `0` 回退内置默认值
 - 可通过配置管理页面「🔌 连接设置 → 连接池设置 ConnPool」可视化调整
+
+**`ProxyLimit` 过载保护说明**：
+
+高并发场景（尤其是**带图片的请求**）单个请求体可达数十 MB，若没有任何上限，内存占用会随并发数线性增长，最终被系统当作 OOM 静默杀掉——表现为**进程直接消失、服务停止，日志里看不到任何错误**。
+
+配置设计原则：**「是否限制」用布尔开关表达，「限制值」用整数表达**（不用 `-1`/`0` 这类魔法数字，人读和 AI 读都不容易误判）。
+
+
+| 字段                | 类型 | 说明                                                             | 默认值  |
+| --------------------- | ------ | ------------------------------------------------------------------ | --------- |
+| `Enable`            | bool | 总开关（关闭时不改变任何转发行为）                               | `false` |
+| `LimitConcurrency`  | bool | 是否限制并发数；**`false` = 完全不限并发**（所有请求直接放行）   | `true`  |
+| `MaxConcurrent`     | int  | 最大并发请求数，超出排队（`0` = 用默认值，上限 4096）            | `32`    |
+| `LimitQueueTimeout` | bool | 是否限制排队时间；`false` = 排队不限时（只等客户端断开）         | `true`  |
+| `QueueTimeoutSec`   | int  | 排队超时秒数，超时返回 **503** + `Retry-After`                   | `60`    |
+| `LimitRequestBody`  | bool | 是否限制请求体大小；**`false` = 不限大小**（带图片场景推荐关闭） | `false` |
+| `MaxRequestBodyMB`  | int  | 单请求体上限（MB），超限返回 **413**                             | `32`    |
+
+- **并发闸门**：带缓冲 channel 作为计数信号量，槽位满时请求排队（**排队期间不读请求体、不占内存**）
+- **热更新安全**：修改并发数时只替换信号量，已持有旧槽位的请求归还到**它当初获取的那个** channel —— 既不 panic，也不阻塞在途请求
+- **请求体双保险**：先看 `Content-Length` 直接拒绝（一字节不读），再用 `LimitReader(limit+1)` 兜住 chunked 无长度声明的请求
+- **413 会先丢弃剩余请求体**（`drainRequestBody`，上限 64MB），否则连接会被 RST，客户端只能看到"连接被重置"而读不到中文错误提示
+- 错误体按端点风格区分：`/v1/messages` → Anthropic 格式、`/v1/*` → OpenAI 格式、其他 → Ollama 格式
+- **保存后立即生效（无需重启）**，可通过配置页「🔌 连接设置 → 🛡️ 过载保护 ProxyLimit」调整
+
+> 💡 **建议**：高并发带图场景开启后，`MaxConcurrent` 按内存与上游限流能力设置（如 16~64）；带图片时 `LimitRequestBody` 建议保持关闭。
+
+**`ServerTimeout` 服务器超时说明**：
+
+管的是**客户端连进本服务**这一侧（与 `ConnPool` 的上游连接池方向相反），防慢速攻击与连接堆积。
+
+
+| 字段                   | 类型 | 说明                                           | 默认值 |
+| ------------------------ | ------ | ------------------------------------------------ | -------- |
+| `LimitReadHeader`      | bool | 是否限制读请求头时间；`false` = 不限时         | `true` |
+| `ReadHeaderTimeoutSec` | int  | 从连接建立起，多少秒内必须发完请求头，否则断开 | `30`   |
+| `LimitIdle`            | bool | 是否回收空闲 keep-alive 连接；`false` = 不回收 | `true` |
+| `IdleTimeoutSec`       | int  | 空闲连接多久回收（秒）                         | `120`  |
+| `LimitMaxHeader`       | bool | 是否限制请求头大小；`false` = 不限大小         | `true` |
+| `MaxHeaderMB`          | int  | 单次请求头最大体积（MB）                       | `1`    |
+
+- **慢速攻击（Slowloris）防护**：无超时时，上千个"每秒只发 1 字节请求头"的连接会永远挂着，占满 goroutine 与文件句柄
+- **连接泄漏防护**：客户端异常退出留下的死连接会被自动回收
+- **刻意不提供 `ReadTimeout` / `WriteTimeout`**：`WriteTimeout` 会中途掐断 SSE 流式对话，`ReadTimeout` 会中断几十 MB 的大请求体上传
+- ⚠️ **修改需重启程序生效**——Go 的 `http.Server` 字段不允许在 `Serve()` 之后修改
+- ⚠️ `MaxHeaderMB` 的"不限制"在 Go 里要特殊处理：`MaxHeaderBytes = 0` 表示**使用默认 1MB**，所以开关关闭时会显式填入极大值
 
 > ⚠️ **注意**：`OPENAI_KEY` 在第一次启动后会自动加密并回写到配置文件中。后续启动将使用加密后的密钥，换机器会提示"机器码不匹配"。
 
@@ -326,21 +412,24 @@ go build -o "Remote Convert Ollama.exe" "Remote Convert Ollama.go"
 
 页面功能一览：
 
-| 功能                         | 说明                                                                               |
-| ---------------------------- | ---------------------------------------------------------------------------------- |
-| 📡**上游 API**         | 修改`OPENAI_BASE`，密钥输入明文后**自动加密保存**（留空表示保持当前密钥）  |
-| 🔌**测试连接**         | 一键测试上游连通性，显示上游可用模型列表                                           |
-| 🔒**访问密码**         | 设置`WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改） |
-| 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                            |
-| 🔌**连接池设置**     | 可视化调整`ConnPool`（HTTP/2 + keep-alive 连接复用），**保存后立即生效，无需重启** |
-| 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                       |
-| 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                         |
-| 🧭**模型上下文注入** | 可视化配置`ModelContextPrompt`（开关、插入位置、模板）                            |
-| 🚨**末日循环保护** | 可视化配置`DoomLoopProtection`（总开关 + 去重/复读检测/熔断阈值/警告提示词，分级置灰联动） |
-| 📡**实时请求** | 实时查看每一笔请求（SSE 推送 + 手动刷新），展开查看原始请求体/转发上游请求体/响应体，自动标记触发的保护，可暂停/清空/隐藏探活请求 |
-| 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                      |
-| 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力、视觉代理模型与提示词）                  |
-| ✂️**提示词替换规则** | 可视化增删`RequestPromptReplace` 规则                                            |
+
+| 功能                   | 说明                                                                                                                                           |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 📡**上游 API**         | 修改`OPENAI_BASE`，密钥输入明文后**自动加密保存**（留空表示保持当前密钥）                                                                      |
+| 🔌**测试连接**         | 一键测试上游连通性，显示上游可用模型列表                                                                                                       |
+| 🔒**访问密码**         | 设置`WebConfigPassword` 后，访问页面和所有配置接口需输入密码（防局域网他人乱改）                                                               |
+| 🖥️**监听设置**       | 修改`IP` / `PORT`（需重启程序生效）                                                                                                            |
+| 🔌**连接池设置**       | 可视化调整`ConnPool`（HTTP/2 + keep-alive 连接复用），**保存后立即生效，无需重启**                                                             |
+| 🛡️**过载保护**       | 可视化配置`ProxyLimit`：并发闸门 + 请求体上限，防高并发 OOM。每项都有独立的「限制」开关（关闭 = 完全不限制），三级置灰联动，**保存后立即生效** |
+| ⏱️**服务器超时**     | 可视化配置`ServerTimeout`：读头超时 / 空闲连接回收 / 请求头上限，防慢速连接堆积（**需重启生效**）                                              |
+| 📜**日志设置**         | 调整日志清理阈值、响应/请求头/请求体打印开关                                                                                                   |
+| 🧩**模型显示**         | 前后缀、流式策略、能力声明                                                                                                                     |
+| 🧭**模型上下文注入**   | 可视化配置`ModelContextPrompt`（开关、插入位置、模板）                                                                                         |
+| 🚨**末日循环保护**     | 可视化配置`DoomLoopProtection`（总开关 + 去重/复读检测/熔断阈值/警告提示词，分级置灰联动）                                                     |
+| 📡**实时请求**         | 实时查看每一笔请求（SSE 推送 + 手动刷新），展开查看原始请求体/转发上游请求体/响应体，自动标记触发的保护，可暂停/清空/隐藏探活请求              |
+| 🔖**模型别名**         | 可视化增删`ModelAlias` 映射                                                                                                                    |
+| 📐**模型详细设置**     | 可视化增删`ModelDetailedSettings`（上下文长度、最大输出、能力、视觉代理模型与提示词）；顶部「🔄 获取模型列表」可拉取上游模型供下拉选择 |
+| ✂️**提示词替换规则** | 可视化增删`RequestPromptReplace` 规则                                                                                                          |
 
 保存后配置**立即写入 `config.json` 并同步到运行内存**（除 `IP`/`PORT` 外均即时生效），支持 `Ctrl+S` 快捷保存。
 
@@ -400,14 +489,15 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 }
 ```
 
-| 字段                     | 说明                                                         |
-| ------------------------ | ------------------------------------------------------------ |
-| `ProviderName`           | 提供方名称，OpenAI 协议固定填 `"openai"`                     |
-| `CustomURL`              | 本程序 OpenAI 接入地址，固定填 `http://127.0.0.1:11434/v1` |
-| `Id` / `DisplayName`     | 模型 ID 与显示名称（支持 emoji 前缀）                        |
-| `IsToolCallingEnabled`   | 是否启用工具调用（本程序支持，填 `true`）                    |
-| `IsVisionEnabled`        | 是否启用视觉（需模型支持 `vision` 能力或配置了视觉代理）     |
-| `MaxInputTokens` / `MaxOutputTokens` | 上下文长度与最大输出 Token（需与程序配置一致） |
+
+| 字段                                 | 说明                                                       |
+| -------------------------------------- | ------------------------------------------------------------ |
+| `ProviderName`                       | 提供方名称，OpenAI 协议固定填 `"openai"`                   |
+| `CustomURL`                          | 本程序 OpenAI 接入地址，固定填 `http://127.0.0.1:11434/v1` |
+| `Id` / `DisplayName`                 | 模型 ID 与显示名称（支持 emoji 前缀）                      |
+| `IsToolCallingEnabled`               | 是否启用工具调用（本程序支持，填 `true`）                  |
+| `IsVisionEnabled`                    | 是否启用视觉（需模型支持 `vision` 能力或配置了视觉代理）   |
+| `MaxInputTokens` / `MaxOutputTokens` | 上下文长度与最大输出 Token（需与程序配置一致）             |
 
 > 📝 **提示**：模型列表可在程序终端或配置页面（📡 上游 API → 🔌 测试连接）中查看；修改配置文件后需**重启 VS2026** 才能生效。
 
@@ -454,13 +544,30 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
                      模板占位符: {model} {context_length} {max_output_tokens} {capabilities} {vision}
                      {vision} 自动判断: 配置了视觉代理→"图片由代理模型识别"; 否则Capabilities含vision→"原生支持"; 否则→"不支持"
  ▼ DoomLoopProtection : 末日循环保护,检测上游内容重复并熔断,防止客户端陷入重试死循环
-                     格式: {Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt}
+                     格式: {Enable, Dedup, RepeatCheck, MaxRepeat, WarnPrompt, ThinkTag,
+                           LimitRepeatEntries, RepeatMaxEntries, LimitRepeatTTL, RepeatTTLMin}
                      检测到连续重复达 MaxRepeat 次时: 跳过重复内容并强制收尾当前流(D方案),
                      并在下一轮请求自动注入 system 警告提示词,让 AI 停止复读(C方案,只提醒一次)
-                     RepeatCheck 需记录每轮回复全文,且可能误伤正常重复提问,默认关闭
+                     RepeatCheck 需记录每轮回复摘要,且可能误伤正常重复提问,默认关闭
+                     ThinkTag 思考标签消毒总开关(独立于 Enable 生效,默认开启): 防 ollama cloud 死循环
+                     ThinkTagRequest 请求侧消毒(默认开启): 客户端历史 → 上游, 防上游截断 assistant 历史
+                     ThinkTagResponse 响应侧消毒(默认开启): 上游 → 客户端, 防脏标签污染客户端历史(根治)
+                     ThinkTagRoleAssistant/User/System/Tool 请求侧生效角色(默认只处理 assistant)
+                       死循环污染源是 assistant 历史被回放; tool 工具输出里的字面标签多属内容的一部分, 默认不处理以免误触发
+                     LimitRepeatEntries/RepeatMaxEntries: 复读记录条数上限(默认 256)
+                     LimitRepeatTTL/RepeatTTLMin: 复读记录有效期(默认 30 分钟)
  ▼ ConnPool         : 上游连接池设置(HTTP/2 + keep-alive 连接复用),保存后立即生效,无需重启
                      格式: {MaxIdleConns, MaxIdleConnsPerHost, MaxConnsPerHost, IdleConnTimeoutSec, TLSHandshakeTimeoutSec, ForceHTTP2}
                      0值回退内置默认: 空闲=100 每主机空闲=32 每主机上限=64 空闲超时=90s TLS超时=10s HTTP2=true
+ ▼ ProxyLimit       : 过载保护(并发闸门 + 请求体上限),防高并发 OOM,保存后立即生效,无需重启
+                     格式: {Enable, LimitConcurrency, MaxConcurrent, LimitQueueTimeout, QueueTimeoutSec,
+                           LimitRequestBody, MaxRequestBodyMB}
+                     限制用布尔开关控制(关闭=完全不限制),数值只填具体数字(0=用默认值)
+                     并发已满时请求排队,排队超时返回 503;请求体超过上限直接返回 413
+ ▼ ServerTimeout    : 入站 HTTP 服务器超时(防慢速连接堆积),修改需重启程序生效
+                     格式: {LimitReadHeader, ReadHeaderTimeoutSec, LimitIdle, IdleTimeoutSec,
+                           LimitMaxHeader, MaxHeaderMB}
+                     刻意不提供 WriteTimeout/ReadTimeout: 会切断 SSE 流式对话与大请求体上传
  ▼ RealtimeLog      : 实时请求查看,内存记录最近的请求与响应,供配置页面「实时请求」页查看(不写磁盘,程序退出即清空)
                      格式: {Enable: 开关, MaxEntries: 保留条数(1-1000,默认100), MaxBodyLen: 请求/响应体截断长度(字符,默认8000)}
                      记录内容: 时间/客户端/路径/模型/原始请求体/转发上游请求体/响应体/状态码/耗时/token 用量
@@ -486,6 +593,76 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 ### 📡 局域网共享
 
 将 `config.json` 中的 `IP` 改为 `0.0.0.0`，局域网内的其他设备可通过 `http://你的IP:11434` 访问。
+
+### 🛡️ 过载保护（防高并发 OOM）
+
+如果你用高并发压测或批量请求（**尤其是带图片的请求**），可能会遇到"代理服务端突然崩溃、进程直接消失、日志里什么错误都没有"——这通常是**内存被撑爆后系统静默杀掉进程**。
+
+单个带图请求体里塞着几张图的 base64，轻松就是 10~40 MB。高并发时如果每个请求都被整体复制放大若干次，内存会随并发数线性爆炸。
+
+本程序已从两个方向解决：
+
+**① 消除内存放大**（默认启用，无需配置）
+
+- 请求体截断、图片检测、模型名还原、思考标签消毒、assistant 循环检测等环节都加了**字节级预检门禁**——不满足条件时直接跳过整体反序列化，不会把几十 MB 的 base64 再复制一份
+- 截断函数改为顺序扫描，不再 `[]rune(s)` 整份 4 倍膨胀
+- 跨请求复读记录只存 **SHA-256 摘要**，内存与回复长短无关
+
+**② 两道闸门**（`ProxyLimit`，需手动开启）
+
+```json
+"ProxyLimit": {
+    "Enable": true,
+    "LimitConcurrency": true,
+    "MaxConcurrent": 32,
+    "LimitQueueTimeout": true,
+    "QueueTimeoutSec": 60,
+    "LimitRequestBody": false,
+    "MaxRequestBodyMB": 32
+}
+```
+
+- **并发闸门**：同时处理的请求数超过 `MaxConcurrent` 时排队（**排队期间不读请求体、不占内存**），排队超时返回 `503`
+- **请求体上限**：超过 `MaxRequestBodyMB` 直接返回 `413`，不做任何解析
+- 两项都可独立开关：例如只想限请求体、不限并发，就把 `LimitConcurrency` 关掉
+
+**参数怎么定**（参考）：
+
+
+| 场景           | MaxConcurrent | MaxRequestBodyMB                      |
+| ---------------- | --------------- | --------------------------------------- |
+| 纯文本对话     | 32 ~ 64       | 32                                    |
+| 偶尔带图       | 16 ~ 32       | 16 ~ 32                               |
+| 高并发大量带图 | 8 ~ 16        | 建议关闭（`LimitRequestBody: false`） |
+
+> 💡 **调优思路**：并发数上限 ≈ 可用内存 ÷ 单个请求峰值内存。带图请求峰值按"图片体积 × 3"粗估（base64 + 反序列化副本 + 转发缓冲）。
+
+开启后若频繁看到 `503 服务繁忙`，说明并发压到了上限，可以调大 `MaxConcurrent` 或排查是否有请求卡住不释放。
+
+### ⏱️ 服务器超时（防慢速连接）
+
+`ServerTimeout` 管的是**客户端连进本服务**这一侧，与 `ConnPool`（上游连接池）方向相反。
+
+典型威胁是**慢速攻击（Slowloris）**：有人或某个抽风的客户端开上千个 TCP 连接，每个每秒只发 1 个字节的请求头。如果服务端没有任何超时，这些连接会永远挂着，占满 goroutine 和文件句柄，正常请求就进不来了。
+
+```json
+"ServerTimeout": {
+    "LimitReadHeader": true,
+    "ReadHeaderTimeoutSec": 30,
+    "LimitIdle": true,
+    "IdleTimeoutSec": 120,
+    "LimitMaxHeader": true,
+    "MaxHeaderMB": 1
+}
+```
+
+- `ReadHeaderTimeoutSec`：30 秒内必须把请求头发完，否则断开
+- `IdleTimeoutSec`：空闲的 keep-alive 连接多久回收
+- `MaxHeaderMB`：单次请求头最大体积（防有人塞个 50MB 的 `Cookie`）
+
+> ⚠️ **修改需重启程序生效**（Go 的 `http.Server` 字段不允许在 `Serve()` 之后修改）。
+>
+> ⚠️ **本程序刻意不提供 `ReadTimeout` / `WriteTimeout`**：`WriteTimeout` 会中途掐断 SSE 流式对话（用户看到半截话），`ReadTimeout` 会中断几十 MB 的大请求体上传。默认值就是推荐值，一般无需调整。
 
 ### 🏷️ 模型别名
 
@@ -535,13 +712,25 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 
 通过 `DoomLoopProtection` 你可以防止客户端陷入「重试 → 再收到重复 → 再重试」的死循环。上游（模型/中转网关）可能重复发送相同内容块或整个响应，导致客户端误判模型复读而反复重试，白白烧掉 token。
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `Enable` | bool | 总开关（默认 `false`，透明转发不改变任何行为，主动开启才生效） |
-| `Dedup` | bool | 内容去重：相邻块去重 + 全文尾部去重（≥20 字符才参与尾部匹配，防误杀短文本） |
-| `RepeatCheck` | bool | 跨请求复读检测：请求签名 + 回复全文与上一轮相同 → 判定复读（默认关闭，需记录每轮回复全文，且可能误伤正常重复提问） |
-| `MaxRepeat` | int | 连续重复熔断阈值（≥2 生效，默认 3） |
-| `WarnPrompt` | string | 跨请求注入的警告提示词（留空=内置默认） |
+
+| 字段                 | 类型   | 说明                                                                                                                                                        |
+| ---------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Enable`             | bool   | 总开关（默认 `false`，透明转发不改变任何行为，主动开启才生效）                                                                                              |
+| `Dedup`              | bool   | 内容去重：相邻块去重 + 全文尾部去重（≥20 字符才参与尾部匹配，防误杀短文本）                                                                                |
+| `RepeatCheck`        | bool   | 跨请求复读检测：请求签名 + 回复与上一轮相同 → 判定复读（默认关闭；记录只存 SHA-256 摘要，内存与回复长短无关，但"相同请求+相同回复"仍可能误伤正常重复提问） |
+| `MaxRepeat`          | int    | 连续重复熔断阈值（≥2 生效，默认 3）                                                                                                                        |
+| `WarnPrompt`         | string | 跨请求注入的警告提示词（留空=内置默认）                                                                                                                     |
+| `ThinkTag`           | bool   | 思考标签消毒总开关（独立于 `Enable` 生效，默认开启）                                                                                                        |
+| `ThinkTagRequest`    | bool   | 请求侧消毒：客户端历史 → 上游（默认开启）；关闭后不再处理历史里的裸闭标签，只保留响应侧根治                                                              |
+| `ThinkTagResponse`   | bool   | 响应侧消毒：上游 → 客户端（默认开启）；阻止脏标签污染客户端会话历史                                                                                          |
+| `ThinkTagRoleAssistant` | bool | 请求侧只处理 `assistant` 消息（默认 `true`，真正会导致上游截断历史的角色）                                                                                |
+| `ThinkTagRoleUser`   | bool   | 请求侧处理 `user` 消息（默认 `false`）                                                                                                                      |
+| `ThinkTagRoleSystem` | bool   | 请求侧处理 `system` 消息，含 Anthropic 顶层 `system`（默认 `false`）                                                                                        |
+| `ThinkTagRoleTool`   | bool   | 请求侧处理 `tool` / `function` 工具结果（默认 `false`；工具输出里的字面标签多属内容的一部分，开了会频繁误触发徽章）                                              |
+| `LimitRepeatEntries` | bool   | 是否限制复读记录条数；`false` = 不限条数（map 可无限增长）                                                                                                  |
+| `RepeatMaxEntries`   | int    | 复读记录会话数上限（`0` = 默认 256，上限 10000）                                                                                                            |
+| `LimitRepeatTTL`     | bool   | 是否限制复读记录有效期；`false` = 永不过期                                                                                                                  |
+| `RepeatTTLMin`       | int    | 复读记录保留分钟数（`0` = 默认 30，上限 1440）                                                                                                              |
 
 **工作原理**：
 
@@ -551,7 +740,13 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 - **跨请求提醒（C 方案）**：熔断后下一轮请求自动注入 system 警告，让 AI 停止复读（只提醒一次）
 - **assistant 循环检测**：仅统计「连续段」内的重复——`user`/`system` 消息视为对话边界重置连续性，长会话中相隔多轮的重复调用（如先后两次读同一文件）不会误报；签名兼容 string/对象两种 arguments 形态，空 content 消息不参与检测；命中后警告注入带 **10 分钟冷却**（同一会话只提醒一次，避免污染上下文）
 - **多客户端隔离**：所有跨请求保护状态（警告标记/复读记录/冷却）以 `客户端IP + User-Agent 指纹` 为会话 key——同一台机器上同时运行 VS Code / VS2026 / Cherry Studio 等多个客户端时，各自状态互不污染（A 的熔断警告不会被 B 偷走，A 的冷却不会消耗 B 的额度）
+- **思考标签消毒分两侧 + 按角色生效**：`ThinkTagResponse`（响应侧，根治）挡住上游泄漏进入客户端历史；`ThinkTagRequest`（请求侧，兜底）防止上游渲染器截断 assistant 历史。
+  请求侧默认**只处理 `assistant`**，因为死循环的真正污染源是 assistant 历史被回放；`tool` 工具输出里的字面标签多属内容的一部分（如阅读源码时返回的文本），默认不处理，避免实时记录每轮都亮「请求侧思考标签消毒」徽章掩盖真正的异常。
+  两侧均**只替换裸闭标签 `</thinking>`**（才是上游 `SplitN` 截断历史的触发点）；裸开标签 `<thinking>` 与配对完整的 `<thinking>...</thinking>` 一律原样保留——裸开标签本身无害，无差别替换会让「讨论标签本身」的正常对话反复误报
 - 去重只影响 `content` 字段，`tool_calls` / `usage` / `finish_reason` / SSE 事件顺序全部保持原样
+- **复读记录只存摘要**：跨请求复读记录存的是请求签名与回复的 **SHA-256 摘要**（各 32 字节），而非回复全文——
+  一方面内存与回复长短完全无关（256 条≈ 16KB），另一方面**摘要比对等价于全文精确比对**，
+  避免了「截断到固定长度后比对」带来的误报（前 N 字符相同、后面不同会误判为复读）
 
 示例配置：
 
@@ -561,7 +756,18 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
     "Dedup": true,
     "RepeatCheck": false,
     "MaxRepeat": 3,
-    "WarnPrompt": "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。"
+    "WarnPrompt": "【系统警告】你上一轮回复出现了内容重复（疑似陷入死循环）。请立即停止重复输出，直接给出最终答案，不要复读任何已输出的内容。",
+    "ThinkTag": true,
+    "ThinkTagRequest": true,
+    "ThinkTagResponse": true,
+    "ThinkTagRoleAssistant": true,
+    "ThinkTagRoleUser": false,
+    "ThinkTagRoleSystem": false,
+    "ThinkTagRoleTool": false,
+    "LimitRepeatEntries": true,
+    "RepeatMaxEntries": 256,
+    "LimitRepeatTTL": true,
+    "RepeatTTLMin": 30
 }
 ```
 
@@ -592,31 +798,33 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 }
 ```
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `Enable` | bool | 总开关（默认 `true`） |
-| `MaxEntries` | int | 保留条数（1-1000，默认 100，超出丢弃最旧） |
-| `MaxBodyLen` | int | 请求/响应体截断长度（字符，默认 8000，上限 100000） |
+
+| 字段         | 类型 | 说明                                                               |
+| -------------- | ------ | -------------------------------------------------------------------- |
+| `Enable`     | bool | 总开关（默认 `true`）                                              |
+| `MaxEntries` | int  | 保留条数（1-1000，默认 100，超出丢弃最旧）                         |
+| `MaxBodyLen` | int  | 请求/响应体截断长度（字符，默认 8000；`0` = 不截断，上限 5000000） |
 
 #### 🏷️ 保护标记一览
 
 每条记录上会显示本次请求触发的保护/处理徽章（不同类别不同颜色）：
 
-| 徽章 | 标记键 | 触发场景 |
-| --- | --- | --- |
-| 🛡 请求侧思考标签消毒 | `think-tag-req` | 客户端历史含裸 `<thinking>`/`</thinking>` 标签（开/闭未配对），转发上游前替换为 `[THINK-START]`/`[THINK-END]` 安全文本 |
-| 🛡 响应侧思考标签消毒 | `think-tag-resp` | 上游响应泄漏裸 `<thinking>`/`</thinking>` 标签（开/闭未配对），发给客户端前替换为 `[THINK-START]`/`[THINK-END]` 安全文本 |
-| ⚠ 去重·跳过重复块 | `dedup-skip` | 流式相邻块与上一块完全相同被跳过 |
-| ✂ 去重·截断尾部重复 | `dedup-tail` | 流式新内容与已发送全文尾部重复被截断 |
-| 🚨 熔断·连续重复收尾 | `dedup-trip` | 连续重复达 `MaxRepeat` 次，强制收尾当前流 |
-| 🔁 响应内部重复 | `repeat-internal` | 非流式响应内部大段重复 |
-| 🔁 跨请求复读 | `repeat-cross` | 请求与回复均与上一轮相同 |
-| 🚨 注入复读警告 | `warn-inject` | 上一轮熔断/复读后，本轮自动注入 system 警告 |
-| 🚨 assistant 循环检测 | `assistant-loop` | 请求内出现 ≥2 条签名相同的 assistant 消息 |
-| 🖼 视觉代理识别 | `vision-proxy` | 图片经视觉代理模型识别并合并文本 |
-| 🧭 模型上下文注入 | `ctx-inject` | 模型信息已注入提示词 |
-| ✂ 提示词替换 | `prompt-replace` | 请求提示词替换规则已生效 |
-| 🔧 模型名还原 | `model-alias` | 显示名（含前后缀）已还原为上游真实模型 ID |
+
+| 徽章                  | 标记键            | 触发场景                                                                                                                 |
+| ----------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 🛡 请求侧思考标签消毒 | `think-tag-req`   | 客户端历史含裸 `<thinking>`/`</thinking>` 标签（开/闭未配对），转发上游前替换为 `[THINK-START]`/`[THINK-END]` 安全文本   |
+| 🛡 响应侧思考标签消毒 | `think-tag-resp`  | 上游响应泄漏裸 `<thinking>`/`</thinking>` 标签（开/闭未配对），发给客户端前替换为 `[THINK-START]`/`[THINK-END]` 安全文本 |
+| ⚠ 去重·跳过重复块   | `dedup-skip`      | 流式相邻块与上一块完全相同被跳过                                                                                         |
+| ✂ 去重·截断尾部重复 | `dedup-tail`      | 流式新内容与已发送全文尾部重复被截断                                                                                     |
+| 🚨 熔断·连续重复收尾 | `dedup-trip`      | 连续重复达 `MaxRepeat` 次，强制收尾当前流                                                                                |
+| 🔁 响应内部重复       | `repeat-internal` | 非流式响应内部大段重复                                                                                                   |
+| 🔁 跨请求复读         | `repeat-cross`    | 请求与回复均与上一轮相同                                                                                                 |
+| 🚨 注入复读警告       | `warn-inject`     | 上一轮熔断/复读后，本轮自动注入 system 警告                                                                              |
+| 🚨 assistant 循环检测 | `assistant-loop`  | 请求内出现 ≥2 条签名相同的 assistant 消息                                                                               |
+| 🖼 视觉代理识别       | `vision-proxy`    | 图片经视觉代理模型识别并合并文本                                                                                         |
+| 🧭 模型上下文注入     | `ctx-inject`      | 模型信息已注入提示词                                                                                                     |
+| ✂ 提示词替换         | `prompt-replace`  | 请求提示词替换规则已生效                                                                                                 |
+| 🔧 模型名还原         | `model-alias`     | 显示名（含前后缀）已还原为上游真实模型 ID                                                                                |
 
 > 💡 **提示**：保护标记让排查死循环、重复输出、历史污染等问题一目了然——例如看到 `dedup-trip` + `warn-inject` 组合，说明上游正在复读且防护已介入。
 
@@ -634,25 +842,28 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 
 每条规则包含以下字段：
 
-| 字段      | 类型   | 说明                                                          |
-| --------- | ------ | ------------------------------------------------------------ |
-| `enable`  | bool   | 是否启用该规则                                                |
+
+| 字段      | 类型   | 说明                                                                                                 |
+| ----------- | -------- | ------------------------------------------------------------------------------------------------------ |
+| `enable`  | bool   | 是否启用该规则                                                                                       |
 | `mode`    | string | **替换模式枚举**（可选）：`normal`=普通替换 / `whole`=匹配整段替换 / `force`=强制替换，默认 `normal` |
-| `role`    | string | 按角色过滤（如`"system"`、`"user"`），可选                    |
-| `index`   | int    | 按索引取第 N 条消息，可选                                     |
-| `prompt`  | string | 要查找替换的原文（必须完全匹配才能替换；强制替换时忽略）      |
-| `replace` | string | 替换后的文本（`whole` / `force` 模式时 = 消息的完整新内容）   |
+| `role`    | string | 按角色过滤（如`"system"`、`"user"`），可选                                                           |
+| `index`   | int    | 按索引取第 N 条消息，可选                                                                            |
+| `prompt`  | string | 要查找替换的原文（必须完全匹配才能替换；强制替换时忽略）                                             |
+| `replace` | string | 替换后的文本（`whole` / `force` 模式时 = 消息的完整新内容）                                          |
 
 #### 匹配优先级
 
-| 组合方式                  | 行为                                                              |
-| ------------------------- | ----------------------------------------------------------------- |
+
+| 组合方式              | 行为                                                        |
+| ----------------------- | ------------------------------------------------------------- |
 | `role` + `index` 都有 | **先按 role 过滤**，再取过滤后第 N 条消息进行替换（最精确） |
-| 仅有`role`              | 替换所有匹配该 role 的消息                                        |
-| 仅有`index`             | 按消息数组的索引取第 N 条替换                                     |
-| 两者都省略                | 不对 messages 数组处理                                            |
+| 仅有`role`            | 替换所有匹配该 role 的消息                                  |
+| 仅有`index`           | 按消息数组的索引取第 N 条替换                               |
+| 两者都省略            | 不对 messages 数组处理                                      |
 
 > ⚡ **三种替换模式（`mode` 枚举，互斥只能选一种）**：
+>
 > - `normal`（普通替换，默认）：仅将 `prompt` 出现的位置替换为 `replace`，消息其余内容保留
 > - `whole`（匹配整段替换）：先检查消息内容是否包含 `prompt`，匹配到就把**整条 content** 替换为 `replace`；未匹配到则不动。适合「检测到原文特征就整体换成自己的设定」
 > - `force`（强制替换）：不检查 `prompt` 是否匹配，只要定位到目标消息（按 role / index），就直接把整条 `content` 替换为 `replace`。适合「整个系统提示词换成自己的设定」这类场景，无需关心原文内容
@@ -697,7 +908,7 @@ VS2026 的 **Bring Your Own Model（BYOM）** 功能**不支持在界面上手�
 
 > 💡 **提示**：替换规则按 `role+index` 的精确定位，只影响特定消息的文本内容，不影响消息结构。
 
-###🛡️ 自定义加密 UUID
+### 🛡️ 自定义加密 UUID
 
 修改源码中的 `secretUUID` 常量，使用 [UUID Generator](https://www.uuidgenerator.net/) 生成自己的 UUID，增强加密安全性。
 
@@ -756,16 +967,19 @@ Remote Convert Ollama/
 
 ### 关键技术点
 
-| 技术                     | 用途                                |
-| ------------------------ | ----------------------------------- |
-| Go`net/http`           | HTTP 服务器和反向代理               |
-| AES-256-GCM              | API Key 加密存储                    |
-| SHA-256                  | 机器指纹 + UUID 密钥派生            |
-| Server-Sent Events (SSE) | 流式响应实时转发；配置页面实时请求查看（`/api/realtime/events` 推送） |
-| 内存环形缓冲 + 互斥锁 | 实时请求记录（`RealtimeLog`）线程安全存储，只存内存不写磁盘 |
-| 系统调用 (Windows)       | 控制台标题设置、磁盘卷序列号获取    |
-| `bufio` 流式解析       | OpenAI / Anthropic 流式数据实时转发 |
-| `sync.RWMutex`         | reasoning_content 线程安全读写      |
+
+| 技术                            | 用途                                                                                            |
+| --------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Go`net/http`                    | HTTP 服务器和反向代理                                                                           |
+| AES-256-GCM                     | API Key 加密存储                                                                                |
+| SHA-256                         | 机器指纹 + UUID 密钥派生；跨请求复读记录摘要比对（等价全文精确比对，内存恒定）                  |
+| Server-Sent Events (SSE)        | 流式响应实时转发；配置页面实时请求查看（`/api/realtime/events` 推送）                           |
+| 内存环形缓冲 + 互斥锁           | 实时请求记录（`RealtimeLog`）线程安全存储，只存内存不写磁盘                                     |
+| 带缓冲 channel 信号量           | 过载保护并发闸门（热更新时只替换信号量，在途请求归还到自己获取的那个 channel，不 panic 不阻塞） |
+| `io.LimitReader` / `io.Discard` | 请求体上限拦截与超限后丢弃剩余 body（防 413 响应被连接 RST 抢掉）                               |
+| 系统调用 (Windows)              | 控制台标题设置、磁盘卷序列号获取                                                                |
+| `bufio` 流式解析                | OpenAI / Anthropic 流式数据实时转发                                                             |
+| `sync.Mutex` + `map`           | reasoning_content 按「会话指纹 + 模型 ID」隔离存储（带 TTL 与条数上限）                        |
 
 ---
 
@@ -825,11 +1039,13 @@ Remote Convert Ollama/
 <details>
 <summary><b>Q: DeepSeek 思考模式下对话历史不连贯？</b></summary>
 
-本程序会自动追踪上游返回的 `reasoning_content`，并在客户端下次请求时自动注入。如果仍然有问题：
+本程序会自动追踪上游返回的 `reasoning_content`，并在客户端下次请求时自动注入。追踪是**按「会话指纹（IP + UA）+ 模型 ID」隔离**的，只补**最后一条** assistant 消息，四条路径（Ollama 流式/非流式、OpenAI 流式/非流式）全覆盖。如果仍然有问题：
 
 1. 确保使用的是 `StreamMode: "preserve"`（默认值）
 2. 检查客户端是否发送了完整的消息历史
-3. 某些客户端可能需要手动清除对话后重新开始
+3. 确认对话中途**没有切换模型**——推理内容按模型 ID 隔离，换模型后旧推理不会被注入（这是有意设计，避免推理内容串号）
+4. 推理记录有 30 分钟有效期，间隔太久才追问时可能已失效
+5. 某些客户端可能需要手动清除对话后重新开始
 
 </details>
 
@@ -850,6 +1066,34 @@ Remote Convert Ollama/
 <summary><b>Q: 实时记录会写入磁盘吗？隐私安全吗？</b></summary>
 
 不会。实时记录仅存于程序内存，程序退出即清空。但记录包含对话内容，若配置页面未设访问密码，局域网内可访问者也能看到，建议启用访问密码。
+
+</details>
+
+<details>
+<summary><b>Q: 高并发请求时服务端突然崩溃 / 进程直接消失，日志里没有任何错误？</b></summary>
+
+这几乎都是**内存被撑爆后系统静默杀掉进程**（OOM Killer），所以看不到 Go 的 panic 栈。带图片的请求最容易触发——单个请求体就可能有几十 MB。
+
+解决步骤：
+
+1. 打开配置页「🔌 连接设置 → 🛡️ 过载保护 ProxyLimit」，**启用总开关**
+2. `MaxConcurrent` 按内存设置（如 16~32），`LimitRequestBody` 带图场景建议**关闭**
+3. 保存即生效，无需重启
+4. 若仍崩溃，把 `MaxConcurrent` 再调小（如 8），并观察是否有个别请求长时间卡住不释放
+
+> 💡 本程序已消除大部分内存放大（预检门禁跳过无谓的反序列化、截断不再 4 倍膨胀、复读记录只存摘要），配合 `ProxyLimit` 基本不会再 OOM。
+
+</details>
+
+<details>
+<summary><b>Q: 客户端报「503 服务繁忙」或「413 请求体过大」？</b></summary>
+
+两者都来自**过载保护**（`ProxyLimit`），说明防护正常工作了：
+
+- **503**：并发已满且排队超时。调大 `MaxConcurrent`，或把 `LimitQueueTimeout` 关掉（排队不限时）
+- **413**：请求体超过 `MaxRequestBodyMB`。调大该值，或把 `LimitRequestBody` 关掉（完全不限大小）
+
+如果不想要这些限制，直接关闭 `ProxyLimit.Enable`（总开关），就会恢复成完全透明转发。
 
 </details>
 
